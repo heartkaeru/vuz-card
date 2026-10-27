@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Backend storage
+backend/storage/presentations/*.pptx
+
+# Node / Frontend
+node_modules/
+dist/
+.vite/
+.next/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
