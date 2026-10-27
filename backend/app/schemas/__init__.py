@@ -6,7 +6,12 @@ from app.schemas.university import (
     UniversityUpdate,
 )
 from app.schemas.job import JobStatusEnum, JobResponse
-from app.schemas.presentation import PresentationCreateRequest, PresentationResponse
+from app.schemas.presentation import (
+    PresentationCreateRequest,
+    PresentationResponse,
+    SlideContent,
+    PresentationPreviewResponse,
+)
 
 __all__ = [
     "VerificationStatus",
@@ -18,4 +23,6 @@ __all__ = [
     "JobResponse",
     "PresentationCreateRequest",
     "PresentationResponse",
+    "SlideContent",
+    "PresentationPreviewResponse",
 ]
