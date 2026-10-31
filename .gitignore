@@ -4,6 +4,8 @@ __pycache__/
 *$py.class
 *.so
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -11,6 +13,8 @@ ENV/
 
 # Backend storage
 backend/storage/presentations/*.pptx
+backend/output/
+.pytest_cache/
 
 # Node / Frontend
 node_modules/

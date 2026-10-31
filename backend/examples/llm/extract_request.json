@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.1",
+  "institution": {
+    "id": "demo-001",
+    "name": "Учебный университет-пример",
+    "card_version": 1
+  },
+  "documents": [
+    {
+      "source_id": "demo-leadership",
+      "url": "https://university.example/leadership",
+      "title": "Синтетический пример, не реальные сведения",
+      "text": "Учебный университет-пример. Руководство.\nИванов Иван Иванович — исполняющий обязанности ректора.\nРабочая почта Иванова Ивана Ивановича: ivanov@university.example.\nТелефон приёмной: +7 (000) 000-00-00.",
+      "retrieved_at": "2026-10-31T12:00:00+05:00",
+      "published_at": null
+    }
+  ]
+}
