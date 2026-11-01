@@ -1,0 +1,5 @@
+gigachat==0.2.4
+pydantic>=2.6,<3
+python-dotenv==1.2.4
+pymorphy3==2.0.6
+pymorphy3-dicts-ru==2.4.417150.4580142

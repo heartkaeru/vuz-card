@@ -1,0 +1,28 @@
+[
+  {
+    "facts": [
+      {"subject":{"entity_kind":"institution","entity_name":"Университет Северный","entity_fragment_id":"f1"},"field":"institution.profile","value":"инженерное образование и прикладные исследования","fragment_ids":["f1"]},
+      {"subject":{"entity_kind":"project","entity_name":"Лаборатория робототехники","entity_fragment_id":"f2"},"field":"project.name","value":"Лаборатория робототехники","fragment_ids":["f2"]},
+      {"subject":{"entity_kind":"project","entity_name":"Лаборатория робототехники","entity_fragment_id":"f2"},"field":"project.program","value":"Приоритет-2030","fragment_ids":["f2"]},
+      {"subject":{"entity_kind":"project","entity_name":"Лаборатория робототехники","entity_fragment_id":"f2"},"field":"project.role","value":"планирует подать заявку","fragment_ids":["f2"]},
+      {"subject":{"entity_kind":"project","entity_name":"Лаборатория робототехники","entity_fragment_id":"f2"},"field":"project.status","value":"подготовка заявки","fragment_ids":["f2"]},
+      {"subject":{"entity_kind":"event","entity_name":"Карьерный форум «Старт»","entity_fragment_id":"f3"},"field":"event.name","value":"Карьерный форум «Старт»","fragment_ids":["f3"]},
+      {"subject":{"entity_kind":"event","entity_name":"Карьерный форум «Старт»","entity_fragment_id":"f3"},"field":"event.type","value":"Карьерный форум","fragment_ids":["f3"]},
+      {"subject":{"entity_kind":"event","entity_name":"Карьерный форум «Старт»","entity_fragment_id":"f3"},"field":"event.date","value":"12 ноября 2026 года","fragment_ids":["f3"]},
+      {"subject":{"entity_kind":"event","entity_name":"Карьерный форум «Старт»","entity_fragment_id":"f3"},"field":"event.status","value":"анонс","fragment_ids":["f3"]}
+    ],
+    "gaps": ["Сроки и решение о поддержке заявки не опубликованы в переданном примере."]
+  },
+  {
+    "brief_sections": [
+      {"title":"Профиль","statements":[{"text":"Профиль — инженерное образование и прикладные исследования.","fact_ids":["fact_1"]}]},
+      {"title":"Проекты","statements":[{"text":"По проекту «Лаборатория робототехники» указана подготовка заявки в программу «Приоритет-2030».","fact_ids":["fact_2","fact_3","fact_4","fact_5"]}]},
+      {"title":"События","statements":[{"text":"Карьерный форум «Старт» анонсирован на 12 ноября 2026 года.","fact_ids":["fact_6","fact_8","fact_9"]}]}
+    ],
+    "slides": [
+      {"title":"Проекты","theses":[{"text":"«Лаборатория робототехники»: подготовка заявки в программу «Приоритет-2030».","fact_ids":["fact_2","fact_3","fact_5"]}]},
+      {"title":"События","theses":[{"text":"Карьерный форум «Старт»: анонс на 12 ноября 2026 года.","fact_ids":["fact_6","fact_8","fact_9"]}]}
+    ],
+    "questions":[{"question":"Какие шаги нужны для подготовки заявки по проекту «Лаборатория робототехники»?","basis_fact_ids":["fact_2","fact_5"]}]
+  }
+]

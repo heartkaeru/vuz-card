@@ -1,0 +1,2 @@
+-r requirements-llm.txt
+beautifulsoup4==4.15.0

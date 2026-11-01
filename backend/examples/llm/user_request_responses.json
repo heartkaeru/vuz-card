@@ -1,0 +1,12 @@
+[
+  {
+    "intent": "prepare_materials",
+    "outputs": ["brief", "presentation"],
+    "institution_name": {"first_token": 5, "last_token": 6},
+    "city": {"first_token": 9, "last_token": 9},
+    "website_candidate": {"first_token": 13, "last_token": 20},
+    "meeting_goal": {"first_token": 25, "last_token": 27},
+    "meeting_date_text": {"first_token": 30, "last_token": 30},
+    "template": null
+  }
+]
