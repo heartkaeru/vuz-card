@@ -1,0 +1,65 @@
+{
+  "schema_version": "0.2",
+  "institution": {
+    "id": "demo-fragments",
+    "name": "Учебный университет-пример",
+    "card_version": 1
+  },
+  "project_structured_contacts": true,
+  "fields": [
+    "person.name",
+    "appointment.position",
+    "contact.email",
+    "contact.phone"
+  ],
+  "documents": [
+    {
+      "source_id": "demo-source",
+      "url": "https://university.example/leadership",
+      "title": "Вымышленный пример версии 0.2",
+      "text": "Ректор\nИванов Иван Иванович\n\nПриёмная ректора\nТелефон: +7 (3952) 111-22-33\n\nУчебная часть\nЭлектронная почта: study@university.example",
+      "retrieved_at": "2026-10-31T12:00:00+05:00",
+      "published_at": null,
+      "fragments": [
+        {
+          "fragment_id": "f1",
+          "start": 0,
+          "end": 27,
+          "contact_hints": []
+        },
+        {
+          "fragment_id": "f2",
+          "start": 29,
+          "end": 74,
+          "contact_hints": [
+            {
+              "field": "contact.phone",
+              "value": "+7 (3952) 111-22-33",
+              "owner": {
+                "kind": "office",
+                "label": "Приёмная ректора"
+              },
+              "context_fragment_ids": []
+            }
+          ]
+        },
+        {
+          "fragment_id": "f3",
+          "start": 76,
+          "end": 133,
+          "contact_hints": [
+            {
+              "field": "contact.email",
+              "value": "study@university.example",
+              "owner": {
+                "kind": "department",
+                "label": "Учебная часть"
+              },
+              "context_fragment_ids": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -9,9 +9,11 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from .client import ConfigurationError, FixtureProvider, GigaChatProvider, GigaChatSettings, LLMError
-from .models import ExtractionRequest, GenerationRequest
+from .models import GenerationRequest
+from .fragment_models import parse_extraction_request
 from .pipeline import AssistantPipeline, DraftValidationError
 from .render import render_markdown
+from .requests import RequestInterpreter, UserRequest
 
 
 async def run(args):
@@ -26,8 +28,11 @@ async def run(args):
     pipeline = AssistantPipeline(provider)
     raw = args.input.read_text(encoding="utf-8-sig")
     if args.operation == "extract":
-        result = await pipeline.extract_facts(ExtractionRequest.model_validate_json(raw))
+        result = await pipeline.extract_facts(parse_extraction_request(raw))
         code = 0 if result.complete else 2
+    elif args.operation == "interpret":
+        result = await RequestInterpreter(provider).interpret(UserRequest.model_validate_json(raw))
+        code = 0
     else:
         result = await pipeline.generate_materials(GenerationRequest.model_validate_json(raw))
         code = 0
@@ -41,8 +46,8 @@ async def run(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract leadership facts or draft meeting materials")
-    parser.add_argument("operation", choices=["extract", "draft"])
+    parser = argparse.ArgumentParser(description="Interpret a request, extract facts or draft materials")
+    parser.add_argument("operation", choices=["interpret", "extract", "draft"])
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, help="Optional explicit .env path")

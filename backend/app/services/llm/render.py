@@ -19,6 +19,8 @@ def render_markdown(draft: DraftResult) -> str:
     if draft.meeting.date:
         lines += [f"Дата встречи: {draft.meeting.date}", ""]
     for section in draft.brief_sections:
+        if not section.statements:
+            continue
         lines += [f"## {section.title}", ""]
         lines += [f"- {s.text} {citations(s.fact_ids)}" for s in section.statements]
         lines.append("")
@@ -40,6 +42,9 @@ def render_markdown(draft: DraftResult) -> str:
                       f"- Опубликовано: {evidence.published_at.isoformat() if evidence.published_at else 'дата неизвестна'}",
                       f"- Фрагмент: {evidence.chunk_id}",
                       f"- Цитата: {evidence.quote}", ""]
+            if evidence.fragment_id is not None:
+                lines += [f"- Границы цитаты: {evidence.start_offset}–{evidence.end_offset}; "
+                          f"фрагмент {evidence.fragment_id}", ""]
     lines += ["## Ограничения проверки", ""]
     lines += [f"- {warning}" for warning in draft.warnings]
     return "\n".join(lines) + "\n"

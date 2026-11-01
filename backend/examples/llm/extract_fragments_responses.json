@@ -1,0 +1,52 @@
+[
+  {
+    "facts": [
+      {
+        "subject": {
+          "person_name": "Иванов Иван Иванович",
+          "position": "Ректор",
+          "department": null
+        },
+        "field": "appointment.position",
+        "value": "Ректор",
+        "fragment_ids": [
+          "f1"
+        ],
+        "contact_owner": null
+      },
+      {
+        "subject": {
+          "person_name": null,
+          "position": null,
+          "department": null
+        },
+        "field": "contact.phone",
+        "value": "+7 (3952) 111-22-33",
+        "fragment_ids": [
+          "f2"
+        ],
+        "contact_owner": {
+          "kind": "office",
+          "label": "Приёмная ректора"
+        }
+      },
+      {
+        "subject": {
+          "person_name": null,
+          "position": null,
+          "department": "Учебная часть"
+        },
+        "field": "contact.email",
+        "value": "study@university.example",
+        "fragment_ids": [
+          "f3"
+        ],
+        "contact_owner": {
+          "kind": "department",
+          "label": "Учебная часть"
+        }
+      }
+    ],
+    "gaps": []
+  }
+]

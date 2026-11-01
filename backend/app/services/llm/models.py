@@ -45,6 +45,15 @@ class ExtractionRequest(StrictModel):
     schema_version: Literal["0.1"] = "0.1"
     institution: Institution
     documents: list[SourceDocument] = Field(min_length=1)
+    fields: list[str] | None = Field(default=None, min_length=1)
+
+    @field_validator("fields")
+    @classmethod
+    def supported_fields(cls, fields):
+        allowed = {f.value for f in FactField if not f.value.startswith(("project.", "event.", "institution."))}
+        if fields is not None and any(field not in allowed for field in fields):
+            raise ValueError("Unsupported extraction field")
+        return list(dict.fromkeys(fields)) if fields is not None else None
 
     @field_validator("documents")
     @classmethod
@@ -66,6 +75,18 @@ class FactField(str, Enum):
     EDUCATION = "person.education"
     DEGREE = "person.degree"
     CAREER = "person.career"
+    PROFILE = "institution.profile"
+    PROJECT_NAME = "project.name"
+    PROJECT_PROGRAM = "project.program"
+    PROJECT_ROLE = "project.role"
+    PROJECT_STATUS = "project.status"
+    PROJECT_PERIOD = "project.period"
+    PROJECT_DESCRIPTION = "project.description"
+    EVENT_NAME = "event.name"
+    EVENT_TYPE = "event.type"
+    EVENT_DATE = "event.date"
+    EVENT_STATUS = "event.status"
+    EVENT_DESCRIPTION = "event.description"
 
 
 class Subject(StrictModel):
@@ -73,6 +94,25 @@ class Subject(StrictModel):
     person_name: str = Field(min_length=1)
     position: str | None = None
     department: str | None = None
+
+
+class NonPersonSubject(StrictModel):
+    person_name: None = None
+    position: None = None
+    department: str | None = None
+
+
+class EntitySubject(StrictModel):
+    # Local source occurrence, never an automatic merge across articles or years.
+    person_name: None = None
+    entity_id: str = Field(min_length=1)
+    entity_kind: Literal["institution", "project", "event"]
+    entity_name: str = Field(min_length=1)
+
+
+class ContactOwner(StrictModel):
+    kind: Literal["person", "office", "department", "organization", "unknown"]
+    label: str = Field(min_length=1)
 
 
 class EvidenceProposal(StrictModel):
@@ -86,6 +126,13 @@ class FactProposal(StrictModel):
     value: str = Field(min_length=1)
     evidence: list[EvidenceProposal] = Field(min_length=1)
 
+    @field_validator("field")
+    @classmethod
+    def leadership_fields_only(cls, value):
+        if value.value.startswith(("institution.", "project.", "event.")):
+            raise ValueError("Context facts require schema 0.3")
+        return value
+
 
 class ExtractionOutput(StrictModel):
     facts: list[FactProposal]
@@ -98,14 +145,19 @@ class Evidence(EvidenceProposal):
     published_at: datetime | None
     content_sha256: str
     chunk_id: str
+    fragment_id: str | None = None
+    start_offset: int | None = Field(default=None, ge=0)
+    end_offset: int | None = Field(default=None, gt=0)
 
 
 class Fact(StrictModel):
     fact_id: str
     institution_id: str
-    subject: Subject
+    subject: Subject | NonPersonSubject | EntitySubject
     field: FactField
     value: str
+    origin: Literal["llm", "subject_projection", "parser_projection"] = "llm"
+    contact_owner: ContactOwner | None = None
     evidence: list[Evidence]
     validation_status: Literal["passed", "failed"]
     verification_status: Literal["pending", "verified", "conflict", "rejected"]
@@ -130,7 +182,7 @@ class RunInfo(StrictModel):
 
 
 class ExtractionResult(StrictModel):
-    schema_version: Literal["0.1"] = "0.1"
+    schema_version: Literal["0.1", "0.2", "0.3"] = "0.1"
     institution: Institution
     run: RunInfo
     facts: list[Fact]
@@ -145,7 +197,7 @@ class MeetingContext(StrictModel):
 
 
 class GenerationRequest(StrictModel):
-    schema_version: Literal["0.1"] = "0.1"
+    schema_version: Literal["0.1", "0.2", "0.3"] = "0.1"
     institution: Institution
     facts: list[Fact] = Field(min_length=1)
     meeting: MeetingContext = Field(default_factory=MeetingContext)
@@ -178,7 +230,7 @@ class DraftOutput(StrictModel):
 
 
 class DraftResult(DraftOutput):
-    schema_version: Literal["0.1"] = "0.1"
+    schema_version: Literal["0.1", "0.2", "0.3"] = "0.1"
     institution: Institution
     run: RunInfo
     meeting: MeetingContext

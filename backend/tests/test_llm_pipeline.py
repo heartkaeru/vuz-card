@@ -94,6 +94,36 @@ def test_absent_contacts_are_not_invented():
     assert result.gaps == ["Телефон не найден"]
 
 
+def test_declined_full_name_supports_email_without_rewriting_quote():
+    req = request()
+    output = response()
+    output["facts"] = [{
+        "subject": {"person_name": "Иванов Иван Иванович", "position": None, "department": None},
+        "field": "contact.email", "value": "ivanov@university.example",
+        "evidence": [{"source_id": "demo-leadership",
+                      "quote": "Рабочая почта Иванова Ивана Ивановича: ivanov@university.example."}],
+    }]
+    result = extract(output, req)
+    assert result.facts[0].verification_status == "pending"
+    assert result.facts[0].evidence[0].quote == output["facts"][0]["evidence"][0]["quote"]
+
+
+def test_unrequested_field_is_retained_as_rejected_candidate():
+    req = request()
+    req.fields = ["person.name"]
+    result = extract(req=req)
+    assert result.facts[0].verification_status == "pending"
+    assert result.facts[1].verification_status == "rejected"
+    assert "field_not_requested" in result.facts[1].issues
+
+
+def test_invalid_field_selection_is_rejected():
+    raw = request().model_dump(mode="json")
+    raw["fields"] = ["unsupported"]
+    with pytest.raises(ValidationError):
+        ExtractionRequest.model_validate(raw)
+
+
 def test_duplicate_evidence_is_deduplicated():
     output = response()
     output["facts"].append(copy.deepcopy(output["facts"][0]))
@@ -122,7 +152,24 @@ def test_two_head_candidates_require_review():
     fact["evidence"][0]["quote"] = "Петров Пётр Петрович — ректор."
     output["facts"].append(fact)
     result = extract(output, req)
-    assert all(f.verification_status == "conflict" for f in result.facts[1:])
+    assert all(f.verification_status == "conflict" for f in result.facts
+               if f.field.value == "appointment.position")
+    assert all(f.verification_status == "pending" for f in result.facts
+               if f.field.value == "person.name")
+
+
+def test_name_is_projected_only_from_validated_subject_evidence():
+    output = response()
+    output["facts"] = output["facts"][1:]
+    result = extract(output)
+    assert len(result.facts) == 2
+    projected = result.facts[1]
+    assert projected.origin == "subject_projection"
+    assert projected.field.value == "person.name"
+    assert projected.verification_status == "pending"
+    assert projected.evidence == result.facts[0].evidence
+    output["facts"][0]["evidence"][0]["quote"] = "Нет такого человека"
+    assert len(extract(output).facts) == 1
 
 
 def test_partial_failure_is_explicit_and_keeps_valid_facts():
@@ -226,6 +273,62 @@ def test_unsupported_number_rejects_draft():
     output["brief_sections"][0]["statements"][0]["text"] += " Стаж — 30 лет."
     with pytest.raises(DraftValidationError, match="unsupported_number"):
         generate(req, output)
+
+
+def test_known_inline_citation_annotation_is_removed_without_changing_facts():
+    req = reviewed_request()
+    output = draft_response(req)
+    output["brief_sections"][0]["statements"][0]["text"] += " (" + req.facts[0].fact_id + ")"
+    result = generate(req, output)
+    assert req.facts[0].fact_id not in result.brief_sections[0].statements[0].text
+    assert result.brief_sections[0].statements[0].fact_ids == [f.fact_id for f in req.facts]
+
+
+def test_unknown_inline_citation_is_rejected():
+    req = reviewed_request()
+    output = draft_response(req)
+    output["brief_sections"][0]["statements"][0]["text"] += " (fact_invented)"
+    with pytest.raises(DraftValidationError, match="internal_fact_id_in_text"):
+        generate(req, output)
+
+
+def test_known_labeled_reference_annotations_are_formatted_safely():
+    from app.services.llm.pipeline import strip_reference_annotations
+    assert strip_reference_annotations("Ректор (fact_ids: [fact_1, fact_2]).", ["fact_1", "fact_2"]) == "Ректор."
+    assert strip_reference_annotations("Ректор (fact_id: fact_1, fact_2).", ["fact_1", "fact_2"]) == "Ректор."
+    assert "fact_unknown" in strip_reference_annotations("Ректор (fact_ids: [fact_unknown]).", ["fact_1"])
+
+
+def test_drafting_model_cannot_read_unapproved_facts_in_evidence():
+    req = reviewed_request()
+    marker = "Председатель непринятого совета"
+    req.facts[0].evidence[0].quote += " " + marker
+
+    class CaptureProvider(FixtureProvider):
+        async def complete(self, system, payload, schema):
+            assert marker not in json.dumps(payload, ensure_ascii=False)
+            assert all(set(fact) == {"fact_id", "field", "value", "person_name"}
+                       for fact in payload["facts"])
+            return await super().complete(system, payload, schema)
+
+    result = asyncio.run(AssistantPipeline(CaptureProvider([draft_response(req)])).generate_materials(req))
+    assert marker in result.sources[req.facts[0].fact_id][0].quote
+
+
+def test_short_reference_aliases_are_constrained_and_restored():
+    req = reviewed_request()
+
+    class AliasProvider(FixtureProvider):
+        async def complete(self, system, payload, schema):
+            assert [fact["fact_id"] for fact in payload["facts"]] == ["fact_1", "fact_2"]
+            assert schema["$defs"]["GroundedStatement"]["properties"]["fact_ids"]["items"]["enum"] == ["fact_1", "fact_2"]
+            output = draft_response(req)
+            output["brief_sections"][0]["statements"][0]["fact_ids"] = ["fact_1", "fact_2"]
+            output["slides"][0]["theses"][0]["fact_ids"] = ["fact_1", "fact_2"]
+            return json.dumps(output, ensure_ascii=False)
+
+    result = asyncio.run(AssistantPipeline(AliasProvider([])).generate_materials(req))
+    assert result.brief_sections[0].statements[0].fact_ids == [fact.fact_id for fact in req.facts]
 
 
 def test_brief_word_limit():
