@@ -4,3 +4,6 @@ pydantic>=2.6.0
 python-pptx>=0.6.23
 python-multipart>=0.0.9
 -r requirements-llm.txt
+
+# Excel registry import
+openpyxl>=3.1,<4
