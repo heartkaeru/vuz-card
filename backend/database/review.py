@@ -110,7 +110,9 @@ def write_report(db, directory):
       'review_queue.csv':'''SELECT s.id,b.started_at,r.locator,o.original_name,c.name,s.normalized_payload,s.errors,s.status
           FROM staging_record s JOIN source_record r ON r.id=s.source_record_id JOIN source o ON o.id=r.source_id
           JOIN import_batch b ON b.id=s.batch_id LEFT JOIN registry_candidate c ON c.id=s.candidate_id
-          WHERE s.rowid=(SELECT MAX(s2.rowid) FROM staging_record s2 WHERE s2.source_record_id=s.source_record_id) AND s.status='needs_review' ''',
+          WHERE s.rowid=(SELECT MAX(s2.rowid) FROM staging_record s2 WHERE s2.source_record_id=s.source_record_id)
+          AND (s.status='needs_review' OR (s.status='applied' AND EXISTS (
+            SELECT 1 FROM data_quality_issue q WHERE q.staging_record_id=s.id AND q.status='open'))) ''',
     }
     for filename,query in queries.items():
         cursor=db.execute(query)

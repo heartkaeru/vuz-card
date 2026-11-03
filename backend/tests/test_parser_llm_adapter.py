@@ -65,7 +65,7 @@ def test_context_request_contract() -> None:
     )
 
     fragment = request["documents"][0]["fragments"][0]
-    assert fragment["entity_scope_id"] == "s1"
+    assert "entity_scope_id" not in fragment
     assert "contact_hints" not in fragment
 
 

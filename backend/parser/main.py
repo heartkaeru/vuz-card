@@ -1185,6 +1185,7 @@ class UniversityParser:
         final_url = canonical
         content_type = "text/html"
         cached = self._cache.get_page(canonical) if self._cache else None
+        cache_entry = cached
         if cached is not None:
             html = str(cached.get("html") or "")
             final_url = str(cached.get("final_url") or canonical)
@@ -1209,6 +1210,7 @@ class UniversityParser:
                     else None
                 )
                 if stale is not None:
+                    cache_entry = stale
                     html = str(stale.get("html") or "")
                     final_url = str(stale.get("final_url") or canonical)
                     content_type = str(stale.get("content_type") or "text/html")
@@ -1280,6 +1282,7 @@ class UniversityParser:
         if len(doc.text) < 200 and self.settings.enable_playwright:
             rendered = self._render_with_playwright(canonical)
             if rendered and rendered != html:
+                cache_entry = None
                 html = rendered
                 soup = _make_soup(html)
                 doc = cleaner_obj.to_document(
@@ -1292,6 +1295,21 @@ class UniversityParser:
                     self._cache.set_page(
                         canonical, html, final_url, content_type, 200
                     )
+
+        if cache_entry is not None:
+            # Reprocessing a saved page is not a successful check of the website.
+            try:
+                retrieved_at = datetime.fromisoformat(
+                    str(cache_entry.get("retrieved_at", "")).replace("Z", "+00:00")
+                )
+                if retrieved_at.tzinfo is None:
+                    raise ValueError("Cache retrieval date has no timezone")
+            except ValueError:
+                self._warnings.append(f"{section}: кэш без достоверной даты получения ({canonical})")
+                self._failed_urls.add(canonical)
+                return None, None
+            doc.retrieved_at = retrieved_at
+            doc.metadata["cache_status"] = "cached" if cached is not None else "stale"
 
         if not doc.text:
             self._warnings.append(

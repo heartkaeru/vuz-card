@@ -538,7 +538,9 @@ class HTMLCleaner:
                 heading_fragment_id = fragment_id
 
             owner = self._infer_owner(heading, section)
-            hints = self._contact_hints(text, owner, heading_fragment_id)
+            # A default label such as "ВУЗ" is not evidence of ownership.
+            # Keep the contact in the text for extraction without inventing a hint.
+            hints = self._contact_hints(text, owner, heading_fragment_id) if heading else []
 
             fragments.append(
                 DocumentFragment(

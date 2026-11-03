@@ -303,6 +303,7 @@ class DocumentFragment(BaseModel):
     start: int = Field(ge=0)
     end: int = Field(ge=0)
     heading: str = ""
+    entity_scope_id: str | None = Field(default=None, min_length=1)
     contact_hints: list[ContactHint] = Field(default_factory=list)
 
 

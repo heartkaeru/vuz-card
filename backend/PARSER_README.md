@@ -104,9 +104,27 @@ officials = to_officials(card, institution_id="hse")
 `app.services.llm.fragment_models.FragmentExtractionRequest` (0.2) или
 `app.services.llm.context_models.ContextExtractionRequest` (0.3).
 
+Контакт без подтверждённого заголовком владельца остаётся в тексте, но не
+превращается в структурированную подсказку с выдуманным владельцем.
+При чтении HTML из кэша `retrieved_at` сохраняет дату загрузки страницы;
+повторная очистка не подтверждает актуальность сайта. В `metadata.cache_status`
+отмечается использование сохранённой или устаревшей копии.
+
+В режиме 0.3 весь документ не считается одной областью сущности. По умолчанию
+фрагменты независимы: это предотвращает перенос статуса между разными проектами
+на странице списка. Если парсер надёжно выделил одну статью/проект, его фрагментам
+можно явно задать одинаковый `DocumentFragment.entity_scope_id`. Без такой
+разметки связи между разными абзацами потребуют дополнительной обработки.
+
 ## Тесты
 
 ```bash
 cd backend
 python -m pytest tests/test_parser.py tests/test_cleaner.py
+```
+
+Общая проверка LLM, парсера и Excel-импорта из корня репозитория:
+
+```powershell
+backend/.venv/Scripts/python.exe -m pytest -q
 ```
