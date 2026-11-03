@@ -16,6 +16,20 @@ backend/storage/presentations/*.pptx
 backend/output/
 .pytest_cache/
 
+# Parser runtime data
+data/output/
+data/cache/
+data/logs/
+data/*.sqlite3
+data/*.sqlite3-*
+backend/data/output/
+backend/data/cache/
+backend/data/logs/
+backend/data/*.sqlite3
+
+# Aider
+.aider*
+
 # Node / Frontend
 node_modules/
 .pnpm-store/
