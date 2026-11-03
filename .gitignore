@@ -42,3 +42,8 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local database artifacts
+*.sqlite3
+*.sqlite3-*
+*.db
