@@ -7,3 +7,6 @@ requests>=2.31,<3
 beautifulsoup4>=4.12,<5
 lxml>=5.0
 -r requirements-llm.txt
+
+# Excel registry import
+openpyxl>=3.1,<4
