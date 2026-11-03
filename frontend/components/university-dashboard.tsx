@@ -1,16 +1,16 @@
 "use client";
 
-import { useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { ResearchPanel, type ResearchHandle } from "@/components/research-panel";
+import { api, post, errorText, type ApiCard, type SavedMaterial } from "@/lib/api";
 import { AgentChat } from "@/components/agent-chat";
 import { AgentSphere } from "@/components/agent-sphere";
 import { Icon, type IconName } from "@/components/icon";
 import {
-  createUniversity,
   initialUniversities,
   initialsFor,
   sampleEvents,
   sampleProjects,
-  savedReports,
   studyAreas,
   type Section,
   type University,
@@ -49,10 +49,14 @@ export default function UniversityDashboard() {
   const [createOpen, setCreateOpen] = useState(false);
   const [createName, setCreateName] = useState("");
   const [createCity, setCreateCity] = useState("");
+  const [createWebsite, setCreateWebsite] = useState("");
+  const [creating, setCreating] = useState(false);
+  const researchRef = useRef<ResearchHandle>(null);
   const [contacts, setContacts] = useState<Record<string, Contact[]>>({});
   const [contactOpen, setContactOpen] = useState(false);
   const [contactDraft, setContactDraft] = useState<Contact>({ name: "", role: "", phone: "", email: "" });
   const [reportSearch, setReportSearch] = useState("");
+  const [reports, setReports] = useState<SavedMaterial[]>([]);
   const [reportFilter, setReportFilter] = useState("Все форматы");
   const [reportFilterOpen, setReportFilterOpen] = useState(false);
   const [toast, setToast] = useState("");
@@ -65,11 +69,25 @@ export default function UniversityDashboard() {
     return matchesQuery && matchesRegion;
   });
   const universityContacts = contacts[selectedId] ?? [];
-  const filteredReports = savedReports.filter((report) => {
+  const filteredReports = reports.filter((report) => {
     const matchesQuery = `${report.name} ${report.format}`.toLocaleLowerCase("ru-RU").includes(reportSearch.toLocaleLowerCase("ru-RU").trim());
     return matchesQuery && (reportFilter === "Все форматы" || report.format === reportFilter);
   });
   const indicatorSection = hoveredSection ?? section;
+
+  useEffect(() => {
+    if (view === "reports") api<SavedMaterial[]>("/materials").then(setReports)
+      .catch((failure) => setToast(errorText(failure)));
+  }, [view]);
+
+  useEffect(() => {
+    api<ApiCard[]>("/cards").then((cards) => {
+      if (!cards.length) return;
+      const persisted: University[] = cards.map((card) => ({ ...card, id: card.id, backendId: card.id,
+        tone: "mint", draft: true }));
+      setUniversities([...persisted, ...initialUniversities.filter((item) => !cards.some((card) => card.name === item.name))]);
+    }).catch(() => setToast("Сервер недоступен. Запустите backend, чтобы сохранять карточки и собирать факты."));
+  }, []);
 
   useLayoutEffect(() => {
     const updateIndicator = () => {
@@ -113,13 +131,17 @@ export default function UniversityDashboard() {
   const openCreate = (suggestedName = "") => {
     setCreateName(suggestedName);
     setCreateCity("");
+    setCreateWebsite("");
     setCreateOpen(true);
   };
 
-  const handleCreateUniversity = (event: FormEvent<HTMLFormElement>) => {
+  const handleCreateUniversity = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!createName.trim()) return;
-    const university = createUniversity(createName, createCity);
+    setCreating(true);
+    try {
+    const card = await post<ApiCard>("/cards", { name: createName, city: createCity, website: createWebsite });
+    const university: University = { ...card, backendId: card.id, tone: "mint", draft: true };
     setUniversities((current) => [university, ...current]);
     setSelectedId(university.id);
     setHasChosenUniversity(true);
@@ -130,6 +152,8 @@ export default function UniversityDashboard() {
     setSection("about");
     setView("overview");
     notify("Создан черновик карточки. Факты можно добавить после проверки источников.");
+    } catch (failure) { notify(errorText(failure)); }
+    finally { setCreating(false); }
   };
 
   const handleCreateContact = (event: FormEvent<HTMLFormElement>) => {
@@ -171,7 +195,7 @@ export default function UniversityDashboard() {
         </div>
         <button className="user-card" type="button" onClick={() => notify("Профиль сотрудника") }>
           <span className="user-card__avatar">ИИ</span>
-          <span className="user-card__name">Иван Иванов</span>
+          <span className="user-card__name">Сотрудник</span>
           <Icon className="user-card__dots" name="dots" size={20} />
         </button>
       </aside>
@@ -255,8 +279,12 @@ export default function UniversityDashboard() {
             </div>
             <ProfileHero
               university={selectedUniversity}
-              onDownload={() => notify("Формирование отчёта появится после подключения сервиса документов.")}
+              onDownload={() => researchRef.current?.generate()}
             />
+            <ResearchPanel key={selectedUniversity.id} ref={researchRef} university={selectedUniversity}
+              showFacts={section === "contacts"} onShowFacts={() => setSection("contacts")}
+              onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
+                ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
             <div className="profile-tabs" role="tablist" aria-label="Разделы карточки" onMouseLeave={() => setHoveredSection(null)}>
               {tabs.map((tab) => (
                 <button
@@ -278,13 +306,6 @@ export default function UniversityDashboard() {
             </div>
             <div className="profile-content page-enter" key={`${selectedUniversity.id}-${section}`}>
               {section === "about" && <AboutSection university={selectedUniversity} onAdd={() => setChatOpen(true)} />}
-              {section === "contacts" && (
-                <ContactsSection
-                  university={selectedUniversity}
-                  contacts={universityContacts}
-                  onAdd={() => setContactOpen(true)}
-                />
-              )}
               {section === "projects" && <ProjectsSection university={selectedUniversity} />}
               {section === "events" && <EventsSection university={selectedUniversity} />}
             </div>
@@ -342,11 +363,11 @@ export default function UniversityDashboard() {
                 {filteredReports.map((report, index) => (
                   <article className="report-row" key={report.id} style={{ animationDelay: `${index * 45}ms` }}>
                     <div className={`report-format report-format--${report.format.toLowerCase()}`}>{report.format}</div>
-                    <div className="report-row__name"><strong>{report.name}</strong><span>Демо-запись · источник не подключён</span></div>
-                    <time className="report-row__date">{report.date}</time>
-                    <button className="button button--small-primary" type="button" onClick={() => notify("Просмотр отчётов станет доступен после подключения сервиса документов.")}>Открыть</button>
-                    <button className="icon-button icon-button--small" type="button" aria-label={`Скачать ${report.format}`} onClick={() => notify("Скачивание станет доступно после подключения сервиса документов.")}><Icon name="download" size={17} /></button>
-                    <button className="icon-button icon-button--small" type="button" aria-label={`Удалить ${report.format}`} onClick={() => notify("Удаление отчётов будет доступно после подключения сервиса документов.")}><Icon name="trash" size={16} /></button>
+                    <div className="report-row__name"><strong>{report.name}</strong><span>{report.stale ? "Факты изменились — сформируйте новую версию" : "Черновик по принятым фактам"}</span></div>
+                    <time className="report-row__date">{new Date(report.created_at).toLocaleDateString("ru-RU")}</time>
+                    {report.stale ? <span className="demo-label">Архивная версия</span> : <a className="button button--small-primary" href={report.brief_url} target="_blank" rel="noreferrer">Справка</a>}
+                    {report.stale ? <span /> : <a className="icon-button icon-button--small" href={report.download_url} aria-label="Скачать PPTX"><Icon name="download" size={17} /></a>}
+                    <span />
                   </article>
                 ))}
                 {filteredReports.length === 0 && (
@@ -354,21 +375,26 @@ export default function UniversityDashboard() {
                 )}
               </div>
             </div>
-            <p className="reports-disclaimer">Демонстрационный список. Отчёты можно будет открывать и скачивать после подключения сервиса генерации.</p>
+            <p className="reports-disclaimer">Файлы сохраняются после фактической сборки презентации. Перед встречей проверьте итоговый текст.</p>
           </section>
         )}
       </main>
 
       <AgentSphere onClick={() => setChatOpen(true)} hidden={chatOpen} />
-      <AgentChat open={chatOpen} universityName={selectedUniversity.name} onClose={onChatClose} />
+      <AgentChat open={chatOpen} universityName={selectedUniversity.name} onClose={onChatClose}
+        onAction={async (action) => {
+          if (!researchRef.current) return "Сначала откройте карточку учреждения из списка вузов.";
+          return action === "refresh" ? researchRef.current.refresh() : researchRef.current.generate();
+        }} />
 
       {createOpen && (
         <Modal title="Новая карточка вуза" onClose={() => setCreateOpen(false)}>
-          <p className="modal-copy">Добавьте название и регион. Остальные сведения появятся после подключения источников и проверки фактов.</p>
+          <p className="modal-copy">Добавьте название, регион и официальный сайт. Сведения о руководстве появятся после сбора и проверки.</p>
           <form className="modal-form" onSubmit={handleCreateUniversity}>
             <label>Название вуза<input autoFocus required value={createName} onChange={(event) => setCreateName(event.target.value)} placeholder="Например, университет или колледж" /></label>
             <label>Город или регион<input value={createCity} onChange={(event) => setCreateCity(event.target.value)} placeholder="Например, Казань" /></label>
-            <div className="modal-actions"><button className="button button--soft" type="button" onClick={() => setCreateOpen(false)}>Отмена</button><button className="button button--primary" type="submit"><Icon name="plus" size={16} /> Создать черновик</button></div>
+            <label>Официальный сайт<input required type="url" value={createWebsite} onChange={(event) => setCreateWebsite(event.target.value)} placeholder="https://university.ru" /></label>
+            <div className="modal-actions"><button className="button button--soft" type="button" onClick={() => setCreateOpen(false)}>Отмена</button><button className="button button--primary" type="submit" disabled={creating}><Icon name="plus" size={16} /> {creating ? "Сохранение…" : "Создать черновик"}</button></div>
           </form>
         </Modal>
       )}
@@ -401,7 +427,7 @@ function ProfileHero({ university, onDownload }: { university: University; onDow
       <div className="profile-hero__copy">
         <span className="profile-hero__overline">КАРТОЧКА ОБРАЗОВАТЕЛЬНОЙ ОРГАНИЗАЦИИ</span>
         <h1>{university.name}</h1>
-        <p className="profile-hero__meta"><Icon name="pin" size={15} /> {university.city}<span className="meta-separator">·</span>{university.draft ? "черновик · сведения не проверены" : "демо-данные · требуется проверка"}</p>
+        <p className="profile-hero__meta"><Icon name="pin" size={15} /> {university.city}<span className="meta-separator">·</span>Проверка сведений по первоисточникам</p>
         <button className="button button--primary profile-hero__download" type="button" onClick={onDownload}><Icon name="download" size={16} /> Скачать отчёт</button>
       </div>
       <div className="profile-hero__metrics">

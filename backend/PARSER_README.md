@@ -45,6 +45,7 @@ python -m parser.main --input-file universities.txt
 ```text
 data/output/<slug>/<slug>_card.json
 data/output/<slug>/<slug>_documents_<timestamp>.json
+data/output/<slug>/<slug>_llm_card_<timestamp>.json
 data/output/<slug>/<slug>_changes_<timestamp>.json
 data/parser.sqlite3
 data/cache/pages.json
@@ -52,6 +53,13 @@ data/logs/parser.log
 ```
 
 `data/` исключён из git: результаты парсинга не коммитятся.
+
+`*_llm_card_*.json` — полный нативный `UniversityData`, включая документы и фрагменты,
+для [LLMWorkflow / workflow_cli](docs/llm/LLM_WORKFLOW.md). Старый `*_card.json`
+не содержит документов; описательный `*_documents_*.json` не является этим входным контрактом.
+В серверном сценарии Демо 1 `UniversityParser.parse(..., allowed_sections=...)`
+ограничивает сбор руководством/контактами. При проблемах автообнаружения UI позволяет
+передать точную страницу руководства на том же официальном домене.
 
 ## Категории документов
 

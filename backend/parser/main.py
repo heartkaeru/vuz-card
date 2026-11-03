@@ -810,6 +810,7 @@ class UniversityParser:
         url: str | None = None,
         name: str | None = None,
         profile: UniversityProfile | str | None = None,
+        allowed_sections: Sequence[str] | None = None,
     ) -> UniversityData:
         """Собирает данные и возвращает валидированную карточку."""
 
@@ -867,6 +868,8 @@ class UniversityParser:
                 content_selectors=project_section.content_selectors,
             )
         sections = list(by_name.values())
+        if allowed_sections is not None:
+            sections = [section for section in sections if section.name in allowed_sections]
         sections.sort(key=lambda section: SECTION_ORDER.get(section.name, 99))
 
         if not sections:
@@ -2820,9 +2823,12 @@ def save_results(
 
     card_path = directory / f"{slug}_card_{timestamp}.json"
     documents_path = directory / f"{slug}_documents_{timestamp}.json"
+    llm_card_path = directory / f"{slug}_llm_card_{timestamp}.json"
     changes_path = directory / f"{slug}_changes_{timestamp}.json"
 
     utils.atomic_write_json(card_path, card.to_json_dict())
+    # Lossless input for the workflow: keep IDs, timestamps, scopes and contact hints.
+    utils.atomic_write_json(llm_card_path, card.model_dump(mode="json"))
     university_name = card.university.name
     official_domain = card.university.official_domain
     document_records = [
@@ -2877,6 +2883,7 @@ def save_results(
         "card": card_path,
         "latest": latest_path,
         "documents": documents_path,
+        "llm_card": llm_card_path,
     }
     if change_report is not None:
         utils.atomic_write_json(changes_path, change_report.model_dump(mode="json"))

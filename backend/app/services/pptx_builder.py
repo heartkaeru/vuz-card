@@ -7,8 +7,7 @@ from pptx.dml.color import RGBColor
 from app.data.mock_universities import MOCK_UNIVERSITIES_DB
 
 # Директория для сохранения сгенерированных презентаций
-STORAGE_DIR = Path("d:/Dev/vuz-card/backend/storage/presentations")
-STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+STORAGE_DIR = Path(__file__).resolve().parents[2] / "output/legacy-presentations"
 
 
 def build_university_presentation(university_id: int) -> str:
@@ -16,6 +15,7 @@ def build_university_presentation(university_id: int) -> str:
     Генерирует брендированную презентацию .pptx к встрече с руководством ВУЗа.
     Возвращает путь к созданному файлу.
     """
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     uni = MOCK_UNIVERSITIES_DB.get(university_id)
     if not uni:
         raise ValueError(f"ВУЗ {university_id} не найден")

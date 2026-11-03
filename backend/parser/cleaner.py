@@ -41,6 +41,8 @@ from .models import (
     utc_now,
 )
 from .utils import (
+    EMAIL_RE,
+    PHONE_RE,
     clean_email,
     clean_phone,
     extract_emails,
@@ -305,7 +307,13 @@ class HTMLCleaner:
         for selector in self.noise_selectors:
             try:
                 for node in soup.select(selector):
-                    node.decompose()
+                    # ASP.NET pages can wrap the entire article in <form runat=server>.
+                    # Keep semantic source content; controls are removed separately.
+                    if selector == "form" and (node.find(["main", "article", "table"])
+                                                or node.select_one("[itemprop]")):
+                        node.unwrap()
+                    else:
+                        node.decompose()
             except Exception:  # noqa: BLE001 - некорректный селектор не критичен
                 LOGGER.debug("Некорректный селектор шума: %s", selector)
 
@@ -580,7 +588,9 @@ class HTMLCleaner:
     ) -> list[ContactHint]:
         hints: list[ContactHint] = []
         context = [heading_fragment_id] if heading_fragment_id else []
-        for email in extract_emails(text):
+        # Hint values must be literal source lexemes, not display-normalized contacts.
+        for match in EMAIL_RE.finditer(text):
+            email = match.group(1)
             hints.append(
                 ContactHint(
                     field="contact.email",
@@ -589,7 +599,10 @@ class HTMLCleaner:
                     context_fragment_ids=context,
                 )
             )
-        for phone in extract_phones(text):
+        for match in PHONE_RE.finditer(text):
+            phone = match.group(0).strip().rstrip(".")
+            if not clean_phone(phone):
+                continue
             hints.append(
                 ContactHint(
                     field="contact.phone",

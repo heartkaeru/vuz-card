@@ -4,6 +4,9 @@ export type University = {
   city: string;
   tone: "mint" | "blue" | "yellow";
   draft?: boolean;
+  website?: string;
+  backendId?: string;
+  version?: number;
 };
 
 export type Section = "about" | "contacts" | "projects" | "events";
