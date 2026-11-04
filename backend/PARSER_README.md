@@ -45,6 +45,7 @@ python -m parser.main --input-file universities.txt
 ```text
 data/output/<slug>/<slug>_card.json
 data/output/<slug>/<slug>_documents_<timestamp>.json
+data/output/<slug>/<slug>_llm_card_<timestamp>.json
 data/output/<slug>/<slug>_changes_<timestamp>.json
 data/parser.sqlite3
 data/cache/pages.json
@@ -52,6 +53,13 @@ data/logs/parser.log
 ```
 
 `data/` исключён из git: результаты парсинга не коммитятся.
+
+`*_llm_card_*.json` — полный нативный `UniversityData`, включая документы и фрагменты,
+для [LLMWorkflow / workflow_cli](docs/llm/LLM_WORKFLOW.md). Старый `*_card.json`
+не содержит документов; описательный `*_documents_*.json` не является этим входным контрактом.
+В серверном сценарии Демо 1 `UniversityParser.parse(..., allowed_sections=...)`
+ограничивает сбор руководством/контактами. При проблемах автообнаружения UI позволяет
+передать точную страницу руководства на том же официальном домене.
 
 ## Категории документов
 
@@ -104,9 +112,27 @@ officials = to_officials(card, institution_id="hse")
 `app.services.llm.fragment_models.FragmentExtractionRequest` (0.2) или
 `app.services.llm.context_models.ContextExtractionRequest` (0.3).
 
+Контакт без подтверждённого заголовком владельца остаётся в тексте, но не
+превращается в структурированную подсказку с выдуманным владельцем.
+При чтении HTML из кэша `retrieved_at` сохраняет дату загрузки страницы;
+повторная очистка не подтверждает актуальность сайта. В `metadata.cache_status`
+отмечается использование сохранённой или устаревшей копии.
+
+В режиме 0.3 весь документ не считается одной областью сущности. По умолчанию
+фрагменты независимы: это предотвращает перенос статуса между разными проектами
+на странице списка. Если парсер надёжно выделил одну статью/проект, его фрагментам
+можно явно задать одинаковый `DocumentFragment.entity_scope_id`. Без такой
+разметки связи между разными абзацами потребуют дополнительной обработки.
+
 ## Тесты
 
 ```bash
 cd backend
 python -m pytest tests/test_parser.py tests/test_cleaner.py
+```
+
+Общая проверка LLM, парсера и Excel-импорта из корня репозитория:
+
+```powershell
+backend/.venv/Scripts/python.exe -m pytest -q
 ```

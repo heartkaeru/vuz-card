@@ -1,0 +1,16 @@
+{
+  "template_id": "customer-card-v1",
+  "design_reference": "Примеры ИКЭСТ и ИРНИТУ, предоставленные заказчиком",
+  "sections": ["overview", "leadership", "biography", "questions", "theses", "sources"],
+  "width_inches": 13.333333,
+  "height_inches": 7.5,
+  "font": "Calibri",
+  "text_color": "313F48",
+  "muted_color": "647078",
+  "title_pt": 28,
+  "body_pt": 18,
+  "body_lines": 15,
+  "line_characters": 88,
+  "header_image": "assets/sber-gradient-header.jpg",
+  "logo_image": "assets/sber-logo.png"
+}

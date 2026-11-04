@@ -150,7 +150,7 @@ def import_file(db, path, department='Не указан'):
             raise ValueError(f'No supported contact headers found in {path.name}; nothing imported')
         source = uid('source',sha)
         batch = str(uuid.uuid4())
-        counts = {'data_rows':0,'review':0,'applied':0,'service_rows':0,'unsupported_sheets':0}
+        counts = {'data_rows':0,'review':0,'review_required':0,'applied':0,'service_rows':0,'unsupported_sheets':0}
         with db:
             department_id=uid('department',department)
             db.execute('INSERT OR IGNORE INTO department VALUES (?,?)',(department_id,department))
@@ -230,9 +230,10 @@ def import_file(db, path, department='Не указан'):
                         issue(db,stage,error,error)
                     if row_type=='data':
                         counts['applied' if status=='applied' else 'review']+=1
+                        if status=='needs_review' or errors:
+                            counts['review_required']+=1
             db.execute('UPDATE import_batch SET status=?,finished_at=?,counters=? WHERE id=?',
-                       ('completed_with_review' if counts['review'] or counts['unsupported_sheets'] else 'completed',now(),dump(counts),batch))
+                       ('completed_with_review' if counts['review_required'] or counts['unsupported_sheets'] else 'completed',now(),dump(counts),batch))
         return {'batch_id':batch,'source_id':source,**counts}
     finally:
         workbook.close()
-

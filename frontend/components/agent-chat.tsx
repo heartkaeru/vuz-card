@@ -8,15 +8,17 @@ type AgentChatProps = {
   open: boolean;
   universityName: string;
   onClose: () => void;
+  onAction?: (action: "refresh" | "presentation") => Promise<string>;
 };
 
-export function AgentChat({ open, universityName, onClose }: AgentChatProps) {
+export function AgentChat({ open, universityName, onClose, onAction }: AgentChatProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
   const [typing, setTyping] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const messageEndRef = useRef<HTMLDivElement>(null);
   const nextId = useRef(0);
+  useEffect(() => { setMessages([]); }, [universityName]);
 
   useEffect(() => {
     if (!open) return;
@@ -35,7 +37,7 @@ export function AgentChat({ open, universityName, onClose }: AgentChatProps) {
     messageEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, typing]);
 
-  const sendMessage = (text: string) => {
+  const sendMessage = async (text: string) => {
     const value = text.trim();
     if (!value || typing) return;
     const requestId = nextId.current++;
@@ -43,17 +45,18 @@ export function AgentChat({ open, universityName, onClose }: AgentChatProps) {
     setDraft("");
     setTyping(true);
 
-    window.setTimeout(() => {
+    try {
       const action = value.toLocaleLowerCase("ru-RU");
-      const response = action.includes("обновить")
-        ? `Запрос на обновление карточки «${universityName}» подготовлен. В этой версии интерфейс не подключён к источникам данных, поэтому сбор не запускался.`
-        : action.includes("контакт")
-          ? `Чтобы добавить контакт в карточку «${universityName}», сначала нужны его данные и подтверждающий источник. Здесь можно подключить этот сценарий к серверу.`
-          : `Запрос по «${universityName}» принят в демо-интерфейсе. Сейчас карточка не подключена к поиску и CRM: перед добавлением сведений понадобится загрузить источники и проверить факты.`;
+      const response = onAction && /обнов|найди.*руковод|собери.*руковод/.test(action)
+        ? await onAction("refresh")
+        : onAction && /презентаци|сформируй.*отч|скача.*отч/.test(action)
+          ? await onAction("presentation")
+          : `Для «${universityName}» доступны команды «Обновить данные» и «Сформировать презентацию». Выберите официальный сайт в карточке; перед презентацией проверьте найденные факты и источники.`;
       const responseId = nextId.current++;
       setMessages((current) => [...current, { id: responseId, role: "assistant", text: response }]);
-      setTyping(false);
-    }, 620);
+    } catch {
+      setMessages((current) => [...current, { id: nextId.current++, role: "assistant", text: "Не удалось создать задание. Проверьте сообщение в карточке и доступность сервера." }]);
+    } finally { setTyping(false); }
   };
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -90,7 +93,7 @@ export function AgentChat({ open, universityName, onClose }: AgentChatProps) {
           <div className="agent-chat__avatar" aria-hidden="true">AI</div>
           <div className="agent-chat__identity">
             <h2>ИИ-агент</h2>
-            <p><span className="status-dot" /> Онлайн · готов помочь</p>
+            <p><span className="status-dot" /> Сбор данных и подготовка к встрече</p>
           </div>
           <button className="icon-button agent-chat__close" type="button" onClick={onClose} aria-label="Закрыть чат">
             <Icon name="close" size={19} />
@@ -122,7 +125,7 @@ export function AgentChat({ open, universityName, onClose }: AgentChatProps) {
 
         <div className="agent-chat__footer">
           <div className="agent-chat__quick-actions">
-            <button type="button" onClick={() => sendMessage("Добавить контакт")}>Добавить контакт</button>
+            <button type="button" onClick={() => sendMessage("Сформировать презентацию")}>Презентация</button>
             <button type="button" onClick={() => sendMessage("Обновить данные")}>Обновить данные</button>
           </div>
           <form className="agent-chat__composer" onSubmit={handleSubmit}>

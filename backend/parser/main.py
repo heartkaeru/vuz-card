@@ -810,6 +810,7 @@ class UniversityParser:
         url: str | None = None,
         name: str | None = None,
         profile: UniversityProfile | str | None = None,
+        allowed_sections: Sequence[str] | None = None,
     ) -> UniversityData:
         """Собирает данные и возвращает валидированную карточку."""
 
@@ -867,6 +868,8 @@ class UniversityParser:
                 content_selectors=project_section.content_selectors,
             )
         sections = list(by_name.values())
+        if allowed_sections is not None:
+            sections = [section for section in sections if section.name in allowed_sections]
         sections.sort(key=lambda section: SECTION_ORDER.get(section.name, 99))
 
         if not sections:
@@ -1185,6 +1188,7 @@ class UniversityParser:
         final_url = canonical
         content_type = "text/html"
         cached = self._cache.get_page(canonical) if self._cache else None
+        cache_entry = cached
         if cached is not None:
             html = str(cached.get("html") or "")
             final_url = str(cached.get("final_url") or canonical)
@@ -1209,6 +1213,7 @@ class UniversityParser:
                     else None
                 )
                 if stale is not None:
+                    cache_entry = stale
                     html = str(stale.get("html") or "")
                     final_url = str(stale.get("final_url") or canonical)
                     content_type = str(stale.get("content_type") or "text/html")
@@ -1280,6 +1285,7 @@ class UniversityParser:
         if len(doc.text) < 200 and self.settings.enable_playwright:
             rendered = self._render_with_playwright(canonical)
             if rendered and rendered != html:
+                cache_entry = None
                 html = rendered
                 soup = _make_soup(html)
                 doc = cleaner_obj.to_document(
@@ -1292,6 +1298,21 @@ class UniversityParser:
                     self._cache.set_page(
                         canonical, html, final_url, content_type, 200
                     )
+
+        if cache_entry is not None:
+            # Reprocessing a saved page is not a successful check of the website.
+            try:
+                retrieved_at = datetime.fromisoformat(
+                    str(cache_entry.get("retrieved_at", "")).replace("Z", "+00:00")
+                )
+                if retrieved_at.tzinfo is None:
+                    raise ValueError("Cache retrieval date has no timezone")
+            except ValueError:
+                self._warnings.append(f"{section}: кэш без достоверной даты получения ({canonical})")
+                self._failed_urls.add(canonical)
+                return None, None
+            doc.retrieved_at = retrieved_at
+            doc.metadata["cache_status"] = "cached" if cached is not None else "stale"
 
         if not doc.text:
             self._warnings.append(
@@ -2802,9 +2823,12 @@ def save_results(
 
     card_path = directory / f"{slug}_card_{timestamp}.json"
     documents_path = directory / f"{slug}_documents_{timestamp}.json"
+    llm_card_path = directory / f"{slug}_llm_card_{timestamp}.json"
     changes_path = directory / f"{slug}_changes_{timestamp}.json"
 
     utils.atomic_write_json(card_path, card.to_json_dict())
+    # Lossless input for the workflow: keep IDs, timestamps, scopes and contact hints.
+    utils.atomic_write_json(llm_card_path, card.model_dump(mode="json"))
     university_name = card.university.name
     official_domain = card.university.official_domain
     document_records = [
@@ -2859,6 +2883,7 @@ def save_results(
         "card": card_path,
         "latest": latest_path,
         "documents": documents_path,
+        "llm_card": llm_card_path,
     }
     if change_report is not None:
         utils.atomic_write_json(changes_path, change_report.model_dump(mode="json"))

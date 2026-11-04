@@ -1,0 +1,14 @@
+{
+  "template_id": "meeting-v1",
+  "title": "Материалы к встрече с руководством",
+  "width_inches": 13.333333,
+  "height_inches": 7.5,
+  "font": "Calibri",
+  "accent": "21A038",
+  "text": "1B1F23",
+  "muted": "647078",
+  "body_pt": 18,
+  "title_pt": 30,
+  "body_lines": 14,
+  "line_characters": 88
+}

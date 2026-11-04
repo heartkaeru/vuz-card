@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import Iterable, Literal
 
 from .models import Leadership, SourceDocument, UniversityData
@@ -56,6 +57,8 @@ def to_llm_document(
             }
             if entity_scope_id is not None:
                 item["entity_scope_id"] = entity_scope_id or document.source_id
+            elif not include_contact_hints and fragment.entity_scope_id is not None:
+                item["entity_scope_id"] = fragment.entity_scope_id
             if include_contact_hints:
                 item["contact_hints"] = [
                     hint.model_dump(mode="json")
@@ -95,7 +98,6 @@ def to_llm_request(
         documents = [
             to_llm_document(
                 document,
-                entity_scope_id=document.source_id,
                 include_fragments=True,
                 include_contact_hints=False,
             )
@@ -172,6 +174,6 @@ def to_university_detail(
 def _rector_name(leaders: Iterable[Leadership]) -> str | None:
     for leader in leaders:
         position = (leader.position or "").lower()
-        if "ректор" in position and "проректор" not in position:
+        if re.search(r"\bректор(?:а|ом|у|е)?\b", position):
             return leader.full_name
-    return leaders[0].full_name if leaders else None
+    return None
