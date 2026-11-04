@@ -279,7 +279,7 @@ export default function UniversityDashboard() {
             </div>
             <ProfileHero
               university={selectedUniversity}
-              onDownload={() => researchRef.current?.generate()}
+              onPreview={() => researchRef.current?.openReportOptions()}
             />
             <ResearchPanel key={selectedUniversity.id} ref={researchRef} university={selectedUniversity}
               showFacts={section === "contacts"} onShowFacts={() => setSection("contacts")}
@@ -419,7 +419,7 @@ export default function UniversityDashboard() {
   );
 }
 
-function ProfileHero({ university, onDownload }: { university: University; onDownload: () => void }) {
+function ProfileHero({ university, onPreview }: { university: University; onPreview: () => void }) {
   return (
     <section className="profile-hero">
       <div className="profile-hero__decor profile-hero__decor--one" />
@@ -428,7 +428,7 @@ function ProfileHero({ university, onDownload }: { university: University; onDow
         <span className="profile-hero__overline">КАРТОЧКА ОБРАЗОВАТЕЛЬНОЙ ОРГАНИЗАЦИИ</span>
         <h1>{university.name}</h1>
         <p className="profile-hero__meta"><Icon name="pin" size={15} /> {university.city}<span className="meta-separator">·</span>Проверка сведений по первоисточникам</p>
-        <button className="button button--primary profile-hero__download" type="button" onClick={onDownload}><Icon name="file" size={16} /> Сформировать отчёт</button>
+        <button className="button button--primary profile-hero__download" type="button" onClick={onPreview}><Icon name="search" size={16} /> Просмотреть</button>
       </div>
       <div className="profile-hero__metrics">
         <div className="hero-metric hero-metric--green"><span className="hero-metric__icon"><Icon name="spark" size={15} /></span><span>Точки соприкосновений</span><strong>—</strong></div>
