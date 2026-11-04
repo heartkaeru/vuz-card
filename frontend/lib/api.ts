@@ -1,7 +1,10 @@
 export type ApiCard = { id: string; name: string; city: string; website: string; version: number; latest_run: string | null };
 export type Fact = {
   fact_id: string; field: string; value: string;
-  subject: { person_name: string | null; entity_name?: string };
+  subject: {
+    person_name: string | null; entity_name?: string; entity_id?: string;
+    entity_kind?: "institution" | "project" | "event"; department?: string | null; position?: string | null;
+  };
   contact_owner?: { kind: string; label: string } | null;
   verification_status: "pending" | "verified" | "conflict" | "rejected";
   validation_status: "passed" | "failed"; issues: string[];

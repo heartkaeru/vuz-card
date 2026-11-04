@@ -2,16 +2,12 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ResearchPanel, type ResearchHandle } from "@/components/research-panel";
-import { api, post, errorText, type ApiCard, type SavedMaterial } from "@/lib/api";
+import { api, post, errorText, type ApiCard, type Fact, type ResearchRun, type SavedMaterial } from "@/lib/api";
 import { AgentChat } from "@/components/agent-chat";
 import { AgentSphere } from "@/components/agent-sphere";
 import { Icon, type IconName } from "@/components/icon";
 import {
-  initialUniversities,
   initialsFor,
-  sampleEvents,
-  sampleProjects,
-  studyAreas,
   type Section,
   type University,
   type View,
@@ -31,17 +27,17 @@ const tabs: { key: Section; label: string }[] = [
   { key: "events", label: "Мероприятия" },
 ];
 
-type Contact = { name: string; role: string; phone: string; email: string };
-
 export default function UniversityDashboard() {
   const [view, setView] = useState<View>("universities");
   const [section, setSection] = useState<Section>("about");
   const [hoveredSection, setHoveredSection] = useState<Section | null>(null);
   const [tabIndicator, setTabIndicator] = useState({ left: 0, width: 0 });
   const tabRefs = useRef<Partial<Record<Section, HTMLButtonElement>>>({});
-  const [universities, setUniversities] = useState(initialUniversities);
-  const [selectedId, setSelectedId] = useState(initialUniversities[0].id);
+  const [universities, setUniversities] = useState<University[]>([]);
+  const [selectedId, setSelectedId] = useState("");
   const [hasChosenUniversity, setHasChosenUniversity] = useState(false);
+  const [cardsLoading, setCardsLoading] = useState(true);
+  const [cardsError, setCardsError] = useState("");
   const [universitySearch, setUniversitySearch] = useState("");
   const [globalSearch, setGlobalSearch] = useState("");
   const [regionFilter, setRegionFilter] = useState("Все регионы");
@@ -52,23 +48,23 @@ export default function UniversityDashboard() {
   const [createWebsite, setCreateWebsite] = useState("");
   const [creating, setCreating] = useState(false);
   const researchRef = useRef<ResearchHandle>(null);
-  const [contacts, setContacts] = useState<Record<string, Contact[]>>({});
-  const [contactOpen, setContactOpen] = useState(false);
-  const [contactDraft, setContactDraft] = useState<Contact>({ name: "", role: "", phone: "", email: "" });
+  const [runs, setRuns] = useState<Record<string, ResearchRun | null>>({});
   const [reportSearch, setReportSearch] = useState("");
   const [reports, setReports] = useState<SavedMaterial[]>([]);
+  const [reportsLoading, setReportsLoading] = useState(false);
+  const [reportsError, setReportsError] = useState("");
   const [reportFilter, setReportFilter] = useState("Все форматы");
   const [reportFilterOpen, setReportFilterOpen] = useState(false);
   const [toast, setToast] = useState("");
 
-  const selectedUniversity = universities.find((university) => university.id === selectedId) ?? universities[0];
+  const selectedUniversity = universities.find((university) => university.id === selectedId);
+  const selectedRun = selectedId ? runs[selectedId] ?? null : null;
   const regions = useMemo(() => [...new Set(universities.map((university) => university.city))], [universities]);
   const filteredUniversities = universities.filter((university) => {
     const matchesQuery = `${university.name} ${university.city}`.toLocaleLowerCase("ru-RU").includes(universitySearch.toLocaleLowerCase("ru-RU").trim());
     const matchesRegion = regionFilter === "Все регионы" || university.city === regionFilter;
     return matchesQuery && matchesRegion;
   });
-  const universityContacts = contacts[selectedId] ?? [];
   const filteredReports = reports.filter((report) => {
     const matchesQuery = `${report.name} ${report.format}`.toLocaleLowerCase("ru-RU").includes(reportSearch.toLocaleLowerCase("ru-RU").trim());
     return matchesQuery && (reportFilter === "Все форматы" || report.format === reportFilter);
@@ -76,17 +72,33 @@ export default function UniversityDashboard() {
   const indicatorSection = hoveredSection ?? section;
 
   useEffect(() => {
-    if (view === "reports") api<SavedMaterial[]>("/materials").then(setReports)
-      .catch((failure) => setToast(errorText(failure)));
+    if (view !== "reports") return;
+    let active = true;
+    setReportsLoading(true);
+    setReportsError("");
+    api<SavedMaterial[]>("/materials").then((items) => {
+      if (active) setReports(items);
+    }).catch((failure) => {
+      if (active) setReportsError(errorText(failure));
+    }).finally(() => {
+      if (active) setReportsLoading(false);
+    });
+    return () => { active = false; };
   }, [view]);
 
   useEffect(() => {
+    let active = true;
     api<ApiCard[]>("/cards").then((cards) => {
-      if (!cards.length) return;
+      if (!active) return;
       const persisted: University[] = cards.map((card) => ({ ...card, id: card.id, backendId: card.id,
-        tone: "mint", draft: true }));
-      setUniversities([...persisted, ...initialUniversities.filter((item) => !cards.some((card) => card.name === item.name))]);
-    }).catch(() => setToast("Сервер недоступен. Запустите backend, чтобы сохранять карточки и собирать факты."));
+        tone: "mint", draft: card.latest_run === null }));
+      setUniversities(persisted);
+      setSelectedId((current) => persisted.some((item) => item.id === current) ? current : persisted[0]?.id ?? "");
+      setCardsError("");
+    }).catch((failure) => {
+      if (active) setCardsError(errorText(failure));
+    }).finally(() => { if (active) setCardsLoading(false); });
+    return () => { active = false; };
   }, []);
 
   useLayoutEffect(() => {
@@ -107,7 +119,7 @@ export default function UniversityDashboard() {
   };
 
   const navigate = (nextView: View) => {
-    if (nextView === "overview" && !hasChosenUniversity) return;
+    if ((nextView === "overview" || nextView === "events") && (!hasChosenUniversity || !selectedUniversity)) return;
     setView(nextView);
     if (nextView === "overview") setSection("about");
     if (nextView === "events") setSection("events");
@@ -156,18 +168,6 @@ export default function UniversityDashboard() {
     finally { setCreating(false); }
   };
 
-  const handleCreateContact = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!contactDraft.name.trim()) return;
-    setContacts((current) => ({
-      ...current,
-      [selectedId]: [...(current[selectedId] ?? []), contactDraft],
-    }));
-    setContactDraft({ name: "", role: "", phone: "", email: "" });
-    setContactOpen(false);
-    notify("Контакт добавлен в черновик карточки.");
-  };
-
   const onChatClose = () => setChatOpen(false);
 
   return (
@@ -181,10 +181,10 @@ export default function UniversityDashboard() {
                 className={`nav-link${view === item.key ? " nav-link--active" : ""}`}
                 type="button"
                 key={item.key}
-                disabled={item.key === "overview" && !hasChosenUniversity}
+                disabled={(item.key === "overview" || item.key === "events") && (!hasChosenUniversity || !selectedUniversity)}
                 onClick={() => navigate(item.key)}
                 aria-current={view === item.key ? "page" : undefined}
-                aria-disabled={item.key === "overview" && !hasChosenUniversity}
+                aria-disabled={(item.key === "overview" || item.key === "events") && (!hasChosenUniversity || !selectedUniversity)}
               >
                 <span className="nav-link__icon"><Icon name={item.icon} size={18} /></span>
                 <span>{item.label}</span>
@@ -232,7 +232,13 @@ export default function UniversityDashboard() {
               </button>
             </div>
 
-            {filteredUniversities.length > 0 ? (
+            {cardsLoading ? (
+              <div className="empty-state empty-state--search">
+                <span className="empty-state__icon"><Icon name="university" size={24} /></span>
+                <h2>Загружаем карточки</h2>
+                <p>Подключаемся к базе сохранённых организаций.</p>
+              </div>
+            ) : filteredUniversities.length > 0 ? (
               <div className="university-grid">
                 {filteredUniversities.map((university, index) => (
                   <button
@@ -257,8 +263,8 @@ export default function UniversityDashboard() {
             ) : (
               <div className="empty-state empty-state--search">
                 <span className="empty-state__icon"><Icon name="university" size={24} /></span>
-                <h2>Такого вуза пока нет в базе</h2>
-                <p>Создайте черновик — название и регион попадут в карточку, а сведения можно добавить после проверки источников.</p>
+                <h2>{cardsError ? "Не удалось загрузить карточки" : universities.length ? "Такого вуза пока нет в базе" : "Карточек вузов пока нет"}</h2>
+                <p>{cardsError || "Создайте черновик — он сохранится в базе и появится в списке после перезагрузки."}</p>
                 <button className="button button--primary" type="button" onClick={() => openCreate(universitySearch)}>
                   <Icon name="plus" size={17} /> Создать карточку
                 </button>
@@ -268,7 +274,7 @@ export default function UniversityDashboard() {
           </section>
         )}
 
-        {view === "overview" && (
+        {view === "overview" && selectedUniversity && (
           <section className="page-section profile-page page-enter" key={`profile-${selectedUniversity.id}`} aria-label={`Карточка: ${selectedUniversity.name}`}>
             <div className="profile-topbar">
               <div className="breadcrumbs"><button type="button" onClick={() => navigate("universities")}>ВУЗы</button><span>/</span><span>Карточка организации</span></div>
@@ -283,6 +289,7 @@ export default function UniversityDashboard() {
             />
             <ResearchPanel key={selectedUniversity.id} ref={researchRef} university={selectedUniversity}
               showFacts={section === "contacts"} onShowFacts={() => setSection("contacts")}
+              onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
               onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
                 ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
             <div className="profile-tabs" role="tablist" aria-label="Разделы карточки" onMouseLeave={() => setHoveredSection(null)}>
@@ -305,14 +312,15 @@ export default function UniversityDashboard() {
               <span className="profile-tabs__indicator" aria-hidden="true" style={{ left: tabIndicator.left, width: tabIndicator.width }} />
             </div>
             <div className="profile-content page-enter" key={`${selectedUniversity.id}-${section}`}>
-              {section === "about" && <AboutSection university={selectedUniversity} onAdd={() => setChatOpen(true)} />}
-              {section === "projects" && <ProjectsSection university={selectedUniversity} />}
-              {section === "events" && <EventsSection university={selectedUniversity} />}
+              {section === "about" && <AboutSection university={selectedUniversity} run={selectedRun} onAdd={() => setChatOpen(true)} />}
+              {section === "contacts" && <ContactsSection university={selectedUniversity} run={selectedRun} />}
+              {section === "projects" && <ProjectsSection university={selectedUniversity} run={selectedRun} />}
+              {section === "events" && <EventsSection university={selectedUniversity} run={selectedRun} />}
             </div>
           </section>
         )}
 
-        {view === "events" && (
+        {view === "events" && selectedUniversity && (
           <section className="page-section events-page page-enter" key="events" aria-label="Мероприятия">
             <div className="page-heading-row">
               <div>
@@ -323,7 +331,7 @@ export default function UniversityDashboard() {
               <button className="button button--soft" type="button" onClick={() => setChatOpen(true)}><Icon name="spark" size={17} /> Обсудить с агентом</button>
             </div>
             <div className="events-context"><span className="events-context__mark">{initialsFor(selectedUniversity.name)}</span><div><span className="muted-label">Выбранный вуз</span><strong>{selectedUniversity.name}</strong><span className="events-context__city"><Icon name="pin" size={14} /> {selectedUniversity.city}</span></div><button className="text-button" type="button" onClick={() => navigate("universities")}>Выбрать вуз <Icon name="arrow" size={16} /></button></div>
-            <EventsList events={sampleEvents} demo />
+            <ContextEntityList kind="event" run={selectedRun} empty="Проверенных мероприятий в карточке пока нет." />
           </section>
         )}
 
@@ -348,7 +356,7 @@ export default function UniversityDashboard() {
                 </button>
                 {reportFilterOpen && (
                   <div className="filter-menu" role="menu">
-                    {["Все форматы", "PPTX", "DOCX", "XLSX"].map((format) => (
+                    {["Все форматы", "PPTX"].map((format) => (
                       <button type="button" role="menuitemradio" aria-checked={reportFilter === format} key={format} onClick={() => { setReportFilter(format); setReportFilterOpen(false); }}>
                         <span>{format}</span>{reportFilter === format && <Icon name="check" size={15} />}
                       </button>
@@ -360,19 +368,25 @@ export default function UniversityDashboard() {
             <div className="report-table-wrap">
               <div className="report-table-head"><span>Название отчёта</span><span>Дата сохранения</span><span>Действия</span></div>
               <div className="report-list">
-                {filteredReports.map((report, index) => (
-                  <article className="report-row" key={report.id} style={{ animationDelay: `${index * 45}ms` }}>
-                    <div className={`report-format report-format--${report.format.toLowerCase()}`}>{report.format}</div>
-                    <div className="report-row__name"><strong>{report.name}</strong><span>{report.stale ? "Факты изменились — сформируйте новую версию" : "Черновик по принятым фактам"}</span></div>
-                    <time className="report-row__date">{new Date(report.created_at).toLocaleDateString("ru-RU")}</time>
-                    {report.stale ? <span className="demo-label">Архивная версия</span> : <a className="button button--small-primary" href={report.brief_url} target="_blank" rel="noreferrer">Справка</a>}
-                    {report.stale ? <span /> : <a className="icon-button icon-button--small" href={report.download_url} aria-label="Скачать PPTX"><Icon name="download" size={17} /></a>}
-                    <span />
-                  </article>
-                ))}
-                {filteredReports.length === 0 && (
-                  <div className="reports-empty"><Icon name="file" size={24} /><strong>Отчётов не найдено</strong><span>Измените поисковый запрос или формат.</span></div>
-                )}
+                {reportsLoading ? (
+                  <div className="reports-empty"><Icon name="file" size={24} /><strong>Загружаем отчёты</strong><span>Получаем сохранённые материалы из базы.</span></div>
+                ) : reportsError ? (
+                  <div className="reports-empty"><Icon name="file" size={24} /><strong>Не удалось загрузить отчёты</strong><span>{reportsError}</span></div>
+                ) : <>
+                  {filteredReports.map((report, index) => (
+                    <article className="report-row" key={report.id} style={{ animationDelay: `${index * 45}ms` }}>
+                      <div className={`report-format report-format--${report.format.toLowerCase()}`}>{report.format}</div>
+                      <div className="report-row__name"><strong>{report.name}</strong><span>{report.stale ? "Факты изменились — сформируйте новую версию" : "Черновик по принятым фактам"}</span></div>
+                      <time className="report-row__date">{new Date(report.created_at).toLocaleDateString("ru-RU")}</time>
+                      {report.stale ? <span className="demo-label">Архивная версия</span> : <a className="button button--small-primary" href={report.brief_url} target="_blank" rel="noreferrer">Справка</a>}
+                      {report.stale ? <span /> : <a className="icon-button icon-button--small" href={report.download_url} aria-label="Скачать PPTX"><Icon name="download" size={17} /></a>}
+                      <span />
+                    </article>
+                  ))}
+                  {filteredReports.length === 0 && (
+                    <div className="reports-empty"><Icon name="file" size={24} /><strong>Отчётов не найдено</strong><span>Измените поисковый запрос или формат.</span></div>
+                  )}
+                </>}
               </div>
             </div>
             <p className="reports-disclaimer">Файлы сохраняются после фактической сборки презентации. Перед встречей проверьте итоговый текст.</p>
@@ -381,7 +395,7 @@ export default function UniversityDashboard() {
       </main>
 
       <AgentSphere onClick={() => setChatOpen(true)} hidden={chatOpen} />
-      <AgentChat open={chatOpen} universityName={selectedUniversity.name} onClose={onChatClose}
+      <AgentChat open={chatOpen} universityName={selectedUniversity?.name ?? "вузом"} onClose={onChatClose}
         onAction={async (action) => {
           if (!researchRef.current) return "Сначала откройте карточку учреждения из списка вузов.";
           return action === "refresh" ? researchRef.current.refresh() : researchRef.current.generate();
@@ -395,21 +409,6 @@ export default function UniversityDashboard() {
             <label>Город или регион<input value={createCity} onChange={(event) => setCreateCity(event.target.value)} placeholder="Например, Казань" /></label>
             <label>Официальный сайт<input required type="url" value={createWebsite} onChange={(event) => setCreateWebsite(event.target.value)} placeholder="https://university.ru" /></label>
             <div className="modal-actions"><button className="button button--soft" type="button" onClick={() => setCreateOpen(false)}>Отмена</button><button className="button button--primary" type="submit" disabled={creating}><Icon name="plus" size={16} /> {creating ? "Сохранение…" : "Создать черновик"}</button></div>
-          </form>
-        </Modal>
-      )}
-
-      {contactOpen && (
-        <Modal title="Добавить контакт" onClose={() => setContactOpen(false)}>
-          <p className="modal-copy">Контакт сохранится в локальном черновике карточки «{selectedUniversity.name}».</p>
-          <form className="modal-form" onSubmit={handleCreateContact}>
-            <label>Имя и фамилия<input autoFocus required value={contactDraft.name} onChange={(event) => setContactDraft((current) => ({ ...current, name: event.target.value }))} placeholder="Имя контакта" /></label>
-            <label>Должность<input value={contactDraft.role} onChange={(event) => setContactDraft((current) => ({ ...current, role: event.target.value }))} placeholder="Роль или подразделение" /></label>
-            <div className="modal-form__columns">
-              <label>Телефон<input value={contactDraft.phone} onChange={(event) => setContactDraft((current) => ({ ...current, phone: event.target.value }))} placeholder="+7 ..." /></label>
-              <label>Электронная почта<input type="email" value={contactDraft.email} onChange={(event) => setContactDraft((current) => ({ ...current, email: event.target.value }))} placeholder="name@university.ru" /></label>
-            </div>
-            <div className="modal-actions"><button className="button button--soft" type="button" onClick={() => setContactOpen(false)}>Отмена</button><button className="button button--primary" type="submit">Сохранить контакт</button></div>
           </form>
         </Modal>
       )}
@@ -438,86 +437,120 @@ function ProfileHero({ university, onPreview }: { university: University; onPrev
   );
 }
 
-function AboutSection({ university, onAdd }: { university: University; onAdd: () => void }) {
+const factLabels: Record<string, string> = {
+  "person.name": "ФИО", "appointment.position": "Должность", "appointment.status": "Статус назначения",
+  "appointment.department": "Подразделение", "appointment.responsibilities": "Зона ответственности",
+  "contact.phone": "Телефон", "contact.email": "Почта", "person.career": "Биография",
+  "person.education": "Образование", "person.degree": "Учёная степень", "institution.profile": "Профиль",
+  "project.program": "Программа", "project.role": "Роль", "project.status": "Статус",
+  "project.period": "Период", "project.description": "Описание", "event.type": "Тип",
+  "event.date": "Дата", "event.status": "Статус", "event.description": "Описание",
+};
+
+function isVerified(fact: Fact) {
+  return fact.verification_status === "verified" && fact.validation_status === "passed" && !fact.issues.length;
+}
+
+function verifiedFacts(run: ResearchRun | null) {
+  return run?.facts.filter(isVerified) ?? [];
+}
+
+function groupVerifiedEntities(run: ResearchRun | null, kind: "project" | "event") {
+  const groups = new Map<string, { name: string; facts: Fact[] }>();
+  for (const fact of verifiedFacts(run)) {
+    if (fact.subject.entity_kind !== kind || !fact.subject.entity_id || !fact.subject.entity_name) continue;
+    const entity = groups.get(fact.subject.entity_id) ?? { name: fact.subject.entity_name, facts: [] };
+    entity.facts.push(fact);
+    groups.set(fact.subject.entity_id, entity);
+  }
+  return [...groups.entries()].map(([id, entity]) => ({ id, ...entity }));
+}
+
+function AboutSection({ university, run, onAdd }: { university: University; run: ResearchRun | null; onAdd: () => void }) {
+  const profile = verifiedFacts(run).find((fact) => fact.field === "institution.profile");
+  const departments = [...new Set(verifiedFacts(run)
+    .filter((fact) => fact.field === "appointment.department")
+    .map((fact) => fact.value))];
   return (
     <div className="about-grid">
       <article className="content-card about-history">
-        <div className="content-card__heading"><span className="section-icon"><Icon name="university" size={18} /></span><div><h2>История вуза</h2><span>Профиль организации</span></div><span className="fact-status"><span className="fact-status__dot" /> Ожидает данных</span></div>
-        <p>Карточка «{university.name}» подготовлена для сбора и проверки сведений из открытых источников. Подтверждённая история, профиль деятельности и основные показатели появятся после загрузки данных.</p>
-        <button className="inline-action" type="button" onClick={onAdd}><Icon name="plus" size={15} /> Добавить сведения</button>
+        <div className="content-card__heading"><span className="section-icon"><Icon name="university" size={18} /></span><div><h2>Профиль организации</h2><span>{university.name}</span></div><span className="fact-status"><span className="fact-status__dot" /> {profile ? "Проверено" : "Ожидает данных"}</span></div>
+        <p>{profile?.value ?? "Подтверждённые сведения появятся после сбора и проверки источников."}</p>
+        {profile?.evidence[0] && <a className="text-button" href={profile.evidence[0].url} target="_blank" rel="noreferrer">Источник <Icon name="external" size={14} /></a>}
+        <button className="inline-action" type="button" onClick={onAdd}><Icon name="spark" size={15} /> Обсудить с агентом</button>
       </article>
-      <InfoListCard title="Структурные подразделения" icon="overview" items={[]} empty="Сведения о подразделениях ещё не добавлены." />
-      <InfoListCard title="Основные направления подготовки" icon="spark" items={studyAreas} demo />
+      <InfoListCard title="Структурные подразделения" icon="overview" items={departments} empty="Проверенных подразделений пока нет." />
+      <InfoListCard title="Официальный сайт" icon="external" items={university.website ? [university.website] : []} empty="Сайт не указан в карточке." />
     </div>
   );
 }
 
-function ContactsSection({ university, contacts, onAdd }: { university: University; contacts: Contact[]; onAdd: () => void }) {
+function ContactsSection({ university, run }: { university: University; run: ResearchRun | null }) {
+  const people = new Map<string, { name: string; facts: Fact[] }>();
+  for (const fact of verifiedFacts(run)) {
+    if (fact.subject.entity_kind) continue;
+    const name = fact.subject.person_name ?? fact.contact_owner?.label ?? "Контакт организации";
+    const group = people.get(name) ?? { name, facts: [] };
+    group.facts.push(fact);
+    people.set(name, group);
+  }
+  const entries = [...people.entries()].map(([id, person]) => ({ id, ...person }));
   return (
     <section className="content-card contacts-card">
-      <div className="content-card__heading"><span className="section-icon"><Icon name="phone" size={18} /></span><div><h2>Руководство и контакты</h2><span>{university.name}</span></div><button className="button button--outline button--small-action" type="button" onClick={onAdd}><Icon name="plus" size={15} /> Добавить контакт</button></div>
-      {contacts.length ? (
-        <div className="contact-list">
-          {contacts.map((contact, index) => (
-            <article className="contact-row" key={`${contact.name}-${index}`}>
-              <span className="contact-row__avatar">{initialsFor(contact.name)}</span>
-              <div className="contact-row__identity"><strong>{contact.name}</strong><span>{contact.role || "Должность не указана"}</span><span className="contact-row__source"><span className="fact-status__dot" /> Черновик · ожидает проверки</span></div>
-              <div className="contact-row__methods">{contact.phone && <span><Icon name="phone" size={15} /> {contact.phone}</span>}{contact.email && <span><Icon name="mail" size={15} /> {contact.email}</span>}</div>
-            </article>
-          ))}
-        </div>
-      ) : (
-        <div className="empty-inline"><span className="empty-inline__icon"><Icon name="phone" size={21} /></span><strong>Контакты пока не добавлены</strong><p>Добавьте руководителя или приёмную. Данные останутся черновиком до проверки источника.</p><button className="button button--primary" type="button" onClick={onAdd}><Icon name="plus" size={16} /> Добавить первый контакт</button></div>
-      )}
+      <div className="content-card__heading"><span className="section-icon"><Icon name="phone" size={18} /></span><div><h2>Проверенное руководство и контакты</h2><span>{university.name} · данные из сохранённого исследования</span></div></div>
+      {entries.length ? <div className="contact-list">
+        {entries.map((person) => <article className="contact-row" key={person.id}>
+          <span className="contact-row__avatar">{initialsFor(person.name)}</span>
+          <div className="contact-row__identity"><strong>{person.name}</strong>{person.facts.map((fact) => <span key={fact.fact_id}>{factLabels[fact.field] ?? fact.field}: {fact.value}</span>)}</div>
+          <div className="contact-row__methods">{person.facts.filter((fact) => fact.evidence[0]).slice(0, 2).map((fact) => <a key={fact.fact_id} href={fact.evidence[0].url} target="_blank" rel="noreferrer">Источник <Icon name="external" size={13} /></a>)}</div>
+        </article>)}
+      </div> : <div className="empty-inline"><span className="empty-inline__icon"><Icon name="phone" size={21} /></span><strong>Проверенных контактов пока нет</strong><p>Запустите сбор в панели выше и проверьте найденные факты и источники.</p></div>}
     </section>
   );
 }
 
-function ProjectsSection({ university }: { university: University }) {
+function ContextEntityList({ kind, run, empty, title }: { kind: "project" | "event"; run: ResearchRun | null; empty: string; title?: string }) {
+  const entities = groupVerifiedEntities(run, kind);
+  const label = kind === "project" ? "Проекты" : "Мероприятия";
+  return (
+    <section className="content-card context-entities">
+      <div className="content-card__heading"><span className="section-icon"><Icon name={kind === "project" ? "spark" : "calendar"} size={18} /></span><div><h2>{title ?? label}</h2><span>Подтверждённые данные из сохранённого исследования</span></div></div>
+      {entities.length ? <div className="context-entity-list">
+        {entities.map((entity) => <article className="context-entity" key={entity.id}>
+          <h3>{entity.name}</h3>
+          {entity.facts.filter((fact) => !fact.field.endsWith(".name")).map((fact) => <p className="context-entity__fact" key={fact.fact_id}>
+            <strong>{factLabels[fact.field] ?? fact.field}:</strong> {fact.value}
+            {fact.evidence[0] && <a href={fact.evidence[0].url} target="_blank" rel="noreferrer">Источник <Icon name="external" size={12} /></a>}
+          </p>)}
+        </article>)}
+      </div> : <div className="empty-list"><span className="empty-list__line" /><p>{empty}</p><span className="empty-list__line empty-list__line--short" /></div>}
+    </section>
+  );
+}
+
+function ProjectsSection({ university, run }: { university: University; run: ResearchRun | null }) {
   return (
     <div className="projects-grid">
-      <InfoListCard title={`Проекты, реализуемые в ${university.name}`} icon="spark" items={sampleProjects} demo />
-      <InfoListCard title="Возможности для сотрудничества" icon="overview" items={[]} empty="Точки соприкосновения появятся после анализа проверенных данных." />
+      <ContextEntityList kind="project" run={run} title={`Проекты в ${university.name}`} empty="Проверенных проектов пока нет." />
+      <InfoListCard title="Возможности для сотрудничества" icon="overview" items={[]} empty="Подтверждённые точки соприкосновения появятся после анализа данных." />
     </div>
   );
 }
 
-function EventsSection({ university }: { university: University }) {
-  return (
-    <section className="content-card profile-events-card">
-      <div className="content-card__heading"><span className="section-icon"><Icon name="calendar" size={18} /></span><div><h2>Мероприятия</h2><span>{university.name}</span></div><span className="demo-label">Демо-данные</span></div>
-      <EventsList events={sampleEvents} demo />
-    </section>
-  );
+function EventsSection({ university, run }: { university: University; run: ResearchRun | null }) {
+  return <ContextEntityList kind="event" run={run} title={`Мероприятия · ${university.name}`} empty="Проверенных мероприятий пока нет." />;
 }
 
-function InfoListCard({ title, icon, items, empty, demo = false }: { title: string; icon: IconName; items: string[]; empty?: string; demo?: boolean }) {
+function InfoListCard({ title, icon, items, empty }: { title: string; icon: IconName; items: string[]; empty?: string }) {
   return (
     <article className="content-card info-list-card">
-      <div className="content-card__heading"><span className="section-icon"><Icon name={icon} size={18} /></span><div><h2>{title}</h2>{demo && <span>Примеры для демонстрации интерфейса</span>}</div></div>
+      <div className="content-card__heading"><span className="section-icon"><Icon name={icon} size={18} /></span><div><h2>{title}</h2></div></div>
       {items.length ? (
-        <ul className="fact-list">{items.map((item) => <li key={item}><span className="fact-list__bullet" />{item}<span className="demo-mark">пример</span></li>)}</ul>
+        <ul className="fact-list">{items.map((item) => <li key={item}><span className="fact-list__bullet" />{item}</li>)}</ul>
       ) : (
         <div className="empty-list"><span className="empty-list__line" /><p>{empty}</p><span className="empty-list__line empty-list__line--short" /></div>
       )}
     </article>
-  );
-}
-
-function EventsList({ events, demo }: { events: typeof sampleEvents; demo?: boolean }) {
-  return (
-    <div className="events-list-card">
-      <div className="events-list-card__heading"><h2>Список мероприятий</h2>{demo && <span className="demo-label">Примеры</span>}</div>
-      <div className="events-list">
-        {events.map((event, index) => (
-          <article className="event-row" key={event.title} style={{ animationDelay: `${index * 45}ms` }}>
-            <span className="event-row__date"><span>НОЯ</span><strong>{String(4 + index * 3).padStart(2, "0")}</strong></span>
-            <div className="event-row__copy"><strong>{event.title}</strong><span>{event.description}</span></div>
-            <span className="event-row__demo">пример</span>
-          </article>
-        ))}
-      </div>
-    </div>
   );
 }
 

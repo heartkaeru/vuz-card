@@ -7,7 +7,10 @@ import { Icon } from "@/components/icon";
 import { type University } from "@/data/universities";
 
 export type ResearchHandle = { generate: () => Promise<string>; refresh: () => Promise<string>; openReportOptions: () => void };
-type Props = { university: University; showFacts: boolean; onShowFacts: () => void; onConnected: (card: ApiCard) => void };
+type Props = {
+  university: University; showFacts: boolean; onShowFacts: () => void;
+  onConnected: (card: ApiCard) => void; onRunChange: (run: ResearchRun | null) => void;
+};
 const fields: Record<string, string> = {
   "person.name": "ФИО", "appointment.position": "Должность", "appointment.status": "Статус назначения",
   "appointment.department": "Подразделение", "appointment.responsibilities": "Зона ответственности",
@@ -16,7 +19,7 @@ const fields: Record<string, string> = {
 };
 const statuses: Record<string, string> = { pending: "На проверке", verified: "Принято", rejected: "Отклонено", conflict: "Конфликт" };
 
-export const ResearchPanel = forwardRef<ResearchHandle, Props>(function ResearchPanel({ university, showFacts, onShowFacts, onConnected }, ref) {
+export const ResearchPanel = forwardRef<ResearchHandle, Props>(function ResearchPanel({ university, showFacts, onShowFacts, onConnected, onRunChange }, ref) {
   const [website, setWebsite] = useState(university.website ?? "");
   const [leadershipUrl, setLeadershipUrl] = useState("");
   const [card, setCard] = useState<ApiCard | null>(null);
@@ -41,7 +44,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const rejected = run?.facts.filter((fact) => fact.verification_status === "rejected").length ?? 0;
 
   function load(detail: CardDetail) {
-    setCard(detail); setWebsite(detail.website); setRun(detail.run); setJob(detail.job);
+    setCard(detail); setWebsite(detail.website); setRun(detail.run); onRunChange(detail.run); setJob(detail.job);
     if (detail.job?.identity?.leadership_url) setLeadershipUrl(detail.job.identity.leadership_url);
     if (detail.job?.status === "completed" && detail.job.result?.material_id &&
         detail.job.identity?.expected_revision === detail.run?.revision) setMaterial(detail.job.result as Material);
@@ -66,7 +69,10 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         if (!active) return;
         setJob(next);
         if (next.status === "completed" || next.status === "failed") {
-          if (next.result?.run_id) setRun(await api<ResearchRun>(`/runs/${next.result.run_id}`));
+          if (next.result?.run_id) {
+            const updatedRun = await api<ResearchRun>(`/runs/${next.result.run_id}`);
+            setRun(updatedRun); onRunChange(updatedRun);
+          }
           if (next.result?.material_id) setMaterial(next.result as Material);
           if (next.status === "failed") {
             setPreviewAfterGeneration(false);
@@ -90,7 +96,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         version: target.version, request_key: crypto.randomUUID(),
         leadership_url: leadershipUrl.trim() || null,
       });
-      setJob(next); onShowFacts();
+      setRun(null); onRunChange(null); setJob(next); onShowFacts();
       return "Задание сбора создано. Состояние и результаты появятся в карточке руководства.";
     } catch (failure) { const message = errorText(failure); setError(message); return message; }
     finally { setSaving(false); }
@@ -106,7 +112,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         expected_revision: run.revision, reviewer,
         decisions: selected.map((fact_id) => ({ fact_id, decision, source_checked: sourceChecked, reason })),
       });
-      setRun(updated); setMaterial(null);
+      setRun(updated); onRunChange(updated); setMaterial(null);
     } catch (failure) { setError(errorText(failure)); }
     finally { setSaving(false); }
   }
