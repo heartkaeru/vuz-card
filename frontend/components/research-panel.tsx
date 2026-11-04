@@ -2,6 +2,7 @@
 
 import { forwardRef, useEffect, useImperativeHandle, useState } from "react";
 import { api, post, errorText, type ApiCard, type CardDetail, type ResearchRun, type Job, type Material } from "@/lib/api";
+import { Icon } from "@/components/icon";
 import { type University } from "@/data/universities";
 
 export type ResearchHandle = { generate: () => Promise<string>; refresh: () => Promise<string> };
@@ -27,6 +28,10 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [material, setMaterial] = useState<Material | null>(null);
+  const [downloadFormat, setDownloadFormat] = useState<"pptx" | "docx">("pptx");
+  const [preview, setPreview] = useState("");
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
   const [showRejected, setShowRejected] = useState(false);
   const busy = saving || job?.status === "queued" || job?.status === "running";
   const accepted = run?.facts.filter((fact) => fact.verification_status === "verified").length ?? 0;
@@ -113,6 +118,22 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     } catch (failure) { const message = errorText(failure); setError(message); return message; }
     finally { setSaving(false); }
   }
+
+  async function openPreview() {
+    if (!material) return;
+    setPreviewLoading(true); setError("");
+    try {
+      const response = await fetch(material.brief_url, { cache: "no-store" });
+      if (!response.ok) throw new Error("preview_unavailable");
+      setPreview(await response.text());
+      setPreviewOpen(true);
+    } catch (failure) {
+      setError(failure instanceof Error && failure.message !== "preview_unavailable"
+        ? "Не удалось загрузить предварительный просмотр отчёта." : "Предварительный просмотр отчёта недоступен.");
+    } finally { setPreviewLoading(false); }
+  }
+
+  const downloadUrl = material && `${material.download_url}?format=${downloadFormat}`;
   useImperativeHandle(ref, () => ({ generate, refresh }));
 
   return <section className="content-card research-panel" aria-label="Актуализация и проверка фактов">
@@ -129,7 +150,21 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     </details>
     {job && <div className="research-progress" role="status"><span>{job.message}</span><progress value={job.progress} max={100} /></div>}
     {error && <p className="research-error" role="alert">{error}</p>}
-    {material && <div className="research-downloads"><a className="button button--primary" href={material.download_url}>Скачать PPTX</a><a className="button button--soft" href={material.brief_url} target="_blank" rel="noreferrer">Открыть справку</a><span>Черновик для проверки перед встречей</span></div>}
+    {material && <div className="research-downloads">
+      <button className="button button--soft" type="button" disabled={previewLoading} onClick={() => { void openPreview(); }}>
+        {previewLoading ? "Загружаем…" : "Просмотреть отчёт"}
+      </button>
+      <label className="research-format-select">Формат файла
+        <select value={downloadFormat} onChange={(event) => setDownloadFormat(event.target.value as "pptx" | "docx")}>
+          <option value="pptx">PowerPoint (.pptx)</option>
+          <option value="docx">Word (.docx)</option>
+        </select>
+      </label>
+      <a className="button button--primary" href={downloadUrl ?? undefined}>
+        <span>Скачать {downloadFormat.toUpperCase()}</span>
+      </a>
+      <span>Черновик для проверки перед встречей</span>
+    </div>}
     {run && <p className="research-summary">Найдено фактов: {run.facts.length} · принято: {accepted} · {run.status === "partial" ? "сбор частичный" : "результат сохранён"}.
       {!showFacts && <button className="text-button" type="button" onClick={onShowFacts}>Проверить факты</button>}</p>}
     {run && Object.values(run.results).some((result) => result.run?.provider === "fixture") &&
@@ -159,5 +194,24 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         <button className="button button--soft" type="button" disabled={Boolean(busy) || !selected.length} onClick={() => { void review("reject"); }}>Отклонить выбранные</button></div>
       </div>
     </>}
+    {previewOpen && <div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreviewOpen(false); }}>
+      <section className="report-preview" role="dialog" aria-modal="true" aria-labelledby="report-preview-title">
+        <header className="report-preview__header">
+          <div><span className="eyebrow">ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР</span><h2 id="report-preview-title">Отчёт к встрече: {university.name}</h2></div>
+          <button className="icon-button" type="button" onClick={() => setPreviewOpen(false)} aria-label="Закрыть предпросмотр"><Icon name="close" size={19} /></button>
+        </header>
+        <div className="report-preview__content">
+          {preview.split("\n").map((line, index) => {
+            if (line.startsWith("# ")) return <h3 key={index}>{line.slice(2)}</h3>;
+            if (line.startsWith("## ")) return <h4 key={index}>{line.slice(3)}</h4>;
+            if (line.startsWith("### ")) return <h5 key={index}>{line.slice(4)}</h5>;
+            if (line.startsWith("- ")) return <p className="report-preview__bullet" key={index}>{line.slice(2)}</p>;
+            if (!line.trim()) return <div className="report-preview__space" key={index} />;
+            return <p key={index}>{line.replaceAll("**", "")}</p>;
+          })}
+        </div>
+      </section>
+    </div>}
   </section>;
 });
+

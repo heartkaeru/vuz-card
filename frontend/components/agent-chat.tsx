@@ -71,6 +71,11 @@ export function AgentChat({ open, universityName, onClose, onAction }: AgentChat
     }
   };
 
+  const insertPrompt = (prompt: string) => {
+    setDraft(prompt);
+    inputRef.current?.focus();
+  };
+
   return (
     <>
       <button
@@ -125,8 +130,8 @@ export function AgentChat({ open, universityName, onClose, onAction }: AgentChat
 
         <div className="agent-chat__footer">
           <div className="agent-chat__quick-actions">
-            <button type="button" onClick={() => sendMessage("Сформировать презентацию")}>Презентация</button>
-            <button type="button" onClick={() => sendMessage("Обновить данные")}>Обновить данные</button>
+            <button type="button" onClick={() => insertPrompt("Сформировать презентацию")}>Презентация</button>
+            <button type="button" onClick={() => insertPrompt("Обновить данные")}>Обновить данные</button>
           </div>
           <form className="agent-chat__composer" onSubmit={handleSubmit}>
             <button
