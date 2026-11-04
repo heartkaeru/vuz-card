@@ -2,7 +2,7 @@
 
 `LLMWorkflow` связывает существующие контракты с SQLite: сохранённый вход парсера →
 кандидаты → явное решение сотрудника → материалы только по принятому снимку.
-Для UI [Демо 1](../../../DEMO1_RUNBOOK.md) добавлен `app/api/v1/ai.py`.
+Для UI [Демо 1](../../../docs/DEMO1_RUNBOOK.md) добавлен `app/api/v1/ai.py`.
 
 Основные объекты: `database.llm_store.LLMRepository`,
 `app.services.llm.workflow.LLMWorkflow`, `workflow_models.ResearchRun/ReviewBatch`.
