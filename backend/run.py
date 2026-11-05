@@ -2,10 +2,14 @@ import uvicorn
 import argparse
 import os
 from pathlib import Path
+import sys
 from dotenv import load_dotenv
 
 if __name__ == "__main__":
-    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+    backend_dir = Path(__file__).resolve().parent
+    os.chdir(backend_dir)
+    sys.path.insert(0, str(backend_dir))
+    load_dotenv(backend_dir / ".env", override=False)
     options = argparse.ArgumentParser(description="Local Demo 1 backend; real parser and GigaChat")
     options.add_argument("--db", type=Path, help="Optional registry/workflow SQLite file")
     args = options.parse_args()

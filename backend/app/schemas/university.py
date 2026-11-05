@@ -25,7 +25,7 @@ class Official(BaseModel):
         default=VerificationStatus.VERIFIED, 
         description="Статус верификации данных"
     )
-    # Поля для поддержки экрана «было / стало» (по дизайну Ангелины)
+    # Поля для поддержки экрана «было / стало»
     previous_value: Optional[str] = Field(
         None, 
         description="Предыдущее значение (если ИИ обнаружил изменения)"
