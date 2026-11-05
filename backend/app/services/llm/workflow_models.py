@@ -27,6 +27,9 @@ class ResearchRun(StrictModel):
     parser_warnings: list[str] = Field(default_factory=list)
     parser_errors: list[str] = Field(default_factory=list)
     requested_modes: list[Literal["0.2", "0.3"]] = Field(default_factory=lambda: ["0.2", "0.3"])
+    previous_run_id: str | None = None
+    baseline_facts: list[Fact] = Field(default_factory=list)
+    retired_fact_ids: list[str] = Field(default_factory=list)
 
 
 class ReviewDecision(StrictModel):
@@ -36,6 +39,13 @@ class ReviewDecision(StrictModel):
     reason: str = Field(min_length=1)
 
 
+class FactRetirement(StrictModel):
+    fact_id: str = Field(min_length=1)
+    source_checked: bool = False
+    reason: str = Field(min_length=1)
+
+
 class ReviewBatch(StrictModel):
     expected_revision: int = Field(ge=1)
     decisions: list[ReviewDecision] = Field(min_length=1, max_length=1000)
+    retirements: list[FactRetirement] = Field(default_factory=list, max_length=1000)

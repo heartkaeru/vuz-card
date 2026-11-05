@@ -4,11 +4,13 @@ import asyncio
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import FileResponse, Response
-from pydantic import Field, HttpUrl
+from pydantic import Field, HttpUrl, field_validator
 
 from database.demo1_store import DemoRepository
 from parser.config import SectionSpec, Settings, UniversityProfile
@@ -20,7 +22,9 @@ from app.services.llm.pipeline import AssistantPipeline, DraftValidationError
 from app.services.llm.render import render_markdown
 from app.services.llm.workflow import LLMWorkflow
 from app.services.llm.workflow_models import ReviewBatch, WorkflowError
+from app.services.llm.changes import compare_run, effective_facts
 from app.services.meeting_pptx import build_meeting_presentation
+from app.services.dossier_preview import build_dossier_preview
 
 router = APIRouter(prefix="/ai", tags=["Демо 1: сбор, проверка и презентация"])
 
@@ -40,7 +44,7 @@ def get_pipeline():
 
 
 def get_collector():
-    def collect(website, name, leadership_url=None):
+    def collect(website, name, leadership_url=None, *, biography_url=None, institution_urls=(), pdf_sources=(), include_institution=False):
         settings = Settings.from_env()
         settings.max_retries = 1
         settings.timeout = min(settings.timeout, 20)
@@ -51,14 +55,36 @@ def get_collector():
         settings.use_cache = False
         parser = UniversityParser(settings)
         try:
-            profile = (UniversityProfile(slug="selected-leadership-source", name=name, url=website,
-                       sections=(SectionSpec(name="leadership", url=leadership_url),)) if leadership_url else None)
+            profile = (UniversityProfile(slug="selected-official-sources", name=name, url=website,
+                       sections=(SectionSpec(name="leadership", url=leadership_url),) if leadership_url else (),
+                       bio_urls=(biography_url,) if biography_url else ()) if leadership_url or biography_url else None)
             result = parser.parse(url=website, name=name, profile=profile,
-                                  allowed_sections=("leadership",) if leadership_url else ("about", "leadership", "contacts"))
+                                  allowed_sections=("about", "leadership", "contacts") if include_institution or not leadership_url else ("leadership",))
+            existing = {document.url for document in result.documents}
+            reference_documents = parser.collect_institution_documents(institution_urls)
+            if len(reference_documents) < len(institution_urls):
+                result.warnings.append("Часть справочных HTML-страниц не получена. Для PDF используйте отдельное поле отчёта.")
+            pdf_documents, pdf_errors = parser.collect_pdf_documents(pdf_sources)
+            result.errors.extend(pdf_errors)
+            reference_documents.extend(pdf_documents)
+            for document in pdf_documents:
+                if document.metadata.get("partial_pdf") == "true":
+                    result.warnings.append(f"PDF: обработаны страницы {document.metadata['pdf_selected_pages']} из {document.metadata['pdf_page_count']}; полный отчёт не обработан.")
+                if document.metadata.get("pdf_pages_without_text"):
+                    result.warnings.append("pdf_pages_without_text_ocr_required")
+            for document in reference_documents:
+                if document.url not in existing:
+                    result.documents.append(document)
+                    existing.add(document.url)
             if leadership_url:
                 # The homepage was used for discovery, not selected as a fact source.
                 result.documents = [document for document in result.documents
-                                    if document.category in {"leadership", "contacts"}]
+                                    if document.category in {"leadership", "contacts"}
+                                    or include_institution and document.section == "about"]
+            if include_institution:
+                from parser.institution_context import mark_institution_context
+                for document in result.documents:
+                    mark_institution_context(document, name)
             return result
         finally:
             parser.close()
@@ -71,10 +97,24 @@ class CardCreate(StrictModel):
     website: HttpUrl
 
 
+class PDFReference(StrictModel):
+    url: HttpUrl
+    pages: list[Annotated[int, Field(strict=True, ge=1, le=300)]] | None = Field(default=None, min_length=1, max_length=20)
+
+    @field_validator("pages")
+    @classmethod
+    def unique_pages(cls, pages):
+        return sorted(set(pages)) if pages is not None else None
+
+
 class RefreshRequest(StrictModel):
     version: int = Field(ge=1)
     request_key: str = Field(min_length=1, max_length=150)
     leadership_url: HttpUrl | None = None
+    biography_url: HttpUrl | None = None
+    institution_urls: list[HttpUrl] = Field(default_factory=list, max_length=3)
+    pdf_sources: list[PDFReference] = Field(default_factory=list, max_length=2)
+    include_institution: bool = False
 
 
 class ReviewRequest(ReviewBatch):
@@ -83,6 +123,7 @@ class ReviewRequest(ReviewBatch):
 
 
 class MaterialRequest(StrictModel):
+    presentation_variant: Literal["compact", "detailed"] = "detailed"
     expected_revision: int = Field(ge=1)
     request_key: str = Field(min_length=1, max_length=150)
     meeting: MeetingContext = Field(default_factory=MeetingContext)
@@ -97,16 +138,18 @@ def checked(operation):
         raise HTTPException(404 if code.endswith("not_found") else 409, code) from None
 
 
-async def collect_job(repository, pipeline, collector, card, job_id, leadership_url=None):
+async def collect_job(repository, pipeline, collector, card, job_id, leadership_url=None, source_options=None):
     try:
         repository.update_job(job_id, status="running", progress=15, message="Сбор официальных страниц руководства")
-        parsed = await asyncio.to_thread(collector, card["website"], card["name"], leadership_url)
+        parsed = await asyncio.to_thread(collector, card["website"], card["name"], leadership_url, **(source_options or {}))
         repository.update_job(job_id, progress=55, message="Страницы получены. Извлечение фактов из текстов")
         workflow = LLMWorkflow(repository, pipeline)
         research, _ = workflow.create(Institution(id=card["id"], name=card["name"], card_version=card["version"]),
-                                       parsed, job_id, modes=("0.2",))
+                                       parsed, job_id, modes=("0.2", "0.3") if (source_options or {}).get("include_institution") else ("0.2",))
         repository.set_latest(card["id"], research.run_id)
-        research = await workflow.extract(research.run_id)
+        research = await workflow.extract(research.run_id, context_fields=[
+            "institution.profile", "institution.type", "institution.location", "institution.founded",
+            "institution.education_areas", "institution.education_levels", "institution.students", "institution.structure"])
         if research.status == "failed" or not research.facts:
             stage_errors = [error.code for result in research.results.values() for error in result.errors]
             repository.update_job(job_id, status="failed", progress=100, message="Не удалось извлечь проверяемые факты",
@@ -127,7 +170,8 @@ async def material_job(repository, pipeline, run_id, payload, job_id):
     try:
         repository.update_job(job_id, status="running", progress=30, message="Подготовка тезисов по принятым фактам")
         material_id, draft = await LLMWorkflow(repository, pipeline).generate(
-            run_id, payload.expected_revision, fact_ids=payload.fact_ids, meeting=payload.meeting)
+            run_id, payload.expected_revision, fact_ids=payload.fact_ids, meeting=payload.meeting,
+            presentation_variant=payload.presentation_variant)
         repository.update_job(job_id, progress=80, message="Сборка карточки PowerPoint по шаблону")
         path = repository.path.parent / "presentations" / f"{material_id}.pptx"
         await asyncio.to_thread(build_meeting_presentation, draft, path, repository.material_facts(material_id))
@@ -137,7 +181,8 @@ async def material_job(repository, pipeline, run_id, payload, job_id):
             raise WorkflowError("facts_changed_during_generation")
         repository.update_job(job_id, status="completed", progress=100, message="Презентация сформирована",
             result={"material_id": material_id, "download_url": f"/api/v1/ai/materials/{material_id}/download",
-                    "brief_url": f"/api/v1/ai/materials/{material_id}/brief"})
+                    "brief_url": f"/api/v1/ai/materials/{material_id}/brief",
+                    "presentation_variant": payload.presentation_variant})
     except asyncio.CancelledError:
         repository.update_job(job_id, status="failed", message="Формирование прервано", result={"code": "generation_cancelled"})
         raise
@@ -162,8 +207,19 @@ def create_card(payload: CardCreate, repository=Depends(get_repository)):
 @router.get("/cards/{card_id}")
 def get_card(card_id: str, repository=Depends(get_repository)):
     card = checked(lambda: repository.card(card_id))
+    run = repository.get(card["latest_run"]) if card["latest_run"] else None
     return {**card, "job": repository.card_job(card_id),
-            "run": repository.get(card["latest_run"]).model_dump(mode="json") if card["latest_run"] else None}
+            "run": run.model_dump(mode="json") if run else None,
+            "approved_facts": effective_facts(run) if run else []}
+
+
+@router.get("/cards/{card_id}/history")
+def history(card_id: str, repository=Depends(get_repository)):
+    checked(lambda: repository.card(card_id))
+    return [{"run_id": run.run_id, "revision": run.revision, "status": run.status,
+             "created_at": run.created_at, "previous_run_id": run.previous_run_id,
+             "approved_count": len(effective_facts(run)), "candidate_count": len(run.facts)}
+            for run in repository.history(card_id)]
 
 
 @router.post("/cards/{card_id}/refresh", status_code=202)
@@ -172,16 +228,23 @@ def refresh(card_id: str, payload: RefreshRequest, background: BackgroundTasks,
     card = checked(lambda: repository.card(card_id))
     if card["version"] != payload.version:
         raise HTTPException(409, "stale_card_version")
-    if payload.leadership_url:
+    for source_url in [payload.leadership_url, payload.biography_url, *payload.institution_urls, *[source.url for source in payload.pdf_sources]]:
+        if source_url is None:
+            continue
         host = (urlsplit(card["website"]).hostname or "").removeprefix("www.")
-        source_host = (payload.leadership_url.host or "").removeprefix("www.")
+        source_host = (source_url.host or "").removeprefix("www.")
         if source_host != host and not source_host.endswith("." + host):
             raise HTTPException(422, "leadership_source_must_belong_to_official_domain")
+    source_options = {"biography_url": str(payload.biography_url) if payload.biography_url else None,
+                      "institution_urls": [str(url) for url in payload.institution_urls],
+                      "pdf_sources": [source.model_dump(mode="json") for source in payload.pdf_sources],
+                      "include_institution": payload.include_institution or bool(payload.institution_urls or payload.pdf_sources)}
     job, created = checked(lambda: repository.new_job(card_id, payload.request_key, "collect",
-        {"version": payload.version, "leadership_url": str(payload.leadership_url) if payload.leadership_url else None}))
+        {"version": payload.version, "leadership_url": str(payload.leadership_url) if payload.leadership_url else None,
+         **source_options}))
     if created:
         background.add_task(collect_job, repository, pipeline, collector, card, job["job_id"],
-                            str(payload.leadership_url) if payload.leadership_url else None)
+                            str(payload.leadership_url) if payload.leadership_url else None, source_options)
     return job
 
 
@@ -195,17 +258,38 @@ def get_run(run_id: str, repository=Depends(get_repository)):
     return checked(lambda: repository.get(run_id))
 
 
+@router.get("/runs/{run_id}/changes")
+def changes(run_id: str, repository=Depends(get_repository)):
+    return compare_run(checked(lambda: repository.get(run_id)))
+
+
+@router.get("/runs/{run_id}/preview")
+async def preview(run_id: str, expected_revision: int, presentation_variant: Literal["compact", "detailed"] = "detailed",
+                  repository=Depends(get_repository)):
+    run = checked(lambda: repository.check_current(run_id, expected_revision))
+    facts = [f for f in run.facts if f.fact_id not in run.retired_fact_ids and f.validation_status == "passed"
+             and not f.issues and f.verification_status in {"pending", "verified"}]
+    facts = facts or effective_facts(run)
+    if not facts:
+        raise HTTPException(409, "no_previewable_facts")
+    path = repository.path.parent / "previews" / f"{run_id}_{expected_revision}_{uuid4().hex}.pptx"
+    await asyncio.to_thread(build_dossier_preview, run.institution, facts, path, presentation_variant=presentation_variant)
+    checked(lambda: repository.check_current(run_id, expected_revision))
+    return FileResponse(path, filename="Предпросмотр кандидатов — требуется проверка.pptx",
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+
 @router.post("/runs/{run_id}/reviews")
 def review(run_id: str, payload: ReviewRequest, repository=Depends(get_repository)):
     return checked(lambda: LLMWorkflow(repository).review(run_id, ReviewBatch(
-        expected_revision=payload.expected_revision, decisions=payload.decisions), actor=payload.reviewer))
+        expected_revision=payload.expected_revision, decisions=payload.decisions, retirements=payload.retirements), actor=payload.reviewer))
 
 
 @router.post("/runs/{run_id}/materials", status_code=202)
 def materials(run_id: str, payload: MaterialRequest, background: BackgroundTasks,
               repository=Depends(get_repository), pipeline=Depends(get_pipeline)):
     run = checked(lambda: repository.check_current(run_id, payload.expected_revision))
-    if not any(f.verification_status == "verified" for f in run.facts):
+    if not effective_facts(run):
         raise HTTPException(409, "no_accepted_facts")
     job, created = checked(lambda: repository.new_job(run.institution.id, payload.request_key, "material",
                                                      {"run_id": run_id, **payload.model_dump(mode="json")}))
@@ -216,13 +300,13 @@ def materials(run_id: str, payload: MaterialRequest, background: BackgroundTasks
 
 @router.get("/materials/{material_id}/download")
 def download(material_id: str, repository=Depends(get_repository)):
-    _, stale = checked(lambda: repository.material(material_id))
+    draft, stale = checked(lambda: repository.material(material_id))
     if stale:
         raise HTTPException(409, "material_stale_after_review")
     path = repository.path.parent / "presentations" / f"{material_id}.pptx"
     if not path.is_file():
         raise HTTPException(404, "presentation_file_not_found")
-    return FileResponse(path, filename="Материалы к встрече.pptx",
+    return FileResponse(path, filename="Краткая карточка.pptx" if draft.presentation_variant == "compact" else "Подробная справка.pptx",
         media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
 
 
@@ -236,4 +320,4 @@ def brief(material_id: str, repository=Depends(get_repository)):
     draft, stale = checked(lambda: repository.material(material_id))
     if stale:
         raise HTTPException(409, "material_stale_after_review")
-    return Response(render_markdown(draft), media_type="text/markdown; charset=utf-8")
+    return Response(render_markdown(draft, repository.material_facts(material_id)), media_type="text/markdown; charset=utf-8")

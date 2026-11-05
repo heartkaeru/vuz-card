@@ -56,7 +56,7 @@ def main():
     repository.fail_interrupted_jobs()
     app.dependency_overrides[get_repository] = lambda: repository
     app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(OfflineDemoProvider())
-    app.dependency_overrides[get_collector] = lambda: lambda website, name, leadership_url=None: fictional_card()
+    app.dependency_overrides[get_collector] = lambda: lambda website, name, leadership_url=None, **kwargs: fictional_card()
     print("OFFLINE FICTIONAL REHEARSAL: no network sources, no GigaChat; separate database.")
     uvicorn.run(app, host="127.0.0.1", port=args.port)
 

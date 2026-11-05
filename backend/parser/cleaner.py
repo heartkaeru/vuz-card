@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import logging
 import re
 from dataclasses import dataclass, field
@@ -131,6 +132,9 @@ class Block:
 
     kind: str
     text: str
+    # None: infer from heading; []: structured block has no proven contact owner.
+    contact_hints: list[ContactHint] | None = None
+    subject_department: str | None = None
 
 
 @dataclass
@@ -438,7 +442,8 @@ class HTMLCleaner:
             if key in seen:
                 continue
             seen.add(key)
-            cleaned.append(Block(kind=block.kind, text=text))
+            cleaned.append(Block(kind=block.kind, text=text, contact_hints=block.contact_hints,
+                                 subject_department=block.subject_department))
         return cleaned
 
     def _walk(self, node: Tag, blocks: list[Block]) -> None:
@@ -446,6 +451,26 @@ class HTMLCleaner:
             return
         name = node.name
         if name in {"script", "style", "noscript", "template", "svg", "canvas"}:
+            return
+
+        properties = set(node.get("itemprop", "").split())
+        if properties & {"rucovodstvo", "rucovodstvoZam", "rucovodstvoFil"}:
+            selector = '[itemprop~="rucovodstvo"], [itemprop~="rucovodstvoZam"], [itemprop~="rucovodstvoFil"]'
+            nested = node.select(selector)
+            if nested:
+                own = deepcopy(node)
+                for child in own.select(selector):
+                    if child.parent is not None:
+                        child.decompose()
+                self._walk(own, blocks)
+                for child in nested:
+                    if not any(parent in nested for parent in child.parents if parent is not node):
+                        self._walk(child, blocks)
+                return
+            text = self._node_text(node)
+            if text:
+                blocks.append(Block("leadership_profile", text, self._profile_contact_hints(node),
+                                    self._profile_department(node)))
             return
 
         if name == "tr":
@@ -465,6 +490,10 @@ class HTMLCleaner:
             return
 
         if name == "table":
+            directory = self._directory_table(node)
+            if directory is not None:
+                blocks.extend(directory)
+                return
             caption = node.find("caption")
             if caption:
                 caption_text = self._node_text(caption)
@@ -512,7 +541,8 @@ class HTMLCleaner:
                 remaining = max_chars - total
                 if remaining > 200:
                     result.append(
-                        Block(block.kind, truncate_text(block.text, remaining))
+                        Block(block.kind, truncate_text(block.text, remaining),
+                              [] if block.contact_hints is not None else None)
                     )
                 return result, True
             result.append(block)
@@ -548,7 +578,9 @@ class HTMLCleaner:
             owner = self._infer_owner(heading, section)
             # A default label such as "ВУЗ" is not evidence of ownership.
             # Keep the contact in the text for extraction without inventing a hint.
-            hints = self._contact_hints(text, owner, heading_fragment_id) if heading else []
+            hints = (block.contact_hints if block.contact_hints is not None else
+                     self._contact_hints(text, owner, heading_fragment_id)
+                     if heading and owner.kind != "unknown" else [])
 
             fragments.append(
                 DocumentFragment(
@@ -557,6 +589,7 @@ class HTMLCleaner:
                     end=end,
                     heading=heading,
                     contact_hints=hints,
+                    subject_department=block.subject_department,
                 )
             )
             parts.append(text)
@@ -570,6 +603,10 @@ class HTMLCleaner:
         if heading and looks_like_person_name(heading):
             return ContactOwner(kind="person", label=heading)
         lowered = heading.lower()
+        if any(marker in lowered for marker in ("приёмная", "приемная", "канцелярия")):
+            return ContactOwner(kind="office", label=heading)
+        if re.search(r"руководств|руководител[ьи]|заместители|органы управления|^контакты$", lowered):
+            return ContactOwner(kind="unknown", label=heading)
         if any(marker in lowered for marker in DEPARTMENT_MARKERS):
             return ContactOwner(kind="department", label=heading)
         if heading and contains_position(heading):
@@ -579,6 +616,109 @@ class HTMLCleaner:
         if heading:
             return ContactOwner(kind="department", label=heading)
         return ContactOwner(kind="organization", label="ВУЗ")
+
+    def _profile_contact_hints(self, node: Tag) -> list[ContactHint]:
+        """Use explicit person/branch microdata, never a nearby person's name."""
+        scoped = {"rucovodstvo", "rucovodstvoZam", "rucovodstvoFil"}
+
+        def belongs(element):
+            return next((parent for parent in element.parents
+                         if set(parent.get("itemprop", "").split()) & scoped), None) is node
+
+        branch = "rucovodstvoFil" in node.get("itemprop", "").split()
+        key = "nameFil" if branch else "fio"
+        labels = {self._node_text(item) for item in node.select(f'[itemprop~="{key}"]') if belongs(item)}
+        if len(labels) != 1:
+            return []
+        label = next(iter(labels))
+        if not label or (not branch and not looks_like_person_name(label)):
+            return []
+        if node.name == "tr":
+            table = node.find_parent("table")
+            header = table.find("tr") if table else None
+            heading = self._node_text(header).lower() if header else ""
+            # Only plain personal directories; unit tables have a separate reader.
+            if (not re.search(r"ф\.?\s*и\.?\s*о\.?|фамилия", heading)
+                    or re.search(r"подразделен|органа управления", heading)):
+                return []
+        owner = ContactOwner(kind="department" if branch else "person", label=label)
+        hints = []
+        for item in node.select('[itemprop~="email"], [itemprop~="telephone"]'):
+            if not belongs(item):
+                continue
+            context = item.parent.get_text(" ", strip=True).lower()
+            if not branch and (re.search(r"при[её]мн|канцеляр|секретар|подразделени|общая почта|общий телефон", context)
+                               or ("факс" in context and "телефон" not in context)):
+                continue
+            field_name = "contact.email" if "email" in item.get("itemprop", "").split() else "contact.phone"
+            hints.extend(hint for hint in self._contact_hints(self._node_text(item), owner, None)
+                         if hint.field == field_name)
+        return hints
+
+    def _profile_department(self, node: Tag) -> str | None:
+        if "rucovodstvoFil" not in node.get("itemprop", "").split():
+            return None
+        labels = {self._node_text(item) for item in node.select('[itemprop~="nameFil"]')}
+        if len(labels) == 1:
+            label = next(iter(labels))
+            if label and not re.search(r"отсутств|не имеется", label, re.I):
+                return label
+        return None
+
+    def _directory_table(self, table: Tag) -> list[Block] | None:
+        """Narrow unit directories: explicit headers and unambiguous rowspan only."""
+        rows = [row for row in table.find_all("tr") if row.find_parent("table") is table]
+        if not rows:
+            return None
+        header = rows[0].find_all(["th", "td"], recursive=False)
+        titles = [self._node_text(cell) for cell in header]
+        units = [i for i, title in enumerate(titles) if re.search(
+            r"наименование.*(?:подразделения|органа управления)", title, re.I)]
+        emails = [i for i, title in enumerate(titles) if re.search(r"электронн.*почт", title, re.I)]
+        if len(units) != 1 or not emails or len(header) > 30:
+            return None
+        if any(cell.get("colspan", "1") != "1" for cell in header):
+            return None
+        unit_index = units[0]
+        people = [i for i, title in enumerate(titles) if re.search(r"фамилия|ф\.?\s*и\.?\s*о\.?|должность", title, re.I)]
+        phones = [i for i, title in enumerate(titles) if re.search(r"телефон", title, re.I)
+                  and "подразделен" in title.lower() and not re.search(r"справочн|организац", title, re.I)]
+        selected = sorted(set([unit_index, *people, *emails, *phones]))
+        result = [Block("table_row", " | ".join(titles[i] for i in selected), [])]
+        pending = {}
+        for row in rows[1:]:
+            values = {i: cell for i, (cell, remaining) in pending.items()}
+            next_pending = {i: (cell, remaining - 1) for i, (cell, remaining) in pending.items() if remaining > 1}
+            index = 0
+            cells = row.find_all(["td", "th"], recursive=False)
+            for cell in cells:
+                while index in values:
+                    index += 1
+                try:
+                    span = int(cell.get("rowspan", "1"))
+                except (ValueError, TypeError):
+                    return None
+                if cell.get("colspan", "1") != "1" or not 1 <= span <= len(rows) or index >= len(header):
+                    return None
+                values[index] = cell
+                if span > 1:
+                    next_pending[index] = (cell, span - 1)
+                index += 1
+            if set(values) != set(range(len(header))):
+                return None
+            pending = next_pending
+            parts = {i: self._node_text(values[i]) for i in selected}
+            label = parts[unit_index]
+            kind = "office" if contains_position(label) else "department"
+            owner = ContactOwner(kind=kind, label=label)
+            hints = []
+            if label and label not in {"—", "-"}:
+                for i in [*emails, *phones]:
+                    field_name = "contact.email" if i in emails else "contact.phone"
+                    hints.extend(h for h in self._contact_hints(parts[i], owner, None) if h.field == field_name)
+            department = label if "подразделения" in titles[unit_index].lower() and label not in {"", "—", "-"} else None
+            result.append(Block("table_row", " | ".join(parts[i] for i in selected), hints, department))
+        return result
 
     @staticmethod
     def _contact_hints(
@@ -600,9 +740,15 @@ class HTMLCleaner:
                 )
             )
         for match in PHONE_RE.finditer(text):
-            phone = match.group(0).strip().rstrip(".")
+            phone = re.sub(r"[\s.(,\-]+$", "", match.group(0)).strip()
             if not clean_phone(phone):
                 continue
+            extension = re.match(r"\s*[,;]?\s*(?:доб\.?|вн\.?\s*(?:тел\.?)?|добавочный)\s*[:.]?\s*\d{1,4}(?!\d)",
+                                 text[match.end():], re.IGNORECASE)
+            if extension:
+                candidate = text[match.start():match.end() + extension.end()].strip()
+                if len(re.sub(r"\D", "", candidate)) <= 15:
+                    phone = candidate
             hints.append(
                 ContactHint(
                     field="contact.phone",

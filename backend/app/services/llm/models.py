@@ -25,6 +25,7 @@ class SourceDocument(StrictModel):
     text: Annotated[str, StringConstraints(strip_whitespace=False, min_length=1)]
     retrieved_at: datetime
     published_at: datetime | None = None
+    file_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @field_validator("text")
     @classmethod
@@ -68,14 +69,24 @@ class FactField(str, Enum):
     NAME = "person.name"
     POSITION = "appointment.position"
     STATUS = "appointment.status"
+    APPOINTED_AT = "appointment.since"
     DEPARTMENT = "appointment.department"
     RESPONSIBILITIES = "appointment.responsibilities"
     EMAIL = "contact.email"
     PHONE = "contact.phone"
     EDUCATION = "person.education"
     DEGREE = "person.degree"
+    TITLE = "person.academic_title"
+    INTERESTS = "person.interests"
     CAREER = "person.career"
     PROFILE = "institution.profile"
+    TYPE = "institution.type"
+    LOCATION = "institution.location"
+    FOUNDED = "institution.founded"
+    EDUCATION_AREAS = "institution.education_areas"
+    EDUCATION_LEVELS = "institution.education_levels"
+    STUDENTS = "institution.students"
+    STRUCTURE = "institution.structure"
     PROJECT_NAME = "project.name"
     PROJECT_PROGRAM = "project.program"
     PROJECT_ROLE = "project.role"
@@ -148,6 +159,16 @@ class Evidence(EvidenceProposal):
     fragment_id: str | None = None
     start_offset: int | None = Field(default=None, ge=0)
     end_offset: int | None = Field(default=None, gt=0)
+    page_number: int | None = Field(default=None, ge=1)
+    file_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+class MetricContext(StrictModel):
+    # Literal source labels, not inferred from retrieval date or university name.
+    period: str = Field(min_length=1)
+    scope: str = Field(min_length=1)
+    unit: str = Field(min_length=1)
+    coverage: str | None = Field(default=None, min_length=1)
 
 
 class Fact(StrictModel):
@@ -156,8 +177,9 @@ class Fact(StrictModel):
     subject: Subject | NonPersonSubject | EntitySubject
     field: FactField
     value: str
-    origin: Literal["llm", "subject_projection", "parser_projection"] = "llm"
+    origin: Literal["llm", "subject_projection", "parser_projection", "curated_candidate"] = "llm"
     contact_owner: ContactOwner | None = None
+    metric_context: MetricContext | None = None
     evidence: list[Evidence]
     validation_status: Literal["passed", "failed"]
     verification_status: Literal["pending", "verified", "conflict", "rejected"]
@@ -230,6 +252,7 @@ class DraftOutput(StrictModel):
 
 
 class DraftResult(DraftOutput):
+    presentation_variant: Literal["compact", "detailed"] = "detailed"
     schema_version: Literal["0.1", "0.2", "0.3"] = "0.1"
     institution: Institution
     run: RunInfo

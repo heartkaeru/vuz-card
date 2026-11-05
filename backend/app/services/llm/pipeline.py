@@ -13,6 +13,7 @@ from .context_models import ContextExtractionRequest
 from .context_render import context_statement, context_title
 from .names import folded, person_name_in_quote
 from .contacts import contact_statement
+from .leadership_render import leadership_statement
 from .models import (
     DraftOutput, DraftResult, EntitySubject, Evidence, ExtractionOutput, ExtractionRequest,
     ExtractionResult, Fact, FactField, GenerationRequest, PipelineError, RunInfo,
@@ -211,6 +212,8 @@ class AssistantPipeline:
         if len(ids) != len(set(ids)):
             raise DraftValidationError("duplicate_fact_id")
         for fact in request.facts:
+            if fact.field == FactField.STUDENTS and fact.metric_context is None:
+                raise DraftValidationError("student_metric_context_required")
             context_field = fact.field.value.startswith(("institution.", "project.", "event."))
             if context_field or isinstance(fact.subject, EntitySubject):
                 if request.schema_version != "0.3":
@@ -252,6 +255,8 @@ class AssistantPipeline:
         payload["facts"] = [{
             "fact_id": alias, "field": fact.field.value, "value": fact.value,
             "person_name": fact.subject.person_name,
+            **({"department": fact.subject.department} if getattr(fact.subject, "department", None) else {}),
+            **({"metric_context": fact.metric_context.model_dump(mode="json")} if fact.metric_context else {}),
             **({"contact_owner": fact.contact_owner.model_dump(mode="json")} if fact.contact_owner else {}),
             **({"entity": {"kind": fact.subject.entity_kind, "name": fact.subject.entity_name}}
                if isinstance(fact.subject, EntitySubject) else {}),
@@ -287,6 +292,9 @@ class AssistantPipeline:
             self._validate_references(statement.text, statement.fact_ids, fact_map)
             if request.schema_version in {"0.2", "0.3"}:
                 canonical = contact_statement([fact_map[fid] for fid in statement.fact_ids])
+                if canonical is not None:
+                    statement.text = canonical
+                canonical = leadership_statement([fact_map[fid] for fid in statement.fact_ids])
                 if canonical is not None:
                     statement.text = canonical
             selected = [fact_map[fid] for fid in statement.fact_ids]
@@ -332,6 +340,7 @@ class AssistantPipeline:
         if not set(ids) <= facts.keys():
             raise DraftValidationError("unknown_fact_reference")
         # Numeric checks are deliberately narrow, not a semantic entailment claim.
-        allowed = " ".join(facts[fid].value for fid in ids)
+        allowed = " ".join(facts[fid].value + " " + (
+            " ".join(facts[fid].metric_context.model_dump(exclude_none=True).values()) if facts[fid].metric_context else "") for fid in ids)
         if not set(re.findall(r"\d+", text)) <= set(re.findall(r"\d+", allowed)):
             raise DraftValidationError("unsupported_number")

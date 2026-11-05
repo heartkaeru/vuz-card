@@ -13,6 +13,8 @@ from .names import folded, person_name_in_quote
 from .evidence import literal_value_in_text
 
 CONTACT_FIELDS = {FactField.EMAIL, FactField.PHONE}
+BIOGRAPHY_FIELDS = {FactField.EDUCATION, FactField.DEGREE, FactField.TITLE, FactField.CAREER,
+                    FactField.INTERESTS, FactField.RESPONSIBILITIES, FactField.APPOINTED_AT}
 
 
 def normalized(value):
@@ -77,6 +79,11 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
                 "source_id": document.source_id,
                 "fragments": [{
                     "fragment_id": f.fragment_id, "text": document.text[f.start:f.end],
+                    "subject_department": f.subject_department,
+                    "biography_subject": ({**f.biography_subject.model_dump(mode="json"),
+                        "anchor_text": document.text[by_id[f.biography_subject.anchor_fragment_id].start:
+                                                     by_id[f.biography_subject.anchor_fragment_id].end]}
+                        if f.biography_subject else None),
                     "contact_hints": [h.model_dump(mode="json") for h in f.contact_hints],
                 } for f in batch],
             }
@@ -91,13 +98,34 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
             gaps.extend(output.gaps)
             for proposal in output.facts:
                 issues, refs = [], list(dict.fromkeys(proposal.fragment_ids))
+                if proposal.value_fragment_id is not None:
+                    chosen = by_id.get(proposal.value_fragment_id)
+                    if (proposal.field not in BIOGRAPHY_FIELDS or proposal.value_fragment_id not in refs
+                            or proposal.value_fragment_id not in available or chosen is None
+                            or chosen.biography_subject is None):
+                        issues.append("invalid_biography_value_selection")
+                        proposal.value = "Неподтверждённый выбор фрагмента"
+                    else:
+                        proposal.value = document.text[chosen.start:chosen.end]
                 if request.fields is not None and proposal.field.value not in request.fields:
                     issues.append("field_not_requested")
                 if not set(refs) <= available:
                     issues.append("unknown_fragment_id")
                 selected = [by_id[fid] for fid in refs if fid in available]
+                context_refs = set()
                 texts = [document.text[f.start:f.end] for f in selected]
                 name = proposal.subject.person_name
+                subject = proposal.subject.model_copy(deep=True)
+                scopes = {f.subject_department for f in selected if f.subject_department
+                          and name and person_name_in_quote(name, document.text[f.start:f.end])}
+                if len(scopes) > 1:
+                    issues.append("conflicting_subject_department_scopes")
+                elif scopes:
+                    scope = next(iter(scopes))
+                    if subject.department and normalized(subject.department) != normalized(scope):
+                        issues.append("subject_department_scope_mismatch")
+                    else:
+                        subject.department = scope
                 if proposal.field not in CONTACT_FIELDS:
                     if not name:
                         issues.append("person_subject_required")
@@ -105,7 +133,15 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
                                  and (literal_value_in_text(proposal.value, text)
                                       or (proposal.field == FactField.NAME
                                           and person_name_in_quote(proposal.value, text))) for text in texts):
-                        issues.append("person_value_not_in_same_fragment")
+                        scoped = [f for f in selected if proposal.field in BIOGRAPHY_FIELDS
+                                  and f.biography_subject
+                                  and normalized(f.biography_subject.person_name) == normalized(name)
+                                  and literal_value_in_text(proposal.value, document.text[f.start:f.end])]
+                        if scoped:
+                            context_refs.update(f.biography_subject.anchor_fragment_id for f in scoped)
+                            refs.extend(sorted(context_refs))
+                        else:
+                            issues.append("person_value_not_in_same_fragment")
                     if proposal.contact_owner is not None:
                         issues.append("owner_on_non_contact_fact")
                 else:
@@ -141,13 +177,18 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
                                 refs.extend(hint.context_fragment_ids)
                 if proposal.field == FactField.NAME and name and normalized(name) != normalized(proposal.value):
                     issues.append("name_context_mismatch")
+                if proposal.field == FactField.INTERESTS and not re.search(
+                    r"научн\w*\s+интерес|област\w*\s+(?:научн\w*\s+)?интерес|направлени\w*\s+исследован|специализиру",
+                    " ".join(texts), re.I,
+                ):
+                    issues.append("research_interests_require_explicit_statement")
                 if proposal.field == FactField.EMAIL and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", proposal.value):
                     issues.append("invalid_email")
                 if proposal.field == FactField.PHONE and not 7 <= len(re.sub(r"\D", "", proposal.value)) <= 15:
                     issues.append("invalid_phone")
                 evidence = []
                 for fid in dict.fromkeys(refs):
-                    if fid not in by_id or (fid not in available and fid not in {
+                    if fid not in by_id or (fid not in available and fid not in context_refs and fid not in {
                         context_id for f in selected for hint in f.contact_hints
                         for context_id in hint.context_fragment_ids
                     }):
@@ -159,10 +200,11 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
                         published_at=document.published_at, content_sha256=source_hash,
                         chunk_id=chunk_id, fragment_id=fid,
                         start_offset=fragment.start, end_offset=fragment.end,
+                        page_number=fragment.page_number, file_sha256=document.file_sha256,
                     ))
                 owner_key = (proposal.contact_owner.model_dump_json() if proposal.contact_owner else None)
                 # Unit contacts repeated in rows belong to the unit, not each person.
-                subject_key = proposal.subject.model_dump_json() if name else None
+                subject_key = subject.model_dump_json() if name else None
                 key = (document.source_id, subject_key, proposal.field,
                        value_key(proposal.field, proposal.value), owner_key, tuple(sorted(set(issues))))
                 if key in seen:
@@ -170,7 +212,7 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
                 seen.add(key)
                 facts.append(Fact(
                     fact_id=f"fact_{uuid4().hex}", institution_id=request.institution.id,
-                    subject=proposal.subject, field=proposal.field, value=proposal.value,
+                    subject=subject, field=proposal.field, value=proposal.value,
                     contact_owner=proposal.contact_owner, evidence=evidence,
                     validation_status="failed" if issues else "passed",
                     verification_status="rejected" if issues else "pending", issues=sorted(set(issues)),
@@ -221,6 +263,7 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
                         published_at=document.published_at, content_sha256=digest,
                         chunk_id=f"parser:{fragment.fragment_id}", fragment_id=fid,
                         start_offset=by_id[fid].start, end_offset=by_id[fid].end,
+                        page_number=by_id[fid].page_number, file_sha256=document.file_sha256,
                     ) for fid in refs]
                     subject = (Subject(person_name=hint.owner.label) if hint.owner.kind == "person" else
                                NonPersonSubject(department=hint.owner.label if hint.owner.kind == "department" else None))
@@ -257,7 +300,7 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
             fact.verification_status = "conflict"
             fact.issues.append("multiple_head_candidates")
     return ExtractionResult(
-        schema_version="0.2", institution=request.institution, run=pipeline.run_info("extract-fragments-v1"),
+        schema_version="0.2", institution=request.institution, run=pipeline.run_info("extract-fragments-v5"),
         facts=facts, gaps=list(dict.fromkeys(gaps)), errors=errors,
         complete=not errors and all(f.validation_status == "passed" for f in facts),
     )

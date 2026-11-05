@@ -29,11 +29,19 @@ class ContactHint(StrictModel):
         return self
 
 
+class BiographySubject(StrictModel):
+    person_name: str = Field(min_length=1)
+    anchor_fragment_id: str = Field(min_length=1)
+
+
 class SourceFragment(StrictModel):
     fragment_id: str = Field(min_length=1)
     start: int = Field(ge=0)
     end: int = Field(gt=0)
     contact_hints: list[ContactHint] = Field(default_factory=list)
+    subject_department: str | None = Field(default=None, min_length=1)
+    biography_subject: BiographySubject | None = None
+    page_number: int | None = Field(default=None, ge=1)
 
 
 class FragmentDocument(SourceDocument):
@@ -54,6 +62,13 @@ class FragmentDocument(SourceDocument):
             content = self.text[fragment.start:fragment.end]
             if not content.strip():
                 raise ValueError("Empty source fragment")
+            if fragment.subject_department and not literal_value_in_text(fragment.subject_department, content):
+                raise ValueError("Subject department is absent from its source fragment")
+            if fragment.biography_subject:
+                bio = fragment.biography_subject
+                anchor = by_id.get(bio.anchor_fragment_id)
+                if anchor is None or not person_name_in_quote(bio.person_name, self.text[anchor.start:anchor.end]):
+                    raise ValueError("Biography subject is absent from its source anchor")
             for hint in fragment.contact_hints:
                 if any(fid not in by_id for fid in hint.context_fragment_ids):
                     raise ValueError("Unknown contact context fragment")
@@ -78,9 +93,17 @@ class FragmentExtractionRequest(ExtractionRequest):
 class FragmentFactProposal(StrictModel):
     subject: Subject | NonPersonSubject
     field: FactField
-    value: str = Field(min_length=1)
+    value: str | None = Field(default=None, min_length=1)
+    # Biography can select a whole source sentence instead of retyping it.
+    value_fragment_id: str | None = Field(default=None, min_length=1)
     fragment_ids: list[str] = Field(min_length=1)
     contact_owner: ContactOwner | None = None
+
+    @model_validator(mode="after")
+    def one_value_representation(self):
+        if (self.value is None) == (self.value_fragment_id is None):
+            raise ValueError("Provide value OR value_fragment_id")
+        return self
 
     @field_validator("field")
     @classmethod

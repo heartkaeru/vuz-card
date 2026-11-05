@@ -149,7 +149,7 @@ export function AgentChat({ open, universityName, onClose, onAction }: AgentChat
               <Icon name="send" size={19} />
             </button>
           </form>
-          <p className="agent-chat__note">Демо-интерфейс · без подключения к источникам</p>
+          <p className="agent-chat__note">Команды выбранной карточки · сбор источников и презентация через сервер</p>
         </div>
       </aside>
     </>

@@ -10,6 +10,7 @@ from uuid import uuid4
 from .schema import connect, execute_statements, initialize
 from app.services.llm.models import DraftResult, Fact, Institution
 from app.services.llm.workflow_models import ResearchRun, WorkflowError
+from app.services.llm.changes import effective_facts
 
 
 def stamp():
@@ -102,18 +103,41 @@ class LLMRepository:
             old = db.execute("SELECT run_id,input_hash FROM llm_run WHERE institution_id=? AND request_key=?",
                              (institution.id, request_key)).fetchone()
             if old:
-                if old[1] != digest:
+                stored = json.loads(db.execute("SELECT payload FROM llm_run_input WHERE run_id=?", (old[0],)).fetchone()[0])
+                old_request = {key: stored[key] for key in ("institution", "card", "modes")}
+                if json.dumps(old_request, ensure_ascii=False, sort_keys=True, separators=(",", ":")) != payload:
                     raise WorkflowError("request_key_payload_mismatch")
                 return self._read(db, old[0]), False
+            previous = self._previous_run(db, institution)
+            baseline = [f.model_copy(deep=True) for f in effective_facts(previous)] if previous else []
             run = ResearchRun(run_id=f"run_{uuid4().hex}", institution=institution, target_kind=kind,
                               created_at=stamp(), updated_at=stamp(),
                               requested_modes=list(modes),
                               parser_warnings=card_payload.get("warnings", []),
-                              parser_errors=card_payload.get("errors", []))
+                              parser_errors=card_payload.get("errors", []),
+                              previous_run_id=previous.run_id if previous else None, baseline_facts=baseline)
+            frozen = json.loads(payload)
+            frozen.update(previous_run_id=run.previous_run_id, baseline_facts=[f.model_dump(mode="json") for f in baseline])
+            payload = json.dumps(frozen, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
             db.execute("INSERT INTO llm_run VALUES (?,?,?,?,?,?)", (
                 run.run_id, institution.id, request_key, digest, run.revision, run.model_dump_json()))
             db.execute("INSERT INTO llm_run_input VALUES (?,?)", (run.run_id, payload))
+            self._after_create(db, run)
             return run, True
+
+    def _previous_run(self, db, institution):
+        row = db.execute("SELECT run_id FROM llm_run WHERE institution_id=? ORDER BY rowid DESC LIMIT 1", (institution.id,)).fetchone()
+        previous = self._read(db, row[0]) if row else None
+        return previous if previous and previous.institution == institution else None
+
+    def _after_create(self, db, run):
+        pass
+
+    def history(self, institution_id):
+        with closing(connect(self.path)) as db:
+            return [self._read(db, row[0]) for row in db.execute(
+                "SELECT run_id FROM llm_run WHERE institution_id=? ORDER BY rowid DESC LIMIT 20", (institution_id,))]
 
     def get(self, run_id):
         with closing(connect(self.path)) as db:
@@ -162,7 +186,7 @@ class LLMRepository:
             material_id = f"material_{uuid4().hex}"
             db.execute("INSERT INTO llm_material VALUES (?,?,?,?,?)", (
                 material_id, run_id, revision, stamp().isoformat(), draft.model_dump_json()))
-            by_id = {fact.fact_id: fact for fact in run.facts}
+            by_id = {fact.fact_id: fact for fact in effective_facts(run)}
             if not draft.sources.keys() <= by_id.keys():
                 raise WorkflowError("unknown_material_fact")
             for index, fact_id in enumerate(draft.sources):
