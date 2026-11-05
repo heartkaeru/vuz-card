@@ -11,6 +11,17 @@ from app.services.llm.workflow_models import WorkflowError
 
 
 class DemoRepository(LLMRepository):
+    def _previous_run(self, db, institution):
+        row = db.execute("SELECT latest_run FROM llm_card WHERE id=?", (institution.id,)).fetchone()
+        if row is None:
+            return super()._previous_run(db, institution)
+        previous = self._read(db, row[0]) if row[0] else None
+        return previous if previous and previous.institution == institution else None
+
+    def _after_create(self, db, run):
+        # Capture approved baseline and switch latest in the same transaction.
+        db.execute("UPDATE llm_card SET latest_run=? WHERE id=?", (run.run_id, run.institution.id))
+
     def __init__(self, path):
         super().__init__(path)
         with closing(connect(self.path)) as db, db:
@@ -124,7 +135,7 @@ class DemoRepository(LLMRepository):
 
     def materials(self):
         with closing(connect(self.path)) as db:
-            rows = db.execute("""SELECT m.material_id,m.created_at,m.run_id,c.name
+            rows = db.execute("""SELECT m.material_id,m.created_at,m.run_id,m.payload,c.name
                 FROM llm_material m JOIN llm_run r ON r.run_id=m.run_id
                 JOIN llm_card c ON c.id=r.institution_id ORDER BY m.rowid DESC""").fetchall()
         result = []
@@ -136,7 +147,10 @@ class DemoRepository(LLMRepository):
                 _, stale = self.material(row["material_id"])
             except WorkflowError:
                 stale = True
-            result.append({"id": row["material_id"], "name": f"Материалы к встрече: {row['name']}",
+            # Old/superseded material payloads retain their variant independently of current research.
+            variant = json.loads(row["payload"]).get("presentation_variant", "detailed")
+            label = "Краткая карточка" if variant == "compact" else "Подробная справка"
+            result.append({"id": row["material_id"], "name": f"{label}: {row['name']}", "presentation_variant": variant,
                 "format": "PPTX", "created_at": row["created_at"], "stale": stale,
                 "download_url": f"/api/v1/ai/materials/{row['material_id']}/download",
                 "brief_url": f"/api/v1/ai/materials/{row['material_id']}/brief"})

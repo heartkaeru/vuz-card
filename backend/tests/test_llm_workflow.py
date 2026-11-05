@@ -250,6 +250,22 @@ def test_missing_registry_identity_never_creates_a_fake_legal_entity(setup):
         assert db.execute("SELECT COUNT(*) FROM legal_entity").fetchone()[0] == 0
 
 
+def test_workflow_keeps_proven_parser_contact_when_model_omits_it(tmp_path):
+    doc = HTMLCleaner().to_document('<main><h2>Приёмная ректора</h2><p>office@example.org</p></main>',
+        url='https://university.example/contacts', section='contacts')
+    card = UniversityData(university=UniversityInfo(name='Учебный вуз', url='https://university.example'), documents=[doc])
+    repository = LLMRepository(tmp_path / 'contacts.sqlite3')
+    workflow = LLMWorkflow(repository, AssistantPipeline(FixtureProvider([{'facts': [], 'gaps': []}])))
+    run, _ = workflow.create(Institution(id='draft:contacts', name='Учебный вуз', card_version=1), card,
+                             'omitted-contact', modes=('0.2',))
+    run = asyncio.run(workflow.extract(run.run_id))
+    assert len(run.facts) == 1
+    fact = run.facts[0]
+    assert fact.value == 'office@example.org' and fact.origin == 'parser_projection'
+    assert fact.subject.person_name is None and fact.contact_owner.kind == 'office'
+    assert fact.verification_status == 'pending' and fact.validation_status == 'passed'
+
+
 def test_partial_parser_failure_is_visible_and_does_not_approve_candidates(setup):
     repository, workflow, run, card = setup
     card.errors.append("Fixture: news section unavailable")

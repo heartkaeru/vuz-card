@@ -209,6 +209,7 @@ class FetchResult:
     encoding: str = ""
     elapsed: float = 0.0
     headers: dict[str, str] = field(default_factory=dict)
+    content: bytes = field(default=b"", repr=False)
 
 
 def setup_logging(
@@ -655,12 +656,16 @@ def contains_position(text: str) -> bool:
     return any(keyword in lowered for keyword in POSITION_KEYWORDS)
 
 
-def detect_encoding(response: requests.Response) -> str:
+def detect_encoding(response: requests.Response, content: bytes | None = None) -> str:
     """Определяет кодировку ответа (включая старые cp1251-сайты)."""
 
     encoding = (response.encoding or "").lower()
     if not encoding or encoding in {"iso-8859-1", "ascii"}:
-        encoding = (response.apparent_encoding or "utf-8").lower()
+        if content is not None:
+            from bs4 import UnicodeDammit
+            encoding = (UnicodeDammit(content).original_encoding or "utf-8").lower()
+        else:
+            encoding = (response.apparent_encoding or "utf-8").lower()
     if encoding in {"windows-1251", "cp1251"}:
         return "cp1251"
     return encoding or "utf-8"
@@ -806,6 +811,7 @@ class HttpClient:
         self._ua_lock = threading.Lock()
         self._requests_made = 0
         self.last_error: str = ""
+        self.last_error_code: str = ""
 
     def _next_user_agent(self) -> str:
         with self._ua_lock:
@@ -830,6 +836,7 @@ class HttpClient:
         """Скачивает страницу. Возвращает ``None`` после исчерпания попыток."""
 
         self.last_error = ""
+        self.last_error_code = ""
         if self._requests_made >= self.settings.max_total_requests:
             self.last_error = (
                 "Достигнут лимит запросов на обход "
@@ -854,32 +861,37 @@ class HttpClient:
             self._requests_made += 1
             self.limiter.wait(url)
             started = time.monotonic()
+            response = None
             try:
                 response = self.session.get(
                     url,
                     headers=self._headers(url),
                     timeout=self.settings.timeout,
                     allow_redirects=True,
+                    stream=True,
                 )
+                content = bytearray()
+                for block in response.iter_content(chunk_size=65536):
+                    content.extend(block)
+                    if len(content) > self.settings.max_response_bytes:
+                        self.last_error_code = "response_too_large"
+                        self.last_error = f"Слишком большой ответ (лимит {self.settings.max_response_bytes} байт): {url}"
+                        LOGGER.warning(self.last_error)
+                        return None
+                content = bytes(content)
                 elapsed = time.monotonic() - started
-                if len(response.content) > self.settings.max_response_bytes:
-                    self.last_error = (
-                        f"Слишком большой ответ ({len(response.content)} байт): {url}"
-                    )
-                    LOGGER.warning(self.last_error)
-                    return None
-                encoding = detect_encoding(response)
-                try:
-                    body = response.content.decode(encoding, errors="replace")
-                except (LookupError, UnicodeDecodeError):
-                    body = response.text
-
                 content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
+                is_pdf = content.startswith(b"%PDF-") or content_type.lower() == "application/pdf"
+                encoding = "" if is_pdf else detect_encoding(response, content)
+                try:
+                    body = "" if is_pdf else content.decode(encoding, errors="replace")
+                except LookupError:
+                    encoding, body = "utf-8", content.decode("utf-8", errors="replace")
                 LOGGER.info(
                     "GET %s -> %s (%.0f КБ, %.1f с)",
                     url,
                     response.status_code,
-                    len(body.encode("utf-8")) / 1024,
+                    len(content) / 1024,
                     elapsed,
                 )
 
@@ -952,6 +964,7 @@ class HttpClient:
                     encoding=encoding,
                     elapsed=elapsed,
                     headers=dict(response.headers),
+                    content=content if is_pdf else b"",
                 )
             except requests.RequestException as exc:
                 last_exception = exc
@@ -967,6 +980,9 @@ class HttpClient:
                     time.sleep(
                         _backoff_seconds(attempt, self.settings.backoff_factor)
                     )
+            finally:
+                if response is not None:
+                    response.close()
 
         if last_exception:
             self.last_error = f"{type(last_exception).__name__}: {last_exception}"

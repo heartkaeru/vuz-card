@@ -5,11 +5,18 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from .models import Institution, SourceDocument, StrictModel
+from .models import Institution, MetricContext, SourceDocument, StrictModel
 
 
 class ContextField(str, Enum):
     PROFILE = "institution.profile"
+    TYPE = "institution.type"
+    LOCATION = "institution.location"
+    FOUNDED = "institution.founded"
+    EDUCATION_AREAS = "institution.education_areas"
+    EDUCATION_LEVELS = "institution.education_levels"
+    STUDENTS = "institution.students"
+    STRUCTURE = "institution.structure"
     PROJECT_NAME = "project.name"
     PROJECT_PROGRAM = "project.program"
     PROJECT_ROLE = "project.role"
@@ -29,6 +36,9 @@ class ContextFragment(StrictModel):
     end: int = Field(gt=0)
     # Parser-defined scope: one article/project/event, not a whole university website.
     entity_scope_id: str | None = Field(default=None, min_length=1)
+    # Only dedicated institutional reference pages, never project/news pages.
+    institution_anchor_id: str | None = Field(default=None, min_length=1)
+    page_number: int | None = Field(default=None, ge=1)
 
 
 class ContextDocument(SourceDocument):
@@ -46,6 +56,8 @@ class ContextDocument(SourceDocument):
             if not self.text[fragment.start:fragment.end].strip():
                 raise ValueError("Blank fragment")
             previous_end = fragment.end
+        if any(f.institution_anchor_id and f.institution_anchor_id not in ids for f in self.fragments):
+            raise ValueError("Unknown institution anchor fragment")
         return self
 
 
@@ -75,8 +87,16 @@ class ContextFactProposal(StrictModel):
     subject: ContextSubjectProposal
     field: ContextField
     # A literal passage; paraphrasing belongs to the reviewed drafting stage.
-    value: str = Field(min_length=1)
+    value: str | None = Field(default=None, min_length=1)
+    value_fragment_id: str | None = Field(default=None, min_length=1)
     fragment_ids: list[str] = Field(min_length=1)
+    metric_context: MetricContext | None = None
+
+    @model_validator(mode="after")
+    def one_value_representation(self):
+        if self.value is None and self.value_fragment_id is None:
+            raise ValueError("Provide value or value_fragment_id")
+        return self
 
 
 class ContextExtractionOutput(StrictModel):

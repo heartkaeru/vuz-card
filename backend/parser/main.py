@@ -2360,10 +2360,45 @@ class UniversityParser:
                 leader.bio = bio
                 leader.source_quote = truncate_text(bio, 300)
 
+    def collect_institution_documents(self, urls):
+        """Explicit official reference sources, sharing normal crawl limits and TLS."""
+        result = []
+        for url in urls:
+            doc, _ = self._get_page(url, section="about")
+            if doc is not None:
+                result.append(doc)
+        return result
+
+    def collect_pdf_documents(self, sources):
+        """Explicit official PDF sources. Keep page selection and failures reviewable."""
+        from .pdf_source import PDFSourceError, pdf_document
+        result, errors = [], []
+        for source in sources:
+            url = str(source["url"])
+            if not is_same_domain(url, self._base_url):
+                errors.append("pdf_source_must_belong_to_official_domain")
+                continue
+            response = self.client.get(url)
+            if response is None:
+                errors.append("pdf_file_too_large" if self.client.last_error_code == "response_too_large" else "pdf_download_failed")
+                continue
+            if not is_same_domain(response.final_url or url, self._base_url):
+                errors.append("pdf_redirect_must_belong_to_official_domain")
+                continue
+            try:
+                result.append(pdf_document(response.content, url=response.final_url or url,
+                    pages=source.get("pages"), max_chars=self.settings.max_document_chars,
+                    max_bytes=self.settings.max_response_bytes))
+            except PDFSourceError as exc:
+                errors.append(str(exc))
+        return result, errors
+
     def _bio_from_url(self, url: str, leader: Leadership) -> str:
         doc, _ = self._get_page(url, section="bio")
         if doc is None:
             return ""
+        from .biography import mark_biography_subject
+        mark_biography_subject(doc, leader.full_name)
         return self._extract_bio_text(doc, leader.full_name, leader)
 
     @staticmethod

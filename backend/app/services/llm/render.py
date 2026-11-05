@@ -3,7 +3,7 @@
 from .models import DraftResult
 
 
-def render_markdown(draft: DraftResult) -> str:
+def render_markdown(draft: DraftResult, facts=None) -> str:
     refs = {fid: f"S{index}" for index, fid in enumerate(draft.sources, 1)}
 
     def citations(ids):
@@ -42,9 +42,20 @@ def render_markdown(draft: DraftResult) -> str:
                       f"- Опубликовано: {evidence.published_at.isoformat() if evidence.published_at else 'дата неизвестна'}",
                       f"- Фрагмент: {evidence.chunk_id}",
                       f"- Цитата: {evidence.quote}", ""]
+            if evidence.page_number:
+                lines += [f"- Страница PDF: {evidence.page_number}", f"- SHA256 файла: {evidence.file_sha256}", ""]
             if evidence.fragment_id is not None:
                 lines += [f"- Границы цитаты: {evidence.start_offset}–{evidence.end_offset}; "
                           f"фрагмент {evidence.fragment_id}", ""]
+    if facts:
+        from .context_render import context_value
+        lines += ["## Полные значения выбранных фактов", ""]
+        for fact in facts:
+            owner = fact.subject.person_name or getattr(fact.subject, "entity_name", None) or (fact.contact_owner.label if fact.contact_owner else "Учреждение")
+            department = getattr(fact.subject, "department", None)
+            if department:
+                owner += " · " + department
+            lines += [f"- **{owner}** · {fact.field.value}: {context_value(fact)} {citations([fact.fact_id])}", ""]
     lines += ["## Ограничения проверки", ""]
     lines += [f"- {warning}" for warning in draft.warnings]
     return "\n".join(lines) + "\n"

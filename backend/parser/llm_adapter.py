@@ -47,6 +47,8 @@ def to_llm_document(
         "retrieved_at": _iso(document.retrieved_at),
         "published_at": _iso(document.published_at),
     }
+    if document.file_sha256:
+        payload["file_sha256"] = document.file_sha256
     if include_fragments:
         fragments = []
         for fragment in document.fragments:
@@ -55,15 +57,23 @@ def to_llm_document(
                 "start": fragment.start,
                 "end": fragment.end,
             }
+            if fragment.page_number is not None:
+                item["page_number"] = fragment.page_number
             if entity_scope_id is not None:
                 item["entity_scope_id"] = entity_scope_id or document.source_id
             elif not include_contact_hints and fragment.entity_scope_id is not None:
                 item["entity_scope_id"] = fragment.entity_scope_id
             if include_contact_hints:
+                if fragment.biography_subject:
+                    item["biography_subject"] = fragment.biography_subject.model_dump(mode="json")
+                if fragment.subject_department:
+                    item["subject_department"] = fragment.subject_department
                 item["contact_hints"] = [
                     hint.model_dump(mode="json")
                     for hint in fragment.contact_hints
                 ]
+            elif fragment.institution_anchor_id:
+                item["institution_anchor_id"] = fragment.institution_anchor_id
             fragments.append(item)
         payload["fragments"] = fragments
     return payload

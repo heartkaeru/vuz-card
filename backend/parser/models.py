@@ -290,6 +290,11 @@ class ContactHint(BaseModel):
     context_fragment_ids: list[str] = Field(default_factory=list)
 
 
+class BiographySubject(BaseModel):
+    person_name: str
+    anchor_fragment_id: str
+
+
 class DocumentFragment(BaseModel):
     """Фрагмент очищенного текста с Unicode-смещениями.
 
@@ -303,7 +308,11 @@ class DocumentFragment(BaseModel):
     start: int = Field(ge=0)
     end: int = Field(ge=0)
     heading: str = ""
+    subject_department: str | None = None
+    biography_subject: BiographySubject | None = None
     entity_scope_id: str | None = Field(default=None, min_length=1)
+    institution_anchor_id: str | None = None
+    page_number: int | None = Field(default=None, ge=1)
     contact_hints: list[ContactHint] = Field(default_factory=list)
 
 
@@ -323,6 +332,7 @@ class SourceDocument(BaseModel):
     retrieved_at: datetime = Field(default_factory=utc_now)
     published_at: Optional[datetime] = None
     text_hash: str = ""
+    file_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     fragments: list[DocumentFragment] = Field(default_factory=list)
     metadata: dict[str, str] = Field(default_factory=dict)
     # Служебные поля для извлечения сущностей. В JSON не попадают:
