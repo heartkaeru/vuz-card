@@ -13,12 +13,13 @@ export type Section = "about" | "contacts" | "projects" | "events";
 export type View = "overview" | "universities" | "events" | "reports";
 
 export const initialUniversities: University[] = [
-  { id: "mgu", name: "МГУ им. М.В. Ломоносова", city: "Москва", tone: "mint" },
-  { id: "bmstu", name: "МГТУ им. Н.Э. Баумана", city: "Москва", tone: "blue" },
-  { id: "mipt", name: "МФТИ", city: "Долгопрудный, Московская область", tone: "blue" },
-  { id: "spbgu", name: "СПбГУ", city: "Санкт-Петербург", tone: "yellow" },
-  { id: "mephi", name: "НИЯУ МИФИ", city: "Москва", tone: "mint" },
-  { id: "hse", name: "НИУ ВШЭ", city: "Москва", tone: "mint" },
+  { id: "bgu", name: "Байкальский государственный университет", city: "Иркутск", website: "https://bgu.ru", tone: "mint" },
+  { id: "bmstu", name: "МГТУ им. Н.Э. Баумана", city: "Москва", website: "https://bmstu.ru", tone: "blue" },
+  { id: "mipt", name: "МФТИ", city: "Долгопрудный, Московская область", website: "https://mipt.ru", tone: "blue" },
+  { id: "spbgu", name: "СПбГУ", city: "Санкт-Петербург", website: "https://spbu.ru", tone: "yellow" },
+  { id: "mephi", name: "НИЯУ МИФИ", city: "Москва", website: "https://mephi.ru", tone: "mint" },
+  { id: "hse", name: "НИУ ВШЭ", city: "Москва", website: "https://hse.ru", tone: "mint" },
+  { id: "msu", name: "МГУ им. М.В. Ломоносова", city: "Москва", website: "https://msu.ru", tone: "mint" },
 ];
 
 export const sampleEvents = [
