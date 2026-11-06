@@ -298,6 +298,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .profile-hero__meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; color: #738078; font-size: 12px; }
 .profile-hero__meta svg { color: #8a9d8f; }
 .meta-separator { padding-inline: 3px; color: #a6b4aa; }
+.profile-hero__actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .profile-hero__download { margin-top: 17px; }
 .profile-hero__metrics { position: relative; z-index: 1; display: flex; flex: 0 0 auto; gap: 10px; }
 .hero-metric { display: flex; width: 138px; min-height: 82px; flex-direction: column; gap: 5px; padding: 12px 12px 10px; border: 1px solid #c4e1cb; border-radius: 17px; background: rgba(255,255,255,.52); color: #0c7a36; font-size: 10px; line-height: 1.3; backdrop-filter: blur(6px); }
@@ -696,7 +697,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .research-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; }
 .research-controls label, .research-review label { display: grid; gap: 7px; font-size: 13px; color: #475569; }
 .research-controls label { flex: 1; min-width: 230px; }
-.research-panel input:not([type="checkbox"]) { border: 1px solid #d9e4df; border-radius: 11px; padding: 12px; background: white; color: #17261e; min-width: 0; width: 100%; }
+.research-panel input:not([type="checkbox"]), .research-panel select { border: 1px solid #d9e4df; border-radius: 11px; padding: 12px; background: white; color: #17261e; min-width: 0; width: 100%; font: inherit; }
 .research-progress { display: grid; gap: 9px; margin: 18px 0; font-size: 14px; }
 .research-progress progress { width: 100%; accent-color: #159764; height: 9px; }
 .research-summary { font-size: 14px; color: #475569; margin-top: 18px; display: flex; gap: 12px; flex-wrap: wrap; }
@@ -761,3 +762,30 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   .report-preview__content { min-height: 120px; padding: 13px; font-size: 11px; }
   .report-preview__actions { align-items: stretch; flex-direction: column; }
 }
+.research-source-options textarea { width: 100%; min-width: 0; resize: vertical; border: 1px solid #d9e4df; border-radius: 11px; padding: 12px; background: white; color: #17261e; font: inherit; }
+.research-source-options .research-ack { display: flex; align-items: center; }
+.research-meeting { border: 1px solid #e1e9e5; border-radius: 12px; margin: 20px 0; padding: 15px; min-width: 0; }
+.research-meeting legend { font-size: 14px; color: #475569; padding: 0 6px; }
+.research-meeting small { display: block; color: #64748b; line-height: 1.6; margin-top: 12px; }
+.research-diagnostics { margin: 16px 0; color: #475569; font-size: 13px; line-height: 1.7; }
+.research-diagnostics summary { cursor: pointer; color: #48715c; }
+.research-diagnostics li { margin: 6px 0; overflow-wrap: anywhere; }
+.approved-card, .research-history { margin: 18px 0; padding: 16px; border: 1px solid #cde2d6; border-radius: 12px; color: #344d40; }
+.approved-card summary, .research-history summary { cursor: pointer; font-weight: 600; }
+.approved-card section { border-top: 1px solid #e1e9e5; margin-top: 15px; }
+.research-changes { margin: 24px 0; }
+.research-changes > p { color: #52655a; font-size: 13px; line-height: 1.6; }
+.research-change { margin: 14px 0; padding: 18px; border: 1px solid #dce8e0; border-radius: 12px; background: #fcfefd; }
+.research-change--changed, .research-change--head_change { border-color: #d8b77a; background: #fffcf5; }
+.research-change--not_confirmed { border-color: #cbd5df; }
+.research-change__heading { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 14px; }
+.research-change__heading > span { font-size: 12px; color: #607064; }
+.change-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 15px 0; }
+.change-columns > div { min-width: 0; }
+.change-columns h4 { font-size: 12px; color: #63746a; margin: 0 0 12px; }
+.change-value { display: grid; gap: 8px; padding: 12px 0; border-bottom: 1px solid #e4ece7; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.change-value small { display: block; color: #64746c; }
+.change-sources { font-size: 12px; }
+.change-sources summary { cursor: pointer; color: #26704c; }
+.research-replacement { grid-column: 1 / -1; padding: 12px; background: #fff6e6; border-radius: 9px; }
+@media(max-width: 800px) { .change-columns { grid-template-columns: 1fr; } }

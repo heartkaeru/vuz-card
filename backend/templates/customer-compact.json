@@ -1,0 +1,14 @@
+{
+  "template_id": "customer-compact-v1",
+  "design_reference": "Карточки ИКЭСТ и ИРНИТУ заказчика; три содержательных слайда без обложки",
+  "sections": ["head", "institution", "agenda"],
+  "width_inches": 13.333333,
+  "height_inches": 7.5,
+  "font": "Calibri",
+  "text_color": "313F48",
+  "muted_color": "647078",
+  "title_pt": 28,
+  "body_pt": 17,
+  "header_image": "assets/sber-gradient-header.jpg",
+  "logo_image": "assets/sber-logo.png"
+}

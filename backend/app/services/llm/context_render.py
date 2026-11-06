@@ -4,6 +4,13 @@ from .models import EntitySubject, Fact
 
 LABELS = {
     "institution.profile": "Профиль",
+    "institution.type": "Тип учреждения",
+    "institution.location": "Местонахождение",
+    "institution.founded": "Основание",
+    "institution.education_areas": "Направления подготовки",
+    "institution.education_levels": "Уровни образования",
+    "institution.students": "Обучающиеся",
+    "institution.structure": "Структура и филиалы",
     "project.program": "Программа",
     "project.role": "Роль учреждения",
     "project.status": "Статус проекта",
@@ -26,12 +33,22 @@ def context_statement(facts: list[Fact]) -> str | None:
     for fact in facts:
         if fact.field.value.endswith(".name"):
             continue
-        key = (fact.field, fact.value)
+        key = (fact.field, fact.value, fact.metric_context.model_dump_json() if fact.metric_context else None)
         if key in seen:
             continue
         seen.add(key)
-        parts.append(f"{LABELS[fact.field.value]}: {fact.value.rstrip('. ')}")
+        parts.append(f"{LABELS[fact.field.value]}: {context_value(fact)}")
     return ". ".join(parts) + "."
+
+
+def context_value(fact: Fact) -> str:
+    value = " ".join(fact.value.rstrip(". ").split())
+    if fact.metric_context:
+        metric = fact.metric_context
+        value += f" (период: {metric.period}; состав: {metric.scope}; единица: {metric.unit})"
+        if metric.coverage:
+            value += f"; охват: {metric.coverage}"
+    return value
 
 
 def context_title(facts: list[Fact]) -> str | None:

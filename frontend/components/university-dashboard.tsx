@@ -286,6 +286,7 @@ export default function UniversityDashboard() {
             <ProfileHero
               university={selectedUniversity}
               onPreview={() => researchRef.current?.openReportOptions()}
+              onDownload={() => { void researchRef.current?.generate(); }}
             />
             <ResearchPanel key={selectedUniversity.id} ref={researchRef} university={selectedUniversity}
               showFacts={section === "contacts"} onShowFacts={() => setSection("contacts")}
@@ -418,7 +419,7 @@ export default function UniversityDashboard() {
   );
 }
 
-function ProfileHero({ university, onPreview }: { university: University; onPreview: () => void }) {
+function ProfileHero({ university, onPreview, onDownload }: { university: University; onPreview: () => void; onDownload: () => void }) {
   return (
     <section className="profile-hero">
       <div className="profile-hero__decor profile-hero__decor--one" />
@@ -427,7 +428,10 @@ function ProfileHero({ university, onPreview }: { university: University; onPrev
         <span className="profile-hero__overline">КАРТОЧКА ОБРАЗОВАТЕЛЬНОЙ ОРГАНИЗАЦИИ</span>
         <h1>{university.name}</h1>
         <p className="profile-hero__meta"><Icon name="pin" size={15} /> {university.city}<span className="meta-separator">·</span>Проверка сведений по первоисточникам</p>
-        <button className="button button--primary profile-hero__download" type="button" onClick={onPreview}><Icon name="search" size={16} /> Просмотреть</button>
+        <div className="profile-hero__actions">
+          <button className="button button--primary profile-hero__download" type="button" onClick={onDownload}><Icon name="download" size={16} /> Сформировать материалы</button>
+          <button className="button button--soft profile-hero__download" type="button" onClick={onPreview}><Icon name="search" size={16} /> Просмотреть и выбрать формат</button>
+        </div>
       </div>
       <div className="profile-hero__metrics">
         <div className="hero-metric hero-metric--green"><span className="hero-metric__icon"><Icon name="spark" size={15} /></span><span>Точки соприкосновений</span><strong>—</strong></div>
