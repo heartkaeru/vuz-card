@@ -312,6 +312,10 @@ export default function UniversityDashboard() {
               ))}
               <span className="profile-tabs__indicator" aria-hidden="true" style={{ left: tabIndicator.left, width: tabIndicator.width }} />
             </div>
+            <ResearchPanel key={selectedUniversity.id} ref={researchRef} university={selectedUniversity}
+              showFacts={section === "contacts"} onShowFacts={() => setSection("contacts")}
+              onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
+                ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
             <div className="profile-content page-enter" key={`${selectedUniversity.id}-${section}`}>
               {section === "about" && <AboutSection university={selectedUniversity} run={selectedRun} onAdd={() => setChatOpen(true)} />}
               {section === "contacts" && <ContactsSection university={selectedUniversity} run={selectedRun} />}
