@@ -37,6 +37,9 @@ dist/
 .vite/
 .next/
 
+# Generated presentation output
+/presentation-output/
+
 # IDE & OS
 .vscode/
 .idea/
