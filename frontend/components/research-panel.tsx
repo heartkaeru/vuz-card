@@ -65,8 +65,10 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [presentationPreview, setPresentationPreview] = useState<PptxPreviewData | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState("");
   const [downloadingPresentation, setDownloadingPresentation] = useState(false);
   const [previewAfterGeneration, setPreviewAfterGeneration] = useState(false);
+  const [previewAfterGenerationFrom, setPreviewAfterGenerationFrom] = useState<string | null>(null);
   const [showRejected, setShowRejected] = useState(false);
   const [meetingGoal, setMeetingGoal] = useState("");
   const [meetingDate, setMeetingDate] = useState("");
@@ -134,6 +136,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
           if (next.result?.material_id) setMaterial(next.result as Material);
           if (next.status === "failed") {
             setPreviewAfterGeneration(false);
+            setPreviewAfterGenerationFrom(null);
             setError(next.message + (next.result?.code ? ` (${errorText(new Error(next.result.code))})` : ""));
           }
         }
@@ -179,7 +182,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   }
 
   async function generate() {
-    if (!run || !accepted) { const message = "Для презентации сначала примите проверенные факты о руководстве."; setError(message); onShowFacts(); return message; }
+    if (!run || (!accepted && !material)) { const message = "Для презентации сначала примите проверенные факты о руководстве."; setError(message); onShowFacts(); return message; }
     if (busy) return "Для карточки уже выполняется задание. Дождитесь его завершения.";
     setSaving(true); setError("");
     try {
@@ -195,15 +198,16 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
 
   async function openPreview() {
     if (!material) return false;
+    setPreviewOpen(true);
     setPreviewLoading(true); setError("");
+    setPreviewError(""); setPresentationPreview(null);
     try {
       const result = await api<PptxPreviewData>(`/materials/${encodeURIComponent(material.material_id)}/preview`);
       if (!result.slides.length) throw new Error("presentation_preview_unavailable");
       setPresentationPreview(result);
-      setPreviewOpen(true);
       return true;
     } catch (failure) {
-      setError(failure instanceof TypeError
+      setPreviewError(failure instanceof TypeError
         ? "Нет связи с сервером. Проверьте, что backend запущен на порту 8000."
         : errorText(failure));
       return false;
@@ -224,30 +228,35 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   }
 
   async function openOrGeneratePresentation() {
-    if (material) {
+    if (material?.presentation_variant === presentationVariant) {
       await openPreview();
       return;
     }
     if (busy) return;
-    if (!run || !accepted) {
-      setError("Сначала запустите парсинг и примите проверенные факты.");
-      onShowFacts();
+    if (!run || (!accepted && !material)) {
+      setError(!run
+        ? "Сначала нажмите «Найти и обновить информацию», чтобы собрать сведения."
+        : "Чтобы сформировать презентацию, проверьте кандидатов и примите факты из первоисточников.");
+      if (run) onShowFacts();
       return;
     }
     setError("");
+    setPreviewAfterGenerationFrom(material?.material_id ?? null);
     setPreviewAfterGeneration(true);
     const result = await generate();
     if (!result.startsWith("Задание формирования презентации создано.")) {
       setPreviewAfterGeneration(false);
+      setPreviewAfterGenerationFrom(null);
       setError(result);
     }
   }
 
   useEffect(() => {
-    if (!previewAfterGeneration || !material) return;
+    if (!previewAfterGeneration || !material || material.material_id === previewAfterGenerationFrom) return;
     setPreviewAfterGeneration(false);
+    setPreviewAfterGenerationFrom(null);
     void openPreview();
-  }, [material, previewAfterGeneration]);
+  }, [material, previewAfterGeneration, previewAfterGenerationFrom]);
 
   const downloadUrl = material?.download_url;
   useImperativeHandle(ref, () => ({ generate, refresh }));
@@ -273,8 +282,8 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     </fieldset>
     <div className="research-action-stack">
       <button className="button button--primary" type="button" disabled={Boolean(busy) || !website.trim()} onClick={() => { void refresh(); }}>Найти и обновить информацию</button>
-      <button className="button button--soft" type="button" disabled={Boolean(busy) || (!material && (!run || !accepted))}
-        onClick={() => { void openOrGeneratePresentation(); }}>{material ? "Просмотреть и скачать презентацию" : "Сформировать и просмотреть презентацию"}</button>
+      <button className="button button--soft" type="button" disabled={Boolean(busy)}
+        onClick={() => { void openOrGeneratePresentation(); }}>{busy && job?.task_type === "material" ? "Формируем презентацию…" : material?.presentation_variant === presentationVariant ? "Просмотреть и скачать презентацию" : material ? "Сформировать выбранный формат" : "Сформировать и просмотреть презентацию"}</button>
     </div>
     {job && <div className="research-progress" role="status"><span>{job.message}</span><progress value={job.progress} max={100} /></div>}
     {error && <p className="research-error" role="alert">{error}</p>}
@@ -341,15 +350,19 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         <button className="button button--soft" type="button" disabled={Boolean(busy) || !selected.length} onClick={() => { void review("reject"); }}>Отклонить выбранные</button></div>
       </div>
     </>}
-    {previewOpen && presentationPreview && typeof document !== "undefined" && createPortal(<div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreviewOpen(false); }}>
+    {previewOpen && typeof document !== "undefined" && createPortal(<div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreviewOpen(false); }}>
       <section className="report-preview" role="dialog" aria-modal="true" aria-labelledby="report-preview-title">
         <header className="report-preview__header">
           <div><span className="eyebrow">ПРЕДПРОСМОТР PPTX</span><h2 id="report-preview-title">Презентация: {university.name}</h2></div>
           <button className="icon-button" type="button" onClick={() => setPreviewOpen(false)} aria-label="Закрыть предпросмотр"><Icon name="close" size={19} /></button>
         </header>
-        <div className="report-preview__content"><PptxPreview preview={presentationPreview} /></div>
+        <div className="report-preview__content">
+          {previewLoading && <div className="reports-empty" role="status"><Icon name="file" size={24} /><strong>Загружаем слайды</strong><span>Открываем предпросмотр презентации.</span></div>}
+          {previewError && <div className="reports-empty" role="alert"><Icon name="file" size={24} /><strong>Предпросмотр не загрузился</strong><span>{previewError}</span><button className="button button--soft" type="button" disabled={previewLoading} onClick={() => { void openPreview(); }}>Повторить</button></div>}
+          {!previewLoading && !previewError && presentationPreview && <PptxPreview preview={presentationPreview} />}
+        </div>
         <footer className="report-preview__actions">
-          <span>{presentationPreview.slides.length} слайдов · сохранённый файл PPTX</span>
+          <span>{presentationPreview ? `${presentationPreview.slides.length} слайдов · сохранённый файл PPTX` : "Сохранённый файл PPTX"}</span>
           <button className="button button--primary" type="button" disabled={downloadingPresentation} onClick={() => { void downloadPresentation(); }}><Icon name="download" size={16} />{downloadingPresentation ? "Скачиваем…" : "Скачать PPTX"}</button>
         </footer>
       </section>
