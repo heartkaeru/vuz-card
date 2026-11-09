@@ -49,7 +49,6 @@ export const studyAreas = [
 export const savedReports = [
   { id: "report-pptx", format: "PPTX", name: "Карточка образовательной организации", date: "20.10.2026" },
   { id: "report-docx", format: "DOCX", name: "Аналитическая справка к встрече", date: "18.10.2026" },
-  { id: "report-xlsx", format: "XLSX", name: "Сводка контактов и проектов", date: "15.10.2026" },
 ] as const;
 
 export function createUniversity(name: string, city: string): University {

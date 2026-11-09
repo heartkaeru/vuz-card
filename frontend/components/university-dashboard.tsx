@@ -2,7 +2,8 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ResearchPanel, type ResearchHandle } from "@/components/research-panel";
-import { api, post, errorText, type ApiCard, type Fact, type ResearchRun, type SavedMaterial } from "@/lib/api";
+import { PptxPreview } from "@/components/pptx-preview";
+import { api, post, errorText, downloadFile, type ApiCard, type Fact, type PptxPreviewData, type ResearchRun, type SavedMaterial } from "@/lib/api";
 import { AgentChat } from "@/components/agent-chat";
 import { AgentSphere } from "@/components/agent-sphere";
 import { Icon, type IconName } from "@/components/icon";
@@ -55,6 +56,10 @@ export default function UniversityDashboard() {
   const [reportsError, setReportsError] = useState("");
   const [reportFilter, setReportFilter] = useState("Все форматы");
   const [reportFilterOpen, setReportFilterOpen] = useState(false);
+  const [previewReport, setPreviewReport] = useState<SavedMaterial | null>(null);
+  const [presentationPreview, setPresentationPreview] = useState<PptxPreviewData | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState("");
   const [toast, setToast] = useState("");
 
   const selectedUniversity = universities.find((university) => university.id === selectedId);
@@ -66,6 +71,7 @@ export default function UniversityDashboard() {
     return matchesQuery && matchesRegion;
   });
   const filteredReports = reports.filter((report) => {
+    if (/^xls(?:x|m|b)?$/i.test(report.format.trim())) return false;
     const matchesQuery = `${report.name} ${report.format}`.toLocaleLowerCase("ru-RU").includes(reportSearch.toLocaleLowerCase("ru-RU").trim());
     return matchesQuery && (reportFilter === "Все форматы" || report.format === reportFilter);
   });
@@ -116,6 +122,32 @@ export default function UniversityDashboard() {
   const notify = (message: string) => {
     setToast(message);
     window.setTimeout(() => setToast(""), 3200);
+  };
+
+  const openPresentationPreview = async (report: SavedMaterial) => {
+    setPreviewReport(report);
+    setPresentationPreview(null);
+    setPreviewError("");
+    setPreviewLoading(true);
+    try {
+      const response = await fetch(report.preview_url, { cache: "no-store" });
+      if (!response.ok) throw new Error("preview_unavailable");
+      const preview = await response.json() as PptxPreviewData;
+      if (!preview.slides.length) throw new Error("preview_unavailable");
+      setPresentationPreview(preview);
+    } catch {
+      setPreviewError("Не удалось загрузить слайды презентации. Возможно, материал устарел.");
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const downloadPresentation = async (report: SavedMaterial) => {
+    try {
+      await downloadFile(report.download_url, `${report.name}.pptx`);
+    } catch (failure) {
+      notify(errorText(failure));
+    }
   };
 
   const navigate = (nextView: View) => {
@@ -283,11 +315,7 @@ export default function UniversityDashboard() {
                 <input value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} placeholder="Поиск по вузам" aria-label="Поиск по вузам" />
               </form>
             </div>
-            <ProfileHero
-              university={selectedUniversity}
-              onPreview={() => researchRef.current?.openReportOptions()}
-              onDownload={() => { void researchRef.current?.generate(); }}
-            />
+            <ProfileHero university={selectedUniversity} />
             <ResearchPanel key={selectedUniversity.id} ref={researchRef} university={selectedUniversity}
               showFacts={section === "contacts"} onShowFacts={() => setSection("contacts")}
               onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
@@ -312,10 +340,6 @@ export default function UniversityDashboard() {
               ))}
               <span className="profile-tabs__indicator" aria-hidden="true" style={{ left: tabIndicator.left, width: tabIndicator.width }} />
             </div>
-            <ResearchPanel key={selectedUniversity.id} ref={researchRef} university={selectedUniversity}
-              showFacts={section === "contacts"} onShowFacts={() => setSection("contacts")}
-              onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
-                ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
             <div className="profile-content page-enter" key={`${selectedUniversity.id}-${section}`}>
               {section === "about" && <AboutSection university={selectedUniversity} run={selectedRun} onAdd={() => setChatOpen(true)} />}
               {section === "contacts" && <ContactsSection university={selectedUniversity} run={selectedRun} />}
@@ -383,8 +407,8 @@ export default function UniversityDashboard() {
                       <div className={`report-format report-format--${report.format.toLowerCase()}`}>{report.format}</div>
                       <div className="report-row__name"><strong>{report.name}</strong><span>{report.stale ? "Факты изменились — сформируйте новую версию" : "Черновик по принятым фактам"}</span></div>
                       <time className="report-row__date">{new Date(report.created_at).toLocaleDateString("ru-RU")}</time>
-                      {report.stale ? <span className="demo-label">Архивная версия</span> : <a className="button button--small-primary" href={report.brief_url} target="_blank" rel="noreferrer">Справка</a>}
-                      {report.stale ? <span /> : <a className="icon-button icon-button--small" href={report.download_url} aria-label="Скачать PPTX"><Icon name="download" size={17} /></a>}
+                      {report.stale ? <span className="demo-label">Архивная версия</span> : <button className="button button--small-primary report-preview-button" type="button" onClick={() => { void openPresentationPreview(report); }} aria-label={`Предпросмотр презентации: ${report.name}`}><Icon name="search" size={15} /><span>Предпросмотр</span></button>}
+                      {report.stale ? <span /> : <button className="icon-button icon-button--small report-download-button" type="button" onClick={() => { void downloadPresentation(report); }} aria-label="Скачать PPTX"><Icon name="download" size={17} /></button>}
                       <span />
                     </article>
                   ))}
@@ -398,6 +422,23 @@ export default function UniversityDashboard() {
           </section>
         )}
       </main>
+
+      {previewReport && (
+        <div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreviewReport(null); }}>
+          <section className="report-preview" role="dialog" aria-modal="true" aria-labelledby="saved-presentation-preview-title">
+            <header className="report-preview__header">
+              <div><span className="eyebrow">ПРЕДПРОСМОТР ПРЕЗЕНТАЦИИ</span><h2 id="saved-presentation-preview-title">{previewReport.name}</h2></div>
+              <button className="icon-button" type="button" onClick={() => setPreviewReport(null)} aria-label="Закрыть предпросмотр"><Icon name="close" size={19} /></button>
+            </header>
+            <div className="report-preview__content">
+              {previewLoading && <div className="reports-empty"><Icon name="file" size={24} /><strong>Загружаем презентацию</strong><span>Подготавливаем предварительный просмотр слайдов.</span></div>}
+              {previewError && <div className="reports-empty" role="alert"><Icon name="file" size={24} /><strong>Предпросмотр недоступен</strong><span>{previewError}</span></div>}
+              {!previewLoading && !previewError && presentationPreview && <PptxPreview preview={presentationPreview} />}
+            </div>
+            {!previewError && <footer className="report-preview__actions"><span>{previewLoading ? "Загрузка слайдов…" : presentationPreview ? `${presentationPreview.slides.length} слайдов · предпросмотр файла PPTX` : ""}</span></footer>}
+          </section>
+        </div>
+      )}
 
       <AgentSphere onClick={() => setChatOpen(true)} hidden={chatOpen} />
       <AgentChat open={chatOpen} universityName={selectedUniversity?.name ?? "вузом"} onClose={onChatClose}
@@ -423,7 +464,7 @@ export default function UniversityDashboard() {
   );
 }
 
-function ProfileHero({ university, onPreview, onDownload }: { university: University; onPreview: () => void; onDownload: () => void }) {
+function ProfileHero({ university }: { university: University }) {
   return (
     <section className="profile-hero">
       <div className="profile-hero__decor profile-hero__decor--one" />
@@ -431,11 +472,7 @@ function ProfileHero({ university, onPreview, onDownload }: { university: Univer
       <div className="profile-hero__copy">
         <span className="profile-hero__overline">КАРТОЧКА ОБРАЗОВАТЕЛЬНОЙ ОРГАНИЗАЦИИ</span>
         <h1>{university.name}</h1>
-        <p className="profile-hero__meta"><Icon name="pin" size={15} /> {university.city}<span className="meta-separator">·</span>Проверка сведений по первоисточникам</p>
-        <div className="profile-hero__actions">
-          <button className="button button--primary profile-hero__download" type="button" onClick={onDownload}><Icon name="download" size={16} /> Сформировать материалы</button>
-          <button className="button button--soft profile-hero__download" type="button" onClick={onPreview}><Icon name="search" size={16} /> Просмотреть и выбрать формат</button>
-        </div>
+        <p className="profile-hero__meta"><Icon name="pin" size={15} /> {university.city}</p>
       </div>
       <div className="profile-hero__metrics">
         <div className="hero-metric hero-metric--green"><span className="hero-metric__icon"><Icon name="spark" size={15} /></span><span>Точки соприкосновений</span><strong>—</strong></div>

@@ -25,8 +25,16 @@ export type ChangeSet = { run_id: string; revision: number; previous_run_id: str
   counts: Record<FactChange["kind"], number>; approved_facts: Fact[]; warning: string };
 export type ResearchHistory = { run_id: string; revision: number; created_at: string; status: string; approved_count: number; candidate_count: number };
 export type PresentationVariant = "compact" | "detailed";
+export type PptxPreviewParagraph = { text: string; font_family: string; font_size_pt: number; color: string | null; bold: boolean; alignment: string };
+export type PptxPreviewShape =
+  | { type: "image"; image_key: string; x: number; y: number; width: number; height: number }
+  | { type: "text"; vertical_anchor: string; paragraphs: PptxPreviewParagraph[]; x: number; y: number; width: number; height: number };
+export type PptxPreviewData = {
+  width_inches: number; height_inches: number; images: Record<string, string>;
+  slides: { shapes: PptxPreviewShape[] }[];
+};
 export type Material = { material_id: string; download_url: string; brief_url: string; presentation_variant?: PresentationVariant };
-export type SavedMaterial = { id: string; name: string; format: "PPTX"; created_at: string; stale: boolean; download_url: string; brief_url: string };
+export type SavedMaterial = { id: string; name: string; format: string; created_at: string; stale: boolean; download_url: string; preview_url: string; brief_url: string };
 export type Job = {
   job_id: string; status: string; task_type: string; progress: number; message: string;
   identity?: { expected_revision?: number; leadership_url?: string | null; biography_url?: string | null;
@@ -39,6 +47,9 @@ export type CardDetail = ApiCard & { run: ResearchRun | null; job: Job | null };
 const errors: Record<string, string> = {
   gigachat_configuration_required: "На сервере не настроен доступ к GigaChat. Проверьте backend/.env и перезапустите сервер.",
   no_accepted_facts: "Сначала проверьте и примите факты по источникам.",
+  material_stale_after_review: "Факты изменились. Сформируйте новую версию презентации.",
+  material_file_not_found: "Файл презентации не найден. Сформируйте материалы заново.",
+  presentation_preview_unavailable: "Предпросмотр презентации недоступен.",
   stale_run_revision: "Данные уже изменились. Обновите карточку и повторите действие.",
   card_job_already_running: "Для этой карточки уже выполняется задание.",
   facts_changed_during_generation: "Во время генерации факты изменились. Сформируйте материалы заново.",
@@ -76,8 +87,25 @@ const errors: Record<string, string> = {
 };
 
 export function errorText(error: unknown) {
+  if (error instanceof TypeError && /fetch|network/i.test(error.message)) return "Не удалось подключиться к серверу. Убедитесь, что backend запущен.";
   return error instanceof Error ? errors[error.message] ?? (/^[a-z0-9_:.-]+$/.test(error.message)
     ? "Задание остановлено. Проверьте источники и повторите действие." : error.message) : "Не удалось выполнить действие.";
+}
+
+export async function downloadFile(path: string, filename: string) {
+  const response = await fetch(path, { cache: "no-store" });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(typeof body.detail === "string" ? body.detail : "Не удалось скачать файл.");
+  }
+  const blobUrl = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = blobUrl;
+  link.download = filename.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_");
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
 }
 
 export async function api<T>(path: string, options?: RequestInit): Promise<T> {

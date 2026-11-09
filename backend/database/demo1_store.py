@@ -153,5 +153,6 @@ class DemoRepository(LLMRepository):
             result.append({"id": row["material_id"], "name": f"{label}: {row['name']}", "presentation_variant": variant,
                 "format": "PPTX", "created_at": row["created_at"], "stale": stale,
                 "download_url": f"/api/v1/ai/materials/{row['material_id']}/download",
+                "preview_url": f"/api/v1/ai/materials/{row['material_id']}/preview",
                 "brief_url": f"/api/v1/ai/materials/{row['material_id']}/brief"})
         return result
