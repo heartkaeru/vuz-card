@@ -24,14 +24,14 @@ UNIVERSITIES = [
 def seed():
     db_path = Path(__file__).resolve().parent / "output/mvp/registry.sqlite3"
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     repo = DemoRepository(db_path)
     print(f"Инициализация базы данных: {db_path}")
-    
+
     for name, city, website in UNIVERSITIES:
         card = repo.create_card(name, city, website)
         print(f" [OK] Добавлена карточка: {name} ({city}) -> id: {card['id']}")
-    
+
     total = len(repo.cards())
     print(f"\nВсего карточек в базе данных: {total}")
 

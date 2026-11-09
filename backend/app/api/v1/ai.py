@@ -299,15 +299,29 @@ def materials(run_id: str, payload: MaterialRequest, background: BackgroundTasks
 
 
 @router.get("/materials/{material_id}/download")
-def download(material_id: str, repository=Depends(get_repository)):
+def download(material_id: str, format: Literal["pptx", "docx"] = "pptx",
+             repository=Depends(get_repository)):
     draft, stale = checked(lambda: repository.material(material_id))
     if stale:
         raise HTTPException(409, "material_stale_after_review")
-    path = repository.path.parent / "presentations" / f"{material_id}.pptx"
+    directory = repository.path.parent / "presentations"
+    path = directory / f"{material_id}.{format}"
+    if format == "docx" and not path.is_file():
+        from app.services.llm.docx_export import build_word_document
+        directory.mkdir(parents=True, exist_ok=True)
+        build_word_document(draft, path)
+        _, stale = checked(lambda: repository.material(material_id))
+        if stale:
+            raise HTTPException(409, "material_stale_after_review")
     if not path.is_file():
-        raise HTTPException(404, "presentation_file_not_found")
-    return FileResponse(path, filename="Краткая карточка.pptx" if draft.presentation_variant == "compact" else "Подробная справка.pptx",
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        raise HTTPException(404, "material_file_not_found")
+    media_types = {
+        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+    filename = ("Материалы к встрече.docx" if format == "docx" else
+                "Краткая карточка.pptx" if draft.presentation_variant == "compact" else "Подробная справка.pptx")
+    return FileResponse(path, filename=filename, media_type=media_types[format])
 
 
 @router.get("/materials")

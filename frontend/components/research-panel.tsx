@@ -1,12 +1,17 @@
 "use client";
 
 import { forwardRef, useEffect, useImperativeHandle, useState } from "react";
+import { createPortal } from "react-dom";
 import { api, post, errorText, type ApiCard, type CardDetail, type ResearchRun, type Job, type Material, type ChangeSet, type ResearchHistory } from "@/lib/api";
+import { Icon } from "@/components/icon";
 import { type University } from "@/data/universities";
 import { ApprovedCard, ResearchChanges } from "@/components/research-changes";
 
-export type ResearchHandle = { generate: () => Promise<string>; refresh: () => Promise<string> };
-type Props = { university: University; showFacts: boolean; onShowFacts: () => void; onConnected: (card: ApiCard) => void };
+export type ResearchHandle = { generate: () => Promise<string>; refresh: () => Promise<string>; openReportOptions: () => void };
+type Props = {
+  university: University; showFacts: boolean; onShowFacts: () => void;
+  onConnected: (card: ApiCard) => void; onRunChange: (run: ResearchRun | null) => void;
+};
 const fields: Record<string, string> = {
   "person.name": "ФИО", "appointment.position": "Должность", "appointment.status": "Статус назначения",
   "appointment.department": "Подразделение", "appointment.responsibilities": "Зона ответственности",
@@ -58,7 +63,7 @@ function parsePdfPages(value: string): number[] | null {
   return [...pages].sort((a, b) => a - b);
 }
 
-export const ResearchPanel = forwardRef<ResearchHandle, Props>(function ResearchPanel({ university, showFacts, onShowFacts, onConnected }, ref) {
+export const ResearchPanel = forwardRef<ResearchHandle, Props>(function ResearchPanel({ university, showFacts, onShowFacts, onConnected, onRunChange }, ref) {
   const [website, setWebsite] = useState(university.website ?? "");
   const [leadershipUrl, setLeadershipUrl] = useState("");
   const [biographyUrl, setBiographyUrl] = useState("");
@@ -76,6 +81,12 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [material, setMaterial] = useState<Material | null>(null);
+  const [downloadFormat, setDownloadFormat] = useState<"pptx" | "docx">("pptx");
+  const [preview, setPreview] = useState("");
+  const [formatPickerOpen, setFormatPickerOpen] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewAfterGeneration, setPreviewAfterGeneration] = useState(false);
   const [showRejected, setShowRejected] = useState(false);
   const [meetingGoal, setMeetingGoal] = useState("");
   const [meetingDate, setMeetingDate] = useState("");
@@ -97,7 +108,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const gaps = run ? [...new Set(Object.values(run.results).flatMap((result) => result.gaps))] : [];
 
   function load(detail: CardDetail) {
-    setCard(detail); setWebsite(detail.website); setRun(detail.run); setJob(detail.job);
+    setCard(detail); setWebsite(detail.website); setRun(detail.run); onRunChange(detail.run); setJob(detail.job);
     if (detail.job?.identity?.presentation_variant) setPresentationVariant(detail.job.identity.presentation_variant);
     if (detail.job?.identity?.leadership_url) setLeadershipUrl(detail.job.identity.leadership_url);
     if (detail.job?.identity?.biography_url) setBiographyUrl(detail.job.identity.biography_url);
@@ -142,9 +153,15 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         if (!active) return;
         setJob(next);
         if (next.status === "completed" || next.status === "failed") {
-          if (next.result?.run_id) setRun(await api<ResearchRun>(`/runs/${next.result.run_id}`));
+          if (next.result?.run_id) {
+            const updatedRun = await api<ResearchRun>(`/runs/${next.result.run_id}`);
+            setRun(updatedRun); onRunChange(updatedRun);
+          }
           if (next.result?.material_id) setMaterial(next.result as Material);
-          if (next.status === "failed") setError(next.message + (next.result?.code ? ` (${errorText(new Error(next.result.code))})` : ""));
+          if (next.status === "failed") {
+            setPreviewAfterGeneration(false);
+            setError(next.message + (next.result?.code ? ` (${errorText(new Error(next.result.code))})` : ""));
+          }
         }
       } catch (failure) { if (active) setError(errorText(failure)); }
     }, 1400);
@@ -168,7 +185,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         include_institution: includeInstitution,
         pdf_sources: pdfUrl.trim() ? [{url: pdfUrl.trim(), pages}] : [],
       });
-      setJob(next); onShowFacts();
+      setRun(null); onRunChange(null); setJob(next); onShowFacts();
       return "Задание сбора создано. Состояние и результаты появятся в карточке руководства.";
     } catch (failure) { const message = errorText(failure); setError(message); return message; }
     finally { setSaving(false); }
@@ -188,7 +205,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         decisions: selected.map((fact_id) => ({ fact_id, decision, source_checked: sourceChecked, reason })),
         retirements: decision === "accept" ? retirementIds.map((fact_id) => ({fact_id, source_checked: sourceChecked, reason})) : [],
       });
-      setRun(updated); setMaterial(null);
+      setRun(updated); onRunChange(updated); setMaterial(null);
     } catch (failure) { setError(errorText(failure)); }
     finally { setSaving(false); }
   }
@@ -207,7 +224,63 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     } catch (failure) { const message = errorText(failure); setError(message); return message; }
     finally { setSaving(false); }
   }
-  useImperativeHandle(ref, () => ({ generate, refresh }));
+
+  async function openPreview() {
+    if (!material) return false;
+    setPreviewLoading(true); setError("");
+    try {
+      const response = await fetch(material.brief_url, { cache: "no-store" });
+      if (!response.ok) throw new Error("preview_unavailable");
+      setPreview(await response.text());
+      setPreviewOpen(true);
+      return true;
+    } catch (failure) {
+      setError(failure instanceof Error && failure.message !== "preview_unavailable"
+        ? "Не удалось загрузить предварительный просмотр отчёта." : "Предварительный просмотр отчёта недоступен.");
+      return false;
+    } finally { setPreviewLoading(false); }
+  }
+
+  async function continueToPreview() {
+    if (material) {
+      if (await openPreview()) setFormatPickerOpen(false);
+      return;
+    }
+    if (busy && job?.task_type === "material") {
+      setPreviewAfterGeneration(true);
+      return;
+    }
+    if (!run || !accepted) {
+      setError("Сначала соберите и примите проверенные факты о руководстве.");
+      return;
+    }
+    if (busy) {
+      setError("Дождитесь завершения текущего задания, затем откройте предпросмотр.");
+      return;
+    }
+    setError("");
+    setPreviewAfterGeneration(true);
+    const result = await generate();
+    if (!result.startsWith("Задание формирования презентации создано.")) {
+      setPreviewAfterGeneration(false);
+      setError(result);
+      return;
+    }
+  }
+
+  function closeFormatPicker() {
+    setFormatPickerOpen(false);
+    setPreviewAfterGeneration(false);
+  }
+
+  useEffect(() => {
+    if (!previewAfterGeneration || !material) return;
+    setPreviewAfterGeneration(false);
+    void openPreview().then((opened) => { if (opened) setFormatPickerOpen(false); });
+  }, [material, previewAfterGeneration]);
+
+  const downloadUrl = material && `${material.download_url}?format=${downloadFormat}`;
+  useImperativeHandle(ref, () => ({ generate, refresh, openReportOptions: () => { setError(""); setFormatPickerOpen(true); } }));
 
   return <section className="content-card research-panel" aria-label="Актуализация и проверка фактов">
     <div className="content-card__heading"><div><h2>Руководство и сведения об учреждении</h2><span>Официальные источники → проверка → презентация</span></div></div>
@@ -254,8 +327,13 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       <small>Параметры используются при следующем формировании и сохраняются с материалом. Цель встречи не считается фактом о вузе.</small>
     </fieldset>
     {job && <div className="research-progress" role="status"><span>{job.message}</span><progress value={job.progress} max={100} /></div>}
-    {error && <p className="research-error" role="alert">{error}</p>}
-    {material && <div className="research-downloads"><a className="button button--primary" href={material.download_url}>Скачать PPTX</a><a className="button button--soft" href={material.brief_url} target="_blank" rel="noreferrer">Открыть справку</a><span>{material.presentation_variant === "compact" ? "Краткая карточка · 3 слайда" : "Подробная справка"} · черновик для проверки перед встречей</span></div>}
+    {error && !formatPickerOpen && <p className="research-error" role="alert">{error}</p>}
+    {material && <div className="research-downloads">
+      <button className="button button--soft" type="button" onClick={() => setFormatPickerOpen(true)}>Просмотреть и выбрать формат</button>
+      <a className="button button--primary" href={material.download_url}>Скачать PPTX</a>
+      <a className="button button--soft" href={material.brief_url} target="_blank" rel="noreferrer">Открыть справку</a>
+      <span>{material.presentation_variant === "compact" ? "Краткая карточка · 3 слайда" : "Подробная справка"} · черновик для проверки перед встречей</span>
+    </div>}
     {run && <p className="research-summary">В последнем сборе: {run.facts.length} кандидатов · на проверке: {pending} · в подтверждённой карточке: {accepted} · отклонено: {rejected} · {run.status === "partial" ? "сбор частичный" : run.status === "failed" ? "сбор не выполнен; прежние принятые сведения сохранены" : "результат сохранён"}.
       {!showFacts && <button className="text-button" type="button" onClick={onShowFacts}>Проверить факты</button>}</p>}
     {run && Object.values(run.results).some((result) => result.run?.provider === "fixture") &&
@@ -319,5 +397,55 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         <button className="button button--soft" type="button" disabled={Boolean(busy) || !selected.length} onClick={() => { void review("reject"); }}>Отклонить выбранные</button></div>
       </div>
     </>}
+    {formatPickerOpen && typeof document !== "undefined" && createPortal(<div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeFormatPicker(); }}>
+      <section className="report-format-dialog" role="dialog" aria-modal="true" aria-labelledby="report-format-title">
+        <header className="report-preview__header">
+          <div><span className="eyebrow">ОТЧЁТ К ВСТРЕЧЕ</span><h2 id="report-format-title">Выберите формат файла</h2></div>
+          <button className="icon-button" type="button" onClick={closeFormatPicker} aria-label="Закрыть выбор формата"><Icon name="close" size={19} /></button>
+        </header>
+        <div className="report-format-options">
+          <label className={`report-format-option${downloadFormat === "pptx" ? " report-format-option--selected" : ""}`}>
+            <input type="radio" name="report-format" value="pptx" checked={downloadFormat === "pptx"} onChange={() => setDownloadFormat("pptx")} />
+            <span><strong>PowerPoint</strong><small>Презентация (.pptx)</small></span>
+          </label>
+          <label className={`report-format-option${downloadFormat === "docx" ? " report-format-option--selected" : ""}`}>
+            <input type="radio" name="report-format" value="docx" checked={downloadFormat === "docx"} onChange={() => setDownloadFormat("docx")} />
+            <span><strong>Word</strong><small>Документ (.docx)</small></span>
+          </label>
+        </div>
+        {!material && run && accepted > 0 && <p className="report-format-hint">Отчёт ещё не сформирован. После выбора формата он подготовится и откроется для просмотра.</p>}
+        {busy && job?.task_type === "material" && <p className="report-format-hint" role="status">{job.message} · {job.progress}%</p>}
+        {error && <p className="research-error" role="alert">{error}</p>}
+        <div className="report-format-actions">
+          <button className="button button--soft" type="button" onClick={closeFormatPicker}>Отмена</button>
+          <button className="button button--primary" type="button" disabled={previewLoading || previewAfterGeneration || (!material && (!run || !accepted)) || (busy && job?.task_type !== "material")} onClick={() => { void continueToPreview(); }}>
+            {previewLoading ? "Открываем…" : previewAfterGeneration || (busy && job?.task_type === "material") ? "Ждём завершения…" : material ? "Открыть предпросмотр" : !run || !accepted ? "Нет проверенных данных" : "Сформировать и просмотреть"}
+          </button>
+        </div>
+      </section>
+    </div>, document.body)}
+    {previewOpen && typeof document !== "undefined" && createPortal(<div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreviewOpen(false); }}>
+      <section className="report-preview" role="dialog" aria-modal="true" aria-labelledby="report-preview-title">
+        <header className="report-preview__header">
+          <div><span className="eyebrow">ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР</span><h2 id="report-preview-title">Отчёт к встрече: {university.name}</h2></div>
+          <button className="icon-button" type="button" onClick={() => setPreviewOpen(false)} aria-label="Закрыть предпросмотр"><Icon name="close" size={19} /></button>
+        </header>
+        <div className="report-preview__content">
+          {preview.split("\n").map((line, index) => {
+            if (line.startsWith("# ")) return <h3 key={index}>{line.slice(2)}</h3>;
+            if (line.startsWith("## ")) return <h4 key={index}>{line.slice(3)}</h4>;
+            if (line.startsWith("### ")) return <h5 key={index}>{line.slice(4)}</h5>;
+            if (line.startsWith("- ")) return <p className="report-preview__bullet" key={index}>{line.slice(2)}</p>;
+            if (!line.trim()) return <div className="report-preview__space" key={index} />;
+            return <p key={index}>{line.replaceAll("**", "")}</p>;
+          })}
+        </div>
+        <footer className="report-preview__actions">
+          <span>Предварительный просмотр отчёта · {downloadFormat.toUpperCase()}</span>
+          <a className="button button--primary" href={downloadUrl ?? undefined}><Icon name="download" size={16} /> Скачать {downloadFormat.toUpperCase()}</a>
+        </footer>
+      </section>
+    </div>, document.body)}
   </section>;
 });
+
