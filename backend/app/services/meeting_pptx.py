@@ -14,10 +14,12 @@ from .llm.models import DraftResult
 TEMPLATE = Path(__file__).resolve().parents[2] / "templates/meeting.json"
 
 
-def build_meeting_presentation(draft: DraftResult, output_path: Path, facts=None):
+def build_meeting_presentation(draft: DraftResult, output_path: Path, facts=None, *,
+                              rector_photo_url=None, partnership_matches=()):
     if facts:
         from .meeting_card_pptx import build_card_presentation
-        return build_card_presentation(draft, output_path, facts)
+        return build_card_presentation(draft, output_path, facts, rector_photo_url=rector_photo_url,
+                                       partnership_matches=partnership_matches)
     draft = DraftResult.model_validate_json(draft.model_dump_json())
     template = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     presentation = Presentation()

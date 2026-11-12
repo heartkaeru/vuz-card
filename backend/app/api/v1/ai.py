@@ -122,12 +122,38 @@ class ReviewRequest(ReviewBatch):
     reviewer: str = Field(min_length=1, max_length=160)
 
 
+class PartnershipMatch(StrictModel):
+    """One catalog matcher result grounded in accepted institution facts."""
+    product_name: str = Field(min_length=1, max_length=100)
+    proposal: str = Field(min_length=1, max_length=220)
+    rationale: str = Field(min_length=1, max_length=220)
+    discussion_question: str = Field(min_length=1, max_length=180)
+    catalog_url: HttpUrl
+    basis_fact_ids: list[str] = Field(min_length=1, max_length=10)
+
+    @field_validator("catalog_url")
+    @classmethod
+    def catalog_must_use_https(cls, value):
+        if value.scheme != "https":
+            raise ValueError("Catalog URLs must use HTTPS")
+        return value
+
+
 class MaterialRequest(StrictModel):
     presentation_variant: Literal["compact", "detailed"] = "detailed"
     expected_revision: int = Field(ge=1)
     request_key: str = Field(min_length=1, max_length=150)
     meeting: MeetingContext = Field(default_factory=MeetingContext)
     fact_ids: list[str] | None = None
+    rector_photo_url: HttpUrl | None = None
+    partnership_matches: list[PartnershipMatch] = Field(default_factory=list, max_length=12)
+
+    @field_validator("rector_photo_url")
+    @classmethod
+    def photo_must_use_https(cls, value):
+        if value is not None and value.scheme != "https":
+            raise ValueError("Portrait URLs must use HTTPS")
+        return value
 
 
 def checked(operation):
@@ -174,7 +200,9 @@ async def material_job(repository, pipeline, run_id, payload, job_id):
             presentation_variant=payload.presentation_variant)
         repository.update_job(job_id, progress=80, message="Сборка карточки PowerPoint по шаблону")
         path = repository.path.parent / "presentations" / f"{material_id}.pptx"
-        await asyncio.to_thread(build_meeting_presentation, draft, path, repository.material_facts(material_id))
+        await asyncio.to_thread(build_meeting_presentation, draft, path, repository.material_facts(material_id),
+                                rector_photo_url=str(payload.rector_photo_url) if payload.rector_photo_url else None,
+                                partnership_matches=[item.model_dump(mode="json") for item in payload.partnership_matches])
         # A review or refresh during file assembly invalidates this export too.
         _, stale = repository.material(material_id)
         if stale:
@@ -289,8 +317,15 @@ def review(run_id: str, payload: ReviewRequest, repository=Depends(get_repositor
 def materials(run_id: str, payload: MaterialRequest, background: BackgroundTasks,
               repository=Depends(get_repository), pipeline=Depends(get_pipeline)):
     run = checked(lambda: repository.check_current(run_id, payload.expected_revision))
-    if not effective_facts(run):
+    accepted_facts = effective_facts(run)
+    if not accepted_facts:
         raise HTTPException(409, "no_accepted_facts")
+    accepted_ids = {fact.fact_id for fact in accepted_facts}
+    if payload.fact_ids is not None:
+        accepted_ids &= set(payload.fact_ids)
+    for match in payload.partnership_matches:
+        if not set(match.basis_fact_ids) <= accepted_ids:
+            raise HTTPException(422, "partnership_match_requires_selected_accepted_facts")
     job, created = checked(lambda: repository.new_job(run.institution.id, payload.request_key, "material",
                                                      {"run_id": run_id, **payload.model_dump(mode="json")}))
     if created:

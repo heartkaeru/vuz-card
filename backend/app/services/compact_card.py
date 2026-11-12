@@ -6,11 +6,12 @@ import textwrap
 from .llm.context_render import LABELS as CONTEXT_LABELS, context_value
 
 
-def render_compact(draft, facts, head, *, page, put, notes, citations, sources, labels):
+def render_compact(draft, facts, head, *, page, put, notes, citations, sources, labels,
+                   portrait=None, partnership_matches=(), add_portrait=None):
     def lines(value, width=49):
         return [line for part in value.splitlines() for line in textwrap.wrap(part, width=width, break_long_words=True)]
 
-    def column(slide, entries, x, *, y=2.35, budget=18):
+    def column(slide, entries, x, *, y=2.35, budget=18, width=5.7):
         omitted = []
         for text, ids, limit in entries:
             wrapped = lines(text + (" " + citations(ids) if ids else ""))
@@ -18,7 +19,7 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
             if len(wrapped) > min(limit, budget) or y + height > 5.98:
                 omitted.extend(ids)
                 continue
-            put(slide, "\n".join(wrapped), x, y, 5.7, height, 17)
+            put(slide, "\n".join(wrapped), x, y, width, height, 17)
             y += height + .08
             budget -= len(wrapped) + 1
         return omitted
@@ -43,6 +44,8 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
 
     slide = page("Руководитель учреждения")
     if head:
+        if portrait and add_portrait:
+            add_portrait(slide, portrait)
         (name, _), items = head
         put(slide, name, .7, 1.58, 11.9, .6, 25, bold=True)
         primary = []
@@ -73,7 +76,10 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
                          if f.field.value in {"appointment.responsibilities", "person.interests"})
         if not secondary:
             secondary = [("Карьерная история и зоны ответственности не подтверждены в выбранных материалах.", [], 4)]
-        omitted = column(slide, primary, .7) + column(slide, secondary, 6.9)
+        if portrait:
+            omitted = column(slide, primary, .7, width=4.05) + column(slide, secondary, 4.95, width=4.05)
+        else:
+            omitted = column(slide, primary, .7) + column(slide, secondary, 6.9)
         footer(slide, [f.fact_id for f in items], omitted=len(omitted) + max(0, len(careers) - 2))
     else:
         put(slide, "Руководитель головного учреждения не подтверждён в выбранных материалах", .7, 1.8, 11.9, 1.1, 23)
@@ -123,3 +129,20 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
     omitted = column(slide, entries, .7) + column(slide, questions, 6.9)
     # Include all facts (also other staff) so compact selection loses no provenance.
     footer(slide, [f.fact_id for f in facts], omitted=len(omitted))
+
+    if partnership_matches:
+        for index, match in enumerate(partnership_matches):
+            slide = page("Предложения и партнерство со Сбером" + (f" · {index + 1}" if index else ""))
+            put(slide, match["product_name"], .7, 1.55, 11.9, .62, 21, bold=True)
+            put(slide, "Предложение: " + match["proposal"], .7, 2.35, 11.9, 1.05, 17)
+            put(slide, "Основание: " + match["rationale"], .7, 3.65, 11.9, 1.05, 17)
+            put(slide, "Вопрос для встречи: " + match["discussion_question"], .7, 4.95, 11.9, .85, 17)
+            link = put(slide, "Источник в каталоге Сбера", .7, 6.05, 11.9, .3, 12, muted=True)
+            link.paragraphs[0].runs[0].hyperlink.address = match["catalog_url"]
+            footer(slide, match["basis_fact_ids"])
+            slide.notes_slide.notes_text_frame.text += f"\n\nЗапись каталога: {match['catalog_url']}"
+    else:
+        slide = page("Предложения и партнерство со Сбером")
+        put(slide, "Данные матчинга с каталогом продуктов Сбера не переданы. "
+            "Предложения появятся после подключения каталога и сопоставления с принятыми фактами.",
+            .7, 1.75, 11.9, 1.6, 17)

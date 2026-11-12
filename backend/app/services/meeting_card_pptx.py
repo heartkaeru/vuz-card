@@ -4,6 +4,7 @@ import json
 import re
 import textwrap
 from collections import OrderedDict
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -13,6 +14,7 @@ from pptx.util import Inches, Pt
 
 from .llm.models import DraftResult, Fact
 from .llm.context_render import LABELS as CONTEXT_LABELS, context_value
+from .presentation_assets import download_official_portrait
 
 ROOT = Path(__file__).resolve().parents[2] / "templates"
 LABELS = {
@@ -27,7 +29,8 @@ BIO = {"appointment.responsibilities", "person.education", "person.degree", "per
        "person.academic_title", "person.interests"}
 
 
-def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, candidate_preview=False):
+def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, candidate_preview=False,
+                            rector_photo_url=None, partnership_matches=()):
     draft = DraftResult.model_validate_json(draft.model_dump_json())
     facts = [Fact.model_validate_json(f.model_dump_json()) for f in facts]
     if (len({f.fact_id for f in facts}) != len(facts) or set(draft.sources) != {f.fact_id for f in facts}
@@ -102,28 +105,33 @@ def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, can
                     parts.append(f"Страница PDF: {evidence.page_number}; SHA256 файла: {evidence.file_sha256}")
         slide.notes_slide.notes_text_frame.text += "\n\n" + "\n\n".join(parts)
 
-    def pages(title, entries, emphasize_first=False, missing_note=None):
+    def pages(title, entries, emphasize_first=False, missing_note=None, portrait_asset=None):
         current, used, page_index = [], 0, 0
         def flush(last=False):
             nonlocal current, used, page_index
             if not current:
                 return
             slide = page(title + (" · продолжение" if page_index else ""))
+            if portrait_asset and page_index == 0:
+                add_portrait(slide, portrait_asset)
             y, ids = 1.65, []
             for value, refs, lines, first in current:
                 height = (lines + 1) * .31
-                frame = put(slide, value, .7, y, 11.9, height, style["body_pt"])
+                content_width = 8.55 if portrait_asset and page_index == 0 else 11.9
+                frame = put(slide, value, .7, y, content_width, height, style["body_pt"])
                 if first and emphasize_first:
                     frame.paragraphs[0].font.bold = True
                 y += height + .15
                 ids.extend(refs)
             notes(slide, ids)
+            if portrait_asset and page_index == 0 and rector_photo_url:
+                slide.notes_slide.notes_text_frame.text += f"\n\nПортрет руководителя: {rector_photo_url}"
             if last and missing_note:
                 put(slide, missing_note, .7, 6.36, 11.9, .38, 11, muted=True)
             current, used, page_index = [], 0, page_index + 1
         for entry_index, (value, ids) in enumerate(entries):
             wrapped = [line for part in value.splitlines() for line in textwrap.wrap(part,
-                       width=style["line_characters"], break_long_words=True)]
+                       width=58 if portrait_asset else style["line_characters"], break_long_words=True)]
             for start in range(0, len(wrapped), 6):
                 chunk = wrapped[start:start + 6]
                 lines = len(chunk)
@@ -152,10 +160,37 @@ def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, can
         if head:
             break
 
+    portrait = None
+    if head and rector_photo_url and any(
+            f.field.value == "appointment.position"
+            and re.search(r"(?<!\w)ректор(?:а)?(?!\w)", f.value, re.I)
+            and not re.search(r"заместител|помощник|советник|проректор", f.value, re.I)
+            for f in head[1]):
+        rector_hosts = {host.lower().rstrip(".") for fact in head[1] for evidence in fact.evidence
+                        if (host := urlsplit(evidence.url).hostname)}
+        portrait = download_official_portrait(str(rector_photo_url), rector_hosts)
+
+    def add_portrait(slide, asset, x=9.55, y=1.75, width=2.75, height=3.7):
+        content, (pixel_width, pixel_height) = asset
+        ratio, box_ratio = pixel_width / pixel_height, width / height
+        if ratio >= box_ratio:
+            picture_width = width
+            picture_height = width / ratio
+            x += (width - picture_width) / 2
+            y += (height - picture_height) / 2
+            slide.shapes.add_picture(BytesIO(content), Inches(x), Inches(y), width=Inches(picture_width))
+        else:
+            picture_height = height
+            picture_width = height * ratio
+            x += (width - picture_width) / 2
+            y += (height - picture_height) / 2
+            slide.shapes.add_picture(BytesIO(content), Inches(x), Inches(y), height=Inches(picture_height))
+
     if draft.presentation_variant == "compact":
         from .compact_card import render_compact
         render_compact(draft, facts, head, page=page, put=put, notes=notes, citations=citations,
-                       sources=sources, labels=LABELS)
+                       sources=sources, labels=LABELS, portrait=portrait,
+                       partnership_matches=partnership_matches, add_portrait=add_portrait)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         presentation.save(output_path)
@@ -211,7 +246,8 @@ def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, can
                 # create a nearly empty continuation slide on its own.
                 combined = [("\n".join(value for value, _ in entries), [fid for _, ids in entries for fid in ids])]
                 note = "Не подтверждено в выбранных материалах: " + ", ".join(missing) + "." if missing else None
-                pages("Руководитель учреждения", combined, emphasize_first="first_entry", missing_note=note)
+                pages("Руководитель учреждения", combined, emphasize_first="first_entry", missing_note=note,
+                      portrait_asset=portrait)
         elif section == "institution":
             selected = [f for f in facts if f.field.value.startswith("institution.")]
             groups = OrderedDict()
@@ -282,6 +318,23 @@ def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, can
                 notes(slide, list(by_id))
         else:
             raise ValueError("Unknown presentation template section")
+    if draft.presentation_variant != "compact":
+        if partnership_matches:
+            for index, match in enumerate(partnership_matches):
+                slide = page("Предложения и партнерство со Сбером" + (f" · {index + 1}" if index else ""))
+                put(slide, match["product_name"], .7, 1.55, 11.9, .62, 21, bold=True)
+                put(slide, "Предложение: " + match["proposal"], .7, 2.35, 11.9, 1.1, style["body_pt"])
+                put(slide, "Основание: " + match["rationale"], .7, 3.65, 11.9, 1.1, style["body_pt"])
+                put(slide, "Вопрос для встречи: " + match["discussion_question"], .7, 4.95, 11.9, .85, style["body_pt"])
+                link = put(slide, "Источник в каталоге Сбера", .7, 6.05, 11.9, .35, 12, muted=True)
+                link.paragraphs[0].runs[0].hyperlink.address = match["catalog_url"]
+                notes(slide, match["basis_fact_ids"])
+                slide.notes_slide.notes_text_frame.text += f"\n\nЗапись каталога: {match['catalog_url']}"
+        else:
+            slide = page("Предложения и партнерство со Сбером")
+            put(slide, "Данные матчинга с каталогом продуктов Сбера не переданы. "
+                "Предложения появятся после подключения каталога и сопоставления с принятыми фактами.",
+                .7, 1.75, 11.9, 1.6, style["body_pt"])
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     presentation.save(output_path)
