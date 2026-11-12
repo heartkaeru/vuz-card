@@ -20,7 +20,9 @@ def test_compact_never_truncates_metric_qualifiers_and_keeps_omitted_fact_in_not
         warnings=[], sources={fact.fact_id: fact.evidence})
     path = build_card_presentation(draft, tmp_path / "compact.pptx", [fact])
     deck = Presentation(path)
-    assert len(deck.slides) == 3
+    assert len(deck.slides) == 4
+    assert "Предложения и партнерство со Сбером" in " ".join(
+        shape.text for shape in deck.slides[3].shapes if shape.has_text_frame)
     content = "\n".join(s.text for slide in deck.slides for s in slide.shapes if s.has_text_frame)
     assert "1200" not in content  # A count without its full qualifier must never appear.
     notes = "\n".join(slide.notes_slide.notes_text_frame.text for slide in deck.slides)
