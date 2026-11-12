@@ -7,7 +7,7 @@ from .llm.context_render import LABELS as CONTEXT_LABELS, context_value
 
 
 def render_compact(draft, facts, head, *, page, put, notes, citations, sources, labels,
-                   portrait=None, partnership_matches=(), add_portrait=None):
+                   portrait=None, portrait_url=None, partnership_matches=(), add_portrait=None):
     def lines(value, width=49):
         return [line for part in value.splitlines() for line in textwrap.wrap(part, width=width, break_long_words=True)]
 
@@ -24,16 +24,19 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
             budget -= len(wrapped) + 1
         return omitted
 
-    def footer(slide, ids, *, omitted=0):
-        # Sources stay clickable without adding a fourth slide. Full URL, quote,
-        # PDF page, fact ID and omitted facts are preserved in speaker notes.
+    def footer(slide, ids, *, omitted=0, extra_link=None):
+        # Source and catalog links stay clickable; full provenance is in notes.
         selected_urls = list(dict.fromkeys(e.url for f in facts if f.fact_id in ids for e in f.evidence))
+        display_urls = selected_urls[:3]
+        if extra_link:
+            display_urls = [url for url in selected_urls if url != extra_link[0]][:2] + [extra_link[0]]
         label_for = {e.url: label for label, e in sources.values()}
-        for index, url in enumerate(selected_urls[:3]):
+        for index, url in enumerate(display_urls):
             from urllib.parse import urlsplit
-            frame = put(slide, f"[{label_for[url]}] {urlsplit(url).netloc}", .7 + index * 3.98, 6.50, 3.8, .22, 10, muted=True)
+            label = label_for.get(url, extra_link[1] if extra_link and url == extra_link[0] else "Источник")
+            frame = put(slide, f"[{label}] {urlsplit(url).netloc}", .7 + index * 3.98, 6.50, 3.8, .22, 10, muted=True)
             frame.paragraphs[0].runs[0].hyperlink.address = url
-        more = " · дополнительные ссылки — в заметках" if len(selected_urls) > 3 else ""
+        more = " · дополнительные ссылки — в заметках" if len(selected_urls) > len(display_urls) - bool(extra_link) else ""
         message = "Полные сведения и цитаты — в справке и заметках" + more
         if omitted:
             message = "Показаны ключевые сведения; полные значения и остальные факты — в справке и заметках"
@@ -47,7 +50,7 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
         if portrait and add_portrait:
             add_portrait(slide, portrait)
         (name, _), items = head
-        put(slide, name, .7, 1.58, 11.9, .6, 25, bold=True)
+        put(slide, name, .7, 1.58, 8.55 if portrait else 11.9, .6, 25, bold=True)
         primary = []
         for field in ("appointment.position", "appointment.status", "contact.phone", "contact.email",
                       "person.degree", "person.academic_title", "person.education", "appointment.since"):
@@ -81,6 +84,8 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
         else:
             omitted = column(slide, primary, .7) + column(slide, secondary, 6.9)
         footer(slide, [f.fact_id for f in items], omitted=len(omitted) + max(0, len(careers) - 2))
+        if portrait and portrait_url:
+            slide.notes_slide.notes_text_frame.text += f"\n\nПортрет руководителя: {portrait_url}"
     else:
         put(slide, "Руководитель головного учреждения не подтверждён в выбранных материалах", .7, 1.8, 11.9, 1.1, 23)
         footer(slide, [])
@@ -134,15 +139,18 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
         for index, match in enumerate(partnership_matches):
             slide = page("Предложения и партнерство со Сбером" + (f" · {index + 1}" if index else ""))
             put(slide, match["product_name"], .7, 1.55, 11.9, .62, 21, bold=True)
-            put(slide, "Предложение: " + match["proposal"], .7, 2.35, 11.9, 1.05, 17)
-            put(slide, "Основание: " + match["rationale"], .7, 3.65, 11.9, 1.05, 17)
+            put(slide, "Гипотеза для обсуждения: " + match["proposal"], .7, 2.35, 11.9, 1.05, 17)
+            put(slide, "Основание: " + match["rationale"] + " " + citations(match["basis_fact_ids"]),
+                .7, 3.65, 11.9, 1.05, 17)
             put(slide, "Вопрос для встречи: " + match["discussion_question"], .7, 4.95, 11.9, .85, 17)
-            link = put(slide, "Источник в каталоге Сбера", .7, 6.05, 11.9, .3, 12, muted=True)
-            link.paragraphs[0].runs[0].hyperlink.address = match["catalog_url"]
-            footer(slide, match["basis_fact_ids"])
-            slide.notes_slide.notes_text_frame.text += f"\n\nЗапись каталога: {match['catalog_url']}"
+            footer(slide, match["basis_fact_ids"], extra_link=(match["catalog_url"], "Каталог Сбера"))
+            slide.notes_slide.notes_text_frame.text += (
+                f"\n\nЗапись каталога: {match['catalog_url']}"
+                "\nСовпадение — гипотеза для обсуждения, не подтверждение партнёрства или доступности продукта."
+            )
     else:
         slide = page("Предложения и партнерство со Сбером")
         put(slide, "Данные матчинга с каталогом продуктов Сбера не переданы. "
             "Предложения появятся после подключения каталога и сопоставления с принятыми фактами.",
             .7, 1.75, 11.9, 1.6, 17)
+        footer(slide, [])

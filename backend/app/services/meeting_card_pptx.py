@@ -190,6 +190,7 @@ def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, can
         from .compact_card import render_compact
         render_compact(draft, facts, head, page=page, put=put, notes=notes, citations=citations,
                        sources=sources, labels=LABELS, portrait=portrait,
+                       portrait_url=str(rector_photo_url) if portrait else None,
                        partnership_matches=partnership_matches, add_portrait=add_portrait)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -323,13 +324,17 @@ def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, can
             for index, match in enumerate(partnership_matches):
                 slide = page("Предложения и партнерство со Сбером" + (f" · {index + 1}" if index else ""))
                 put(slide, match["product_name"], .7, 1.55, 11.9, .62, 21, bold=True)
-                put(slide, "Предложение: " + match["proposal"], .7, 2.35, 11.9, 1.1, style["body_pt"])
-                put(slide, "Основание: " + match["rationale"], .7, 3.65, 11.9, 1.1, style["body_pt"])
+                put(slide, "Гипотеза для обсуждения: " + match["proposal"], .7, 2.35, 11.9, 1.1, style["body_pt"])
+                put(slide, "Основание: " + match["rationale"] + " " + citations(match["basis_fact_ids"]),
+                    .7, 3.65, 11.9, 1.1, style["body_pt"])
                 put(slide, "Вопрос для встречи: " + match["discussion_question"], .7, 4.95, 11.9, .85, style["body_pt"])
                 link = put(slide, "Источник в каталоге Сбера", .7, 6.05, 11.9, .35, 12, muted=True)
                 link.paragraphs[0].runs[0].hyperlink.address = match["catalog_url"]
                 notes(slide, match["basis_fact_ids"])
-                slide.notes_slide.notes_text_frame.text += f"\n\nЗапись каталога: {match['catalog_url']}"
+                slide.notes_slide.notes_text_frame.text += (
+                    f"\n\nЗапись каталога: {match['catalog_url']}"
+                    "\nСовпадение — гипотеза для обсуждения, не подтверждение партнёрства или доступности продукта."
+                )
         else:
             slide = page("Предложения и партнерство со Сбером")
             put(slide, "Данные матчинга с каталогом продуктов Сбера не переданы. "

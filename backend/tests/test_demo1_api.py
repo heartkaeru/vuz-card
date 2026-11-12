@@ -426,10 +426,11 @@ def test_presentation_variant_is_persisted_and_downloaded_without_changing_facts
     assert job["identity"]["presentation_variant"] == result["presentation_variant"] == variant
     deck = Presentation(io.BytesIO(client.get(result["download_url"]).content))
     if variant == "compact":
-        assert len(deck.slides) == 3
+        assert len(deck.slides) == 4
         assert "Руководитель учреждения" in deck.slides[0].shapes[2].text
         assert "Справочная информация" in deck.slides[1].shapes[2].text
         assert "Повестка встречи" in deck.slides[2].shapes[2].text
+        assert "Предложения и партнерство со Сбером" in deck.slides[3].shapes[2].text
     for slide in deck.slides:
         for shape in slide.shapes:
             assert shape.left >= 0 and shape.top >= 0
@@ -456,7 +457,7 @@ def test_compact_preview_stays_unapproved_and_unknown_variant_is_rejected(api_cl
     response = client.get(url + "&presentation_variant=compact")
     assert response.status_code == 200
     deck = Presentation(io.BytesIO(response.content))
-    assert len(deck.slides) == 3
+    assert len(deck.slides) == 4
     assert all("КАНДИДАТЫ НЕ ПРИНЯТЫ" in " ".join(s.text for s in slide.shapes if s.has_text_frame) for slide in deck.slides)
     assert client.get(url + "&presentation_variant=unknown").status_code == 422
     assert repository.reviews(run["run_id"]) == []
