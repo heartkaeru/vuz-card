@@ -113,6 +113,26 @@ export default function UniversityDashboard() {
     return () => { active = false; };
   }, []);
 
+  useEffect(() => {
+    const restoreView = () => {
+      const params = new URLSearchParams(window.location.search);
+      const savedView = params.get("vuzView");
+      const nextView = navigation.some((item) => item.key === savedView) ? savedView as View : "universities";
+      const universityId = params.get("university");
+      setView(nextView);
+      if (nextView === "overview") setSection("about");
+      if (nextView === "events") setSection("events");
+      if (universityId) {
+        setSelectedId(universityId);
+        setHasChosenUniversity(true);
+      }
+      setReportFilterOpen(false);
+    };
+    window.addEventListener("popstate", restoreView);
+    restoreView();
+    return () => window.removeEventListener("popstate", restoreView);
+  }, []);
+
   useLayoutEffect(() => {
     const updateIndicator = () => {
       const tab = tabRefs.current[indicatorSection];
@@ -171,26 +191,36 @@ export default function UniversityDashboard() {
     }
   };
 
-  const navigate = (nextView: View) => {
-    if ((nextView === "overview" || nextView === "events") && (!hasChosenUniversity || !selectedUniversity)) return;
+  const changeView = (nextView: View, nextUniversityId = selectedId) => {
+    if (nextView === view) return;
+    const params = new URLSearchParams(window.location.search);
+    params.set("vuzView", nextView);
+    if (nextUniversityId) params.set("university", nextUniversityId);
+    else params.delete("university");
+    const nextUrl = `${window.location.pathname}?${params.toString()}${window.location.hash}`;
+    window.history.pushState(null, "", nextUrl);
     setView(nextView);
     if (nextView === "overview") setSection("about");
     if (nextView === "events") setSection("events");
     setReportFilterOpen(false);
   };
 
+  const navigate = (nextView: View) => {
+    if ((nextView === "overview" || nextView === "events") && (!hasChosenUniversity || !selectedUniversity)) return;
+    changeView(nextView);
+  };
+
   const openUniversity = (university: University) => {
     setSelectedId(university.id);
     setHasChosenUniversity(true);
-    setSection("about");
-    setView("overview");
+    changeView("overview", university.id);
   };
 
   const handleGlobalSearch = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setUniversitySearch(globalSearch);
     setRegionFilter("Все регионы");
-    setView("universities");
+    changeView("universities");
   };
 
   const openCreate = (suggestedName = "") => {
@@ -214,8 +244,7 @@ export default function UniversityDashboard() {
     setUniversitySearch("");
     setGlobalSearch("");
     setRegionFilter("Все регионы");
-    setSection("about");
-    setView("overview");
+    changeView("overview", university.id);
     notify("Создан черновик карточки. Факты можно добавить после проверки источников.");
     } catch (failure) { notify(errorText(failure)); }
     finally { setCreating(false); }
