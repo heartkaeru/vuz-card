@@ -217,8 +217,38 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
                     validation_status="failed" if issues else "passed",
                     verification_status="rejected" if issues else "pending", issues=sorted(set(issues)),
                 ))
-    # Typed, validated parser values do not need to be retyped by a language model.
-    # This is opt-in and never applies to unknown owners or unprocessed fragments.
+    # Explicit fio/post pairs survive a missing or paraphrased model response.
+    if request.fields is None or FactField.POSITION.value in request.fields:
+        positions = {
+            (normalized(f.subject.person_name), normalized(f.subject.department or ""), normalized(f.value))
+            for f in facts if f.field == FactField.POSITION and f.validation_status == "passed" and f.subject.person_name
+        }
+        for document in request.documents:
+            digest = hashlib.sha256(document.text.encode()).hexdigest()
+            for fragment in document.fragments:
+                leader = fragment.leadership_position
+                if not leader or (document.source_id, fragment.fragment_id) not in processed_fragments:
+                    continue
+                key = (normalized(leader.person_name), normalized(fragment.subject_department or ""),
+                       normalized(leader.position))
+                if key in positions:
+                    continue
+                positions.add(key)
+                facts.append(Fact(
+                    fact_id=f"fact_{uuid4().hex}", institution_id=request.institution.id,
+                    subject=Subject(person_name=leader.person_name, department=fragment.subject_department),
+                    field=FactField.POSITION, value=leader.position, origin="parser_projection",
+                    evidence=[Evidence(
+                        source_id=document.source_id, quote=document.text[fragment.start:fragment.end],
+                        url=str(document.url), retrieved_at=document.retrieved_at,
+                        published_at=document.published_at, content_sha256=digest,
+                        chunk_id=f"parser:{fragment.fragment_id}", fragment_id=fragment.fragment_id,
+                        start_offset=fragment.start, end_offset=fragment.end,
+                        page_number=fragment.page_number, file_sha256=document.file_sha256,
+                    )],
+                    validation_status="passed", verification_status="pending",
+                ))
+    # Typed, validated parser contacts do not need to be retyped by a language model.
     if request.project_structured_contacts:
         contact_keys = {
             (e.source_id, f.field.value, value_key(f.field, f.value),
@@ -300,7 +330,7 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
             fact.verification_status = "conflict"
             fact.issues.append("multiple_head_candidates")
     return ExtractionResult(
-        schema_version="0.2", institution=request.institution, run=pipeline.run_info("extract-fragments-v5"),
+        schema_version="0.2", institution=request.institution, run=pipeline.run_info("extract-fragments-v6"),
         facts=facts, gaps=list(dict.fromkeys(gaps)), errors=errors,
         complete=not errors and all(f.validation_status == "passed" for f in facts),
     )

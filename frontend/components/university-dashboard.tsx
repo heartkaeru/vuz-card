@@ -42,6 +42,7 @@ export default function UniversityDashboard() {
   const [globalSearch, setGlobalSearch] = useState("");
   const [regionFilter, setRegionFilter] = useState("Все регионы");
   const [chatOpen, setChatOpen] = useState(false);
+  const [chatMode, setChatMode] = useState<"general" | "card">("general");
   const [createOpen, setCreateOpen] = useState(false);
   const [createName, setCreateName] = useState("");
   const [createCity, setCreateCity] = useState("");
@@ -49,6 +50,7 @@ export default function UniversityDashboard() {
   const [creating, setCreating] = useState(false);
   const researchRef = useRef<ResearchHandle>(null);
   const [runs, setRuns] = useState<Record<string, ResearchRun | null>>({});
+  const [cardEditVersion, setCardEditVersion] = useState(0);
   const [reportSearch, setReportSearch] = useState("");
   const [reports, setReports] = useState<SavedMaterial[]>([]);
   const [reportsLoading, setReportsLoading] = useState(false);
@@ -58,6 +60,7 @@ export default function UniversityDashboard() {
   const [toast, setToast] = useState("");
 
   const selectedUniversity = universities.find((university) => university.id === selectedId);
+  const chatCard = hasChosenUniversity ? selectedUniversity : undefined;
   const selectedRun = selectedId ? runs[selectedId] ?? null : null;
   const regions = useMemo(() => [...new Set(universities.map((university) => university.city))], [universities]);
   const filteredUniversities = universities.filter((university) => {
@@ -169,6 +172,17 @@ export default function UniversityDashboard() {
   };
 
   const onChatClose = () => setChatOpen(false);
+  const openChat = (mode: "general" | "card") => {
+    setChatMode(mode);
+    setChatOpen(true);
+  };
+
+  const openChatCard = (card: ApiCard) => {
+    const university: University = { ...card, backendId: card.id, tone: "mint", draft: card.latest_run === null };
+    setUniversities((current) => [university, ...current.filter((item) => item.backendId !== card.id)]);
+    openUniversity(university);
+    setCardEditVersion((version) => version + 1);
+  };
 
   return (
     <div className="workspace">
@@ -202,7 +216,7 @@ export default function UniversityDashboard() {
 
       <main className="main-area" id="top">
         <div className="mobile-topbar">
-          <button className="mobile-agent-button" type="button" onClick={() => setChatOpen(true)}>
+          <button className="mobile-agent-button" type="button" onClick={() => openChat("general")}>
             <Icon name="spark" size={18} /> Агент
           </button>
         </div>
@@ -287,12 +301,8 @@ export default function UniversityDashboard() {
               university={selectedUniversity}
               onPreview={() => researchRef.current?.openReportOptions()}
               onDownload={() => { void researchRef.current?.generate(); }}
+              onChat={() => openChat("card")}
             />
-            <ResearchPanel key={selectedUniversity.id} ref={researchRef} university={selectedUniversity}
-              showFacts={section === "contacts"} onShowFacts={() => setSection("contacts")}
-              onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
-              onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
-                ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
             <div className="profile-tabs" role="tablist" aria-label="Разделы карточки" onMouseLeave={() => setHoveredSection(null)}>
               {tabs.map((tab) => (
                 <button
@@ -312,12 +322,13 @@ export default function UniversityDashboard() {
               ))}
               <span className="profile-tabs__indicator" aria-hidden="true" style={{ left: tabIndicator.left, width: tabIndicator.width }} />
             </div>
-            <ResearchPanel key={selectedUniversity.id} ref={researchRef} university={selectedUniversity}
+            <ResearchPanel key={`${selectedUniversity.id}-${cardEditVersion}`} ref={researchRef} university={selectedUniversity}
               showFacts={section === "contacts"} onShowFacts={() => setSection("contacts")}
+              onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
               onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
                 ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
             <div className="profile-content page-enter" key={`${selectedUniversity.id}-${section}`}>
-              {section === "about" && <AboutSection university={selectedUniversity} run={selectedRun} onAdd={() => setChatOpen(true)} />}
+              {section === "about" && <AboutSection university={selectedUniversity} run={selectedRun} onAdd={() => openChat("card")} />}
               {section === "contacts" && <ContactsSection university={selectedUniversity} run={selectedRun} />}
               {section === "projects" && <ProjectsSection university={selectedUniversity} run={selectedRun} />}
               {section === "events" && <EventsSection university={selectedUniversity} run={selectedRun} />}
@@ -333,7 +344,7 @@ export default function UniversityDashboard() {
                 <h1>Мероприятия</h1>
                 <p className="page-subtitle">События и анонсы для работы с выбранной организацией</p>
               </div>
-              <button className="button button--soft" type="button" onClick={() => setChatOpen(true)}><Icon name="spark" size={17} /> Обсудить с агентом</button>
+              <button className="button button--soft" type="button" onClick={() => openChat("card")}><Icon name="spark" size={17} /> Обсудить с агентом</button>
             </div>
             <div className="events-context"><span className="events-context__mark">{initialsFor(selectedUniversity.name)}</span><div><span className="muted-label">Выбранный вуз</span><strong>{selectedUniversity.name}</strong><span className="events-context__city"><Icon name="pin" size={14} /> {selectedUniversity.city}</span></div><button className="text-button" type="button" onClick={() => navigate("universities")}>Выбрать вуз <Icon name="arrow" size={16} /></button></div>
             <ContextEntityList kind="event" run={selectedRun} empty="Проверенных мероприятий в карточке пока нет." />
@@ -399,11 +410,24 @@ export default function UniversityDashboard() {
         )}
       </main>
 
-      <AgentSphere onClick={() => setChatOpen(true)} hidden={chatOpen} />
-      <AgentChat open={chatOpen} universityName={selectedUniversity?.name ?? "вузом"} onClose={onChatClose}
+      <AgentSphere onClick={() => openChat("general")} hidden={chatOpen} />
+      <AgentChat key={chatMode === "card" ? chatCard?.backendId : "general"} open={chatOpen}
+        cardId={chatCard?.backendId} mode={chatMode} onModeChange={setChatMode}
+        universityName={chatCard?.name ?? "ВУЗ-CRM"} onClose={onChatClose}
+        onOpenCard={(card) => { openChatCard(card); setChatMode("card"); }}
+        onEditApplied={() => setCardEditVersion((version) => version + 1)}
+        onCollection={(card, job) => {
+          openChatCard(card);
+          setChatOpen(false);
+          notify(job.status === "queued" ? "Карточка открыта. Задание сбора поставлено в очередь." : job.message);
+        }}
         onAction={async (action) => {
-          if (!researchRef.current) return "Сначала откройте карточку учреждения из списка вузов.";
-          return action === "refresh" ? researchRef.current.refresh() : researchRef.current.generate();
+          if (!researchRef.current) return { message: "Сначала откройте карточку учреждения из списка вузов." };
+          return action === "refresh" ? { message: await researchRef.current.refresh() } : researchRef.current.generate();
+        }}
+        onShowRecheck={() => {
+          setChatOpen(false);
+          requestAnimationFrame(() => researchRef.current?.showRecheck());
         }} />
 
       {createOpen && (
@@ -423,7 +447,9 @@ export default function UniversityDashboard() {
   );
 }
 
-function ProfileHero({ university, onPreview, onDownload }: { university: University; onPreview: () => void; onDownload: () => void }) {
+function ProfileHero({ university, onPreview, onDownload, onChat }: {
+  university: University; onPreview: () => void; onDownload: () => void; onChat: () => void;
+}) {
   return (
     <section className="profile-hero">
       <div className="profile-hero__decor profile-hero__decor--one" />
@@ -435,6 +461,7 @@ function ProfileHero({ university, onPreview, onDownload }: { university: Univer
         <div className="profile-hero__actions">
           <button className="button button--primary profile-hero__download" type="button" onClick={onDownload}><Icon name="download" size={16} /> Сформировать материалы</button>
           <button className="button button--soft profile-hero__download" type="button" onClick={onPreview}><Icon name="search" size={16} /> Просмотреть и выбрать формат</button>
+          <button className="button button--soft profile-hero__download" type="button" onClick={onChat}><Icon name="spark" size={16} /> Обсудить с агентом</button>
         </div>
       </div>
       <div className="profile-hero__metrics">
@@ -460,7 +487,10 @@ function isVerified(fact: Fact) {
 }
 
 function verifiedFacts(run: ResearchRun | null) {
-  return run?.facts.filter(isVerified) ?? [];
+  if (!run) return [];
+  const retired = new Set(run.retired_fact_ids ?? []);
+  const active = new Map([...(run.baseline_facts ?? []), ...run.facts].map((fact) => [fact.fact_id, fact]));
+  return [...active.values()].filter((fact) => isVerified(fact) && !retired.has(fact.fact_id));
 }
 
 function groupVerifiedEntities(run: ResearchRun | null, kind: "project" | "event") {

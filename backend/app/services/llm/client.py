@@ -72,6 +72,17 @@ class GigaChatProvider:
         self.model = settings.model
 
     async def complete(self, system: str, payload: dict, schema: dict) -> str:
+        choice = await self.chat([
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ], response_format={"type": "json_schema", "schema": schema, "strict": True})
+        if choice.finish_reason != "stop":
+            raise LLMError("incomplete_model_response")
+        if not choice.message.content:
+            raise LLMError("empty_model_response")
+        return choice.message.content
+
+    async def chat(self, messages: list[dict], **options):
         try:
             async with GigaChat(
                 credentials=self.settings.credentials,
@@ -85,20 +96,14 @@ class GigaChatProvider:
             ) as client:
                 response = await client.achat({
                     "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                    ],
+                    "messages": messages,
                     "temperature": 0.1,
                     "max_tokens": self.settings.max_output_tokens,
-                    "response_format": {"type": "json_schema", "schema": schema, "strict": True},
+                    **options,
                 })
-                if not response.choices or response.choices[0].finish_reason != "stop":
+                if not response.choices:
                     raise LLMError("incomplete_model_response")
-                content = response.choices[0].message.content
-                if not content:
-                    raise LLMError("empty_model_response")
-                return content
+                return response.choices[0]
         except ResponseError as exc:
             raise LLMError(f"gigachat_http_{exc.status_code}") from None
         except httpx.TimeoutException:

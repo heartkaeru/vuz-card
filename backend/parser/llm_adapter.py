@@ -68,6 +68,8 @@ def to_llm_document(
                     item["biography_subject"] = fragment.biography_subject.model_dump(mode="json")
                 if fragment.subject_department:
                     item["subject_department"] = fragment.subject_department
+                if fragment.leadership_position:
+                    item["leadership_position"] = fragment.leadership_position.model_dump(mode="json")
                 item["contact_hints"] = [
                     hint.model_dump(mode="json")
                     for hint in fragment.contact_hints

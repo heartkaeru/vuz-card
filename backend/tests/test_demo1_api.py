@@ -1,15 +1,21 @@
 import io
 import json
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from gigachat.models import Choices, Messages
 from pptx import Presentation
 
 from app.api.v1.ai import get_collector, get_pipeline, get_repository
+from app.auth.security import create_access_token
 from app.main import app
+from app.services.llm.models import EntitySubject, FactField
 from app.services.llm.pipeline import AssistantPipeline
 from database.demo1_store import DemoRepository
+from database.llm_store import stamp
 from examples.llm.workflow_demo import example_card
+from parser.models import UniversityData
 
 
 class DemoProvider:
@@ -104,6 +110,261 @@ def test_ui_api_full_path_and_pptx_download(api_client):
     assert len(reports) == 1 and reports[0]["stale"] is False
 
 
+def test_pptx_recheck_renews_inherited_facts_after_explicit_source_confirmation(api_client):
+    client, repository, _ = api_client
+    card, run = collected(client)
+    reviewed = client.post(f"/api/v1/ai/runs/{run['run_id']}/reviews", json=review_payload(run))
+    assert reviewed.status_code == 200, reviewed.text
+
+    def age_facts(current, _):
+        for fact in current.facts:
+            fact.last_checked_at = stamp() - timedelta(days=8)
+
+    repository.mutate(run["run_id"], reviewed.json()["revision"], age_facts)
+    snapshot = UniversityData.model_validate(repository.source_card(run["run_id"]))
+    app.dependency_overrides[get_collector] = lambda: lambda *args, **kwargs: snapshot
+    refreshed = client.post(f"/api/v1/ai/cards/{card['id']}/refresh", json={
+        "version": card["version"], "request_key": "recheck-collection",
+    })
+    assert refreshed.status_code == 202, refreshed.text
+    job = repository.job(refreshed.json()["job_id"])
+    current = repository.get(job["result"]["run_id"])
+    path = f"/api/v1/ai/runs/{current.run_id}"
+    ids = [fact.fact_id for fact in current.baseline_facts]
+    assert len(ids) == 2 and all(fact.verification_status == "pending" for fact in current.facts)
+    assert current.reconfirmed_facts == {}
+    assert client.get(f"{path}/changes").json()["recheck_fact_ids"] == ids
+    payload = {"expected_revision": current.revision, "request_key": "recheck-material"}
+    blocked = client.post(f"{path}/materials", json=payload)
+    assert blocked.status_code == 409 and blocked.json()["detail"] == "facts_require_freshness_check"
+    assert repository.card_job(card["id"])["job_id"] == job["job_id"]
+
+    recheck = {"expected_revision": current.revision, "fact_ids": ids, "reviewer": "test-reviewer"}
+    assert client.post(f"{path}/recheck", json={**recheck, "source_checked": False}).status_code == 422
+    pending = client.post(f"{path}/recheck", json={
+        **recheck, "fact_ids": [current.facts[0].fact_id], "source_checked": True,
+    })
+    assert pending.status_code == 409
+    renewed = client.post(f"{path}/recheck", json={**recheck, "source_checked": True})
+    assert renewed.status_code == 200, renewed.text
+    assert client.post(f"{path}/recheck", json={**recheck, "source_checked": True}).status_code == 409
+    assert client.get(f"{path}/changes").json()["recheck_fact_ids"] == []
+    for entry, old in zip(repository.reviews(current.run_id), current.baseline_facts, strict=True):
+        assert entry["decision"] == "recheck" and entry["actor"] == "test-reviewer"
+        assert json.loads(entry["before_json"])["value"] == json.loads(entry["after_json"])["value"] == old.value
+
+    payload["expected_revision"] = renewed.json()["revision"]
+    response = client.post(f"{path}/materials", json=payload)
+    assert response.status_code == 202, response.text
+    result = repository.job(response.json()["job_id"])
+    assert result["status"] == "completed", result
+    assert client.get(result["result"]["download_url"]).status_code == 200
+
+
+def test_repeat_collection_refreshes_outdated_facts_and_exports_without_new_human_review(api_client):
+    client, repository, _ = api_client
+    card, run = collected(client)
+    response = client.post(f"/api/v1/ai/runs/{run['run_id']}/reviews", json=review_payload(run))
+    assert response.status_code == 200, response.text
+
+    def age_facts(current, _):
+        for fact in current.facts:
+            fact.last_checked_at -= timedelta(days=8)
+
+    previous = repository.mutate(run["run_id"], response.json()["revision"], age_facts)
+    refresh = client.post(f"/api/v1/ai/cards/{card['id']}/refresh", json={
+        "version": card["version"], "request_key": "refresh-confirmed-facts",
+    })
+    job = repository.job(refresh.json()["job_id"])
+    current = repository.get(job["result"]["run_id"])
+    path = f"/api/v1/ai/runs/{current.run_id}"
+    changes = client.get(f"{path}/changes").json()
+    assert changes["recheck_fact_ids"] == []
+    assert set(changes["reconfirmed_facts"]) == {f.fact_id for f in previous.facts}
+    assert all(f["reviewed_by"] == "test-reviewer" for f in changes["approved_facts"])
+    duplicate = client.post(f"{path}/reviews", json=review_payload(current.model_dump(mode="json")))
+    assert duplicate.status_code == 409 and duplicate.json()["detail"] == "fact_already_reconfirmed"
+
+    response = client.post(f"{path}/materials", json={"expected_revision": current.revision, "request_key": "export-refreshed"})
+    assert response.status_code == 202, response.text
+    material = repository.job(response.json()["job_id"])
+    assert material["status"] == "completed", material
+    assert client.get(material["result"]["download_url"]).status_code == 200
+
+
+def test_educational_match_uses_reviewed_profile_and_reaches_pptx(api_client):
+    client, repository, _ = api_client
+    _, run = collected(client)
+    first_revision = run["revision"]
+
+    def add_profile(research, _):
+        fact = research.facts[0].model_copy(update={
+            "fact_id": "education-fact",
+            "field": FactField.EDUCATION_AREAS,
+            "subject": EntitySubject(entity_kind="institution", entity_id=research.institution.id,
+                                     entity_name=research.institution.name),
+            "value": "Прикладной анализ данных",
+        })
+        fact.evidence = [fact.evidence[0].model_copy(update={"quote": fact.value})]
+        research.facts.append(fact)
+
+    updated = repository.mutate(run["run_id"], first_revision, add_profile)
+    run = updated.model_dump(mode="json")
+    base = f"/api/v1/ai/runs/{run['run_id']}"
+    calls = []
+    proposal = {
+        "catalog_id": "netology-data-viz", "basis_fact_ids": ["education-fact"],
+        "proposal": "Обсудить вводный курс по визуализации для преподавателей.",
+        "rationale": "Вуз ведёт подготовку по прикладному анализу данных.",
+        "discussion_question": "Какие инструменты визуализации используются на занятиях?",
+    }
+
+    class MatchProvider(DemoProvider):
+        async def complete(self, system, payload, schema):
+            if "catalog" not in payload:
+                statement = {"text": "Прикладной анализ данных.", "fact_ids": ["education-fact"]}
+                return json.dumps({
+                    "brief_sections": [{"title": "Направления", "statements": [statement]}],
+                    "slides": [{"title": "Направления", "theses": [statement]}],
+                    "questions": [],
+                })
+            calls.append(payload)
+            return json.dumps({"matches": [proposal]})
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(MatchProvider())
+    params = {"expected_revision": run["revision"], "meeting": {"goal": "Обучение преподавателей"}}
+    assert client.post(f"{base}/partnership-matches", json=params).json() == []
+    assert calls == []
+
+    run = client.post(f"{base}/reviews", json=review_payload(run)).json()
+    assert client.post(f"{base}/partnership-matches", json=params).status_code == 409
+    params["expected_revision"] = run["revision"]
+    response = client.post(f"{base}/partnership-matches", json=params)
+    assert response.status_code == 200, response.text
+    matches = response.json()
+    assert [fact["fact_id"] for fact in calls[-1]["facts"]] == ["education-fact"]
+    assert calls[-1]["meeting"]["goal"] == "Обучение преподавателей"
+    assert {"edutoria", "sber-payroll", "sber-campus-card", "sber-health-corporate"}.isdisjoint(
+        item["id"] for item in calls[-1]["catalog"]
+    )
+    assert matches[0]["kind"] == "external_course"
+    assert matches[0]["catalog_url"] == "https://netology.ru/programs/data-viz"
+
+    result = client.post(f"{base}/materials", json={
+        **params, "request_key": "with-educational-proposal", "partnership_matches": matches,
+    })
+    assert result.status_code == 202, result.text
+    job = client.get(f"/api/v1/ai/jobs/{result.json()['job_id']}").json()
+    assert job["status"] == "completed", job["result"]
+    presentation = Presentation(io.BytesIO(client.get(job["result"]["download_url"]).content))
+    assert any("Вариант обучения · внешний курс" in shape.text
+               for slide in presentation.slides for shape in slide.shapes if shape.has_text_frame)
+    assert any("netology.ru/programs/data-viz" in slide.notes_slide.notes_text_frame.text
+               for slide in presentation.slides)
+
+    for invalid in (
+        {"catalog_id": "invented-course"},
+        {"catalog_id": "edutoria"},
+        {"catalog_id": "sber-payroll"},
+        {"basis_fact_ids": ["unknown-fact"]},
+        {"basis_fact_ids": [run["facts"][0]["fact_id"]]},
+    ):
+        original = proposal.copy()
+        proposal.update(invalid)
+        response = client.post(f"{base}/partnership-matches", json=params)
+        assert response.status_code == 502
+        assert response.json()["detail"] == "invalid_partnership_response"
+        proposal.update(original)
+
+    def add_project(research, _):
+        profile = next(fact for fact in research.facts if fact.fact_id == "education-fact")
+        value = "Вуз внедряет электронные реестры для расчётов с сотрудниками."
+        research.facts.append(profile.model_copy(update={
+            "fact_id": "payroll-fact", "field": FactField.PROJECT_DESCRIPTION,
+            "subject": EntitySubject(entity_kind="project", entity_id="payments", entity_name="Расчёты"),
+            "value": value, "evidence": [profile.evidence[0].model_copy(update={"quote": value})],
+        }))
+
+    updated = repository.mutate(run["run_id"], run["revision"], add_project)
+    params["expected_revision"] = updated.revision
+    proposal.update(catalog_id="sber-payroll", basis_fact_ids=["payroll-fact"],
+                    rationale="Вуз внедряет электронные реестры выплат.",
+                    proposal="Обсудить интеграцию зарплатного проекта с реестрами вуза.",
+                    discussion_question="Как бухгалтерия передаёт реестры выплат сейчас?")
+    response = client.post(f"{base}/partnership-matches", json=params)
+    assert response.status_code == 200, response.text
+    assert response.json()[0]["product_name"] == "Зарплатный проект Сбера"
+    proposal["basis_fact_ids"] = ["education-fact"]
+    assert client.post(f"{base}/partnership-matches", json=params).status_code == 502
+
+
+def test_card_chat_reads_current_accepted_facts_and_isolates_history(api_client, monkeypatch):
+    client, repository, _ = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('employee-1')[0]}"}
+    other_user = {"Authorization": f"Bearer {create_access_token('employee-2')[0]}"}
+    card, run = collected(client)
+    other_card = repository.create_card("Другой вуз", "", "https://other.example")
+    path = f"/api/v1/ai/cards/{card['id']}/chat"
+    calls = []
+    invalid_reply = False
+
+    class ChatProvider(DemoProvider):
+        async def chat(self, messages, **options):
+            calls.append(messages.copy())
+            question = next(message["content"] for message in reversed(messages) if message["role"] == "user")
+            follow_up = question == "А как с ним связаться?"
+            if messages[-1]["role"] == "user":
+                if follow_up:
+                    assert "Иванов" in messages[-2]["content"]
+                message = Messages(role="assistant", functions_state_id="state-id", function_call={
+                    "name": "read_card",
+                    "arguments": {"section": "contacts", "person": "Иванов"},
+                })
+                return Choices(index=0, finish_reason="function_call", message=message)
+
+            assert messages[-2]["functions_state_id"] == "state-id"
+            assert options["function_call"] == "none"
+            facts = json.loads(messages[-1]["content"])["facts"]
+            position = next(fact for fact in facts if fact["field"] == "appointment.position")
+            text = "В карточке нет подтверждённого контакта ректора." if follow_up else "Ректор — Иванов Иван Иванович."
+            if follow_up:
+                assert not any(fact["field"].startswith("contact.") for fact in facts)
+            return Choices(index=0, finish_reason="stop", message=Messages(role="assistant", content=json.dumps({
+                "text": text, "fact_ids": ["invented"] if invalid_reply else [position["id"]],
+            })))
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(ChatProvider())
+    assert client.get(path).status_code == 401
+    assert client.post(path, json={"message": "Кто руководит вузом?"}).status_code == 401
+    response = client.post(path, headers=headers, json={"message": "Кто руководит вузом?"})
+    assert response.status_code == 200, response.text
+    assert not response.json()["answer"]["sources"]
+    assert "нет принятой записи о руководителе" in response.json()["answer"]["text"]
+    assert not calls
+
+    reviewed = client.post(f"/api/v1/ai/runs/{run['run_id']}/reviews", json=review_payload(run))
+    assert reviewed.status_code == 200, reviewed.text
+    response = client.post(path, headers=headers, json={"message": "Кто руководит вузом"})
+    assert response.status_code == 200, response.text
+    assert "Иванов Иван Иванович — Ректор" in response.json()["answer"]["text"]
+    assert response.json()["answer"]["sources"][0]["url"].startswith("https://")
+    assert not calls
+    response = client.post(path, headers=headers, json={"message": "А как с ним связаться?"})
+    assert response.status_code == 200, response.text
+    assert response.json()["answer"]["sources"][0]["url"].startswith("https://")
+    assert len(calls) == 2
+    assert len(client.get(path, headers=headers).json()) == 3
+    assert client.get(path, headers=other_user).json() == []
+    assert client.get(f"/api/v1/ai/cards/{other_card['id']}/chat", headers=headers).json() == []
+    assert len(DemoRepository(repository.path).chat_snapshot(card["id"], "employee-1", 20)[2]) == 3
+    invalid_reply = True
+    response = client.post(path, headers=headers, json={"message": "Какие рабочие контакты есть?"})
+    assert response.status_code == 502
+    assert response.json()["detail"] == "invalid_chat_reply"
+    assert len(client.get(path, headers=headers).json()) == 3
+
+
 def test_refresh_is_idempotent_and_sources_are_not_recollected(api_client):
     client, repository, calls = api_client
     card, run = collected(client)
@@ -112,6 +373,148 @@ def test_refresh_is_idempotent_and_sources_are_not_recollected(api_client):
     assert again.status_code == 202
     assert again.json()["result"]["run_id"] == run["run_id"]
     assert len(calls) == previous_count
+
+
+def test_chat_edit_requires_owner_confirmation_and_current_revision(api_client, monkeypatch):
+    client, repository, _ = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('editor')[0]}"}
+    other = {"Authorization": f"Bearer {create_access_token('other')[0]}"}
+    card, run = collected(client)
+    review = client.post(f"/api/v1/ai/runs/{run['run_id']}/reviews", json=review_payload(run))
+    assert review.status_code == 200, review.text
+    run = review.json()
+
+    class EditProvider(DemoProvider):
+        async def chat(self, messages, **options):
+            return Choices(index=0, finish_reason="function_call", message=Messages(
+                role="assistant", function_call={
+                    "name": "propose_card_edit",
+                    "arguments": {"field": "appointment.position", "owner": "Иванов",
+                                  "new_value": "Исполняющий обязанности ректора"},
+                }))
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(EditProvider())
+    path = f"/api/v1/ai/cards/{card['id']}/chat"
+    question = {"message": "Замени должность Иванова на Исполняющий обязанности ректора"}
+    invalid = client.post(path, headers=headers, json={"message": "Исправь должность Иванова"})
+    assert invalid.json()["detail"] == "chat_edit_value_required"
+    first = client.post(path, headers=headers, json=question)
+    assert first.status_code == 200, first.text
+    edit = first.json()["answer"]["edit"]
+    assert edit["before"] == "Ректор" and edit["status"] == "pending"
+    assert repository.get(run["run_id"]).revision == run["revision"]
+    second = client.post(path, headers=headers, json=question).json()
+    confirm = f"{path}/{first.json()['id']}/confirm"
+    assert client.post(confirm, headers=other).status_code == 404
+    assert client.post(confirm).status_code == 401
+    assert client.post(confirm, headers=headers).status_code == 200
+    assert client.post(f"{path}/{second['id']}/confirm", headers=headers).status_code == 409
+    assert client.post(confirm, headers=headers).status_code == 409
+
+    detail = client.get(f"/api/v1/ai/cards/{card['id']}").json()
+    positions = [fact for fact in detail["approved_facts"] if fact["field"] == "appointment.position"]
+    assert [fact["value"] for fact in positions] == [edit["after"]]
+    assert positions[0]["origin"] == "manual_edit" and positions[0]["evidence"] == []
+    audit = repository.reviews(run["run_id"])[-1]
+    assert audit["decision"] == "manual_edit" and audit["actor"] == "editor"
+    assert json.loads(audit["before_json"])["value"] == edit["before"]
+    assert json.loads(audit["after_json"])["value"] == edit["after"]
+    assert client.get(path, headers=headers).json()[0]["answer"]["edit"]["status"] == "applied"
+
+
+def test_general_chat_keeps_its_own_context_and_starts_collection(api_client, monkeypatch):
+    client, repository, calls = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('employee')[0]}"}
+    other = {"Authorization": f"Bearer {create_access_token('other')[0]}"}
+    card = repository.create_card("Первый вуз", "Иркутск", "https://first.example")
+    question = "Какие вузы есть в Иркутске?"
+
+    class GeneralProvider(DemoProvider):
+        async def chat(self, messages, **options):
+            assert {tool["name"] for tool in options["functions"]} == {"find_cards", "collect_card"}
+            current = messages[-1]["content"]
+            if current == question:
+                call = {"name": "find_cards", "arguments": {"query": "Иркутск"}}
+            elif current.startswith("Создай"):
+                assert messages[1]["content"] == question
+                call = {"name": "collect_card", "arguments": {
+                    "name": "Второй вуз", "website": "https://second.example",
+                }}
+            else:
+                assert messages[1]["content"] == question
+                assert "Первый вуз (Иркутск)" in messages[2]["content"]
+                return Choices(index=0, finish_reason="stop", message=Messages(
+                    role="assistant", content="Откройте карточку нужного вуза.",
+                ))
+            return Choices(index=0, finish_reason="function_call",
+                           message=Messages(role="assistant", function_call=call))
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(GeneralProvider())
+    path = "/api/v1/ai/chat/general"
+    assert client.get(path).status_code == 401
+    assert client.post(path, json={"message": question}).status_code == 401
+    response = client.post(path, headers=headers, json={"message": question})
+    assert response.status_code == 200, response.text
+    assert [item["id"] for item in response.json()["answer"]["cards"]] == [card["id"]]
+    follow_up = client.post(path, headers=headers, json={"message": "А кто им руководит?"})
+    assert follow_up.json()["answer"]["text"] == "Откройте карточку нужного вуза."
+    response = client.post(path, headers=headers, json={"message": "Создай Второй вуз https://second.example"})
+    assert response.status_code == 200, response.text
+    new_card, = response.json()["answer"]["cards"]
+    assert repository.card_job(new_card["id"])["status"] == "completed"
+    assert calls == ["https://second.example"]
+    assert len(client.get(path, headers=headers).json()) == 3
+    assert client.get(path, headers=other).json() == []
+    assert client.get(f"/api/v1/ai/cards/{card['id']}/chat", headers=headers).json() == []
+
+
+def test_chat_collects_new_card_and_reuses_it_on_retry(api_client, monkeypatch):
+    client, repository, calls = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('employee')[0]}"}
+    arguments = {"name": "Учебный университет", "website": "https://university.example"}
+
+    class IntakeProvider(DemoProvider):
+        async def chat(self, messages, **options):
+            assert any(tool["name"] == "collect_card" for tool in options["functions"])
+            return Choices(index=0, finish_reason="function_call", message=Messages(
+                role="assistant", function_call={"name": "collect_card", "arguments": arguments},
+            ))
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(IntakeProvider())
+    path = "/api/v1/ai/chat/intake"
+    payload = {"message": "Собери карточку Учебный университет: https://university.example", "request_key": "one"}
+    assert client.post(path, json=payload).status_code == 401
+    assert "message" in client.post(path, json={"message": "Собери Учебный университет"}, headers=headers).json()
+    assert repository.cards() == []
+    response = client.post(path, json=payload, headers=headers)
+    assert response.status_code == 200, response.text
+    collection = response.json()["collection"]
+    card_id, job_id = collection["card"]["id"], collection["job"]["job_id"]
+    job = client.get(f"/api/v1/ai/jobs/{job_id}").json()
+    assert job["status"] == "completed" and job["identity"]["public_site_only"]
+    detail = client.get(f"/api/v1/ai/cards/{card_id}").json()
+    assert detail["run"]["facts"] and not detail["approved_facts"]
+    retry = client.post(f"/api/v1/ai/cards/{card_id}/chat", json=payload, headers=headers)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["collection"]["job"]["job_id"] == job_id
+    assert len(repository.cards()) == 1 and len(calls) == 1
+
+    repository.update_job(job_id, status="running")
+    active = client.post(path, json={**payload, "request_key": "while-running"}, headers=headers)
+    assert active.json()["collection"]["job"]["job_id"] == job_id
+    assert len(calls) == 1
+    repository.update_job(job_id, status="completed")
+
+    arguments["website"] = "https://invented.example"
+    invalid = client.post(path, json=payload, headers=headers)
+    assert invalid.status_code == 422 and invalid.json()["detail"] == "chat_collection_url_required"
+    arguments["website"] = "http://127.0.0.1"
+    invalid = client.post(path, headers=headers, json={"message": "Собери Учебный университет http://127.0.0.1"})
+    assert invalid.status_code == 422 and invalid.json()["detail"] == "public_website_required"
+    assert len(repository.cards()) == 1 and len(calls) == 1
 
 
 def test_actualization_http_preserves_card_requires_replacement_and_keeps_history(api_client):
