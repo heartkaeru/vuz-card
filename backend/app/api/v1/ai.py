@@ -35,6 +35,7 @@ from app.services.llm.workflow_models import ReviewBatch, WorkflowError
 from app.services.llm.changes import compare_run, effective_facts
 from app.services.meeting_pptx import build_meeting_presentation
 from app.services.dossier_preview import build_dossier_preview
+from app.services.pptx_preview import preview_presentation
 
 router = APIRouter(prefix="/ai", tags=["Демо 1: сбор, проверка и презентация"])
 chat_bearer = HTTPBearer(auto_error=False)
@@ -517,6 +518,27 @@ def download(material_id: str, format: Literal["pptx", "docx"] = "pptx",
 @router.get("/materials")
 def material_list(repository=Depends(get_repository)):
     return repository.materials()
+
+
+@router.put("/materials/{material_id}/report")
+def save_material_to_reports(material_id: str, repository=Depends(get_repository)):
+    return checked(lambda: repository.save_material_to_reports(material_id))
+
+
+@router.delete("/materials/{material_id}/report")
+def remove_material_from_reports(material_id: str, repository=Depends(get_repository)):
+    return checked(lambda: repository.remove_material_from_reports(material_id))
+
+
+@router.get("/materials/{material_id}/preview")
+def material_preview(material_id: str, repository=Depends(get_repository)):
+    _, stale = checked(lambda: repository.material(material_id))
+    if stale:
+        raise HTTPException(409, "material_stale_after_review")
+    path = repository.path.parent / "presentations" / f"{material_id}.pptx"
+    if not path.is_file():
+        raise HTTPException(404, "material_file_not_found")
+    return preview_presentation(path)
 
 
 @router.get("/materials/{material_id}/brief")

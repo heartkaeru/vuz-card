@@ -2,16 +2,19 @@
 
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, post, errorText, type ApiCard, type CardDetail, type Fact, type ResearchRun, type Job, type Material, type ChangeSet, type ResearchHistory, type PartnershipMatch, type CardActionResult } from "@/lib/api";
+import { api, post, errorText, downloadFile, type ApiCard, type CardDetail, type Fact, type ResearchRun, type Job, type Material, type ChangeSet, type PptxPreviewData, type ResearchHistory, type SavedMaterial, type PartnershipMatch, type CardActionResult } from "@/lib/api";
 import { Icon } from "@/components/icon";
+import { PptxPreview } from "@/components/pptx-preview";
 import { type University } from "@/data/universities";
-import { ApprovedCard, ResearchChanges } from "@/components/research-changes";
+import { ResearchChanges } from "@/components/research-changes";
+import { buildPersonAliases, personIdentityKey } from "@/lib/person-identity";
 
 export type ResearchHandle = { generate: () => Promise<CardActionResult>; refresh: () => Promise<string>; openReportOptions: () => void; showRecheck: () => void };
 type Props = {
-  university: University; showFacts: boolean; onShowFacts: () => void;
+  university: University; showFacts: boolean; reviewOutlet: HTMLDivElement | null; onShowFacts: () => void;
   onConnected: (card: ApiCard) => void; onRunChange: (run: ResearchRun | null) => void;
 };
+type ReviewTab = "candidates" | "conflicts" | "accepted";
 const fields: Record<string, string> = {
   "person.name": "ФИО", "appointment.position": "Должность", "appointment.status": "Статус назначения",
   "appointment.department": "Подразделение", "appointment.responsibilities": "Зона ответственности",
@@ -67,7 +70,62 @@ function parsePdfPages(value: string): number[] | null {
   return [...pages].sort((a, b) => a - b);
 }
 
-export const ResearchPanel = forwardRef<ResearchHandle, Props>(function ResearchPanel({ university, showFacts, onShowFacts, onConnected, onRunChange }, ref) {
+type FactGroup = { key: string; title: string; description: string; facts: Fact[] };
+
+function normalizeGroupPart(value: string) {
+  return value.normalize("NFKC").toLocaleLowerCase("ru-RU").replace(/ё/g, "е").replace(/\s+/g, " ").trim();
+}
+
+function groupReviewFacts(facts: Fact[], institutionName: string, identityFacts = facts): FactGroup[] {
+  const groups = new Map<string, FactGroup>();
+  const aliases = buildPersonAliases(identityFacts.flatMap((fact) => {
+    const name = fact.subject.person_name ?? (fact.contact_owner?.kind === "person" ? fact.contact_owner.label : null);
+    return name ? [{ name, department: fact.subject.department }] : [];
+  }));
+  for (const fact of facts) {
+    const personName = (fact.subject.person_name ?? (fact.contact_owner?.kind === "person" ? fact.contact_owner.label : null))?.trim();
+    const entityName = fact.subject.entity_name?.trim();
+    let key: string;
+    let title: string;
+    let description: string;
+
+    if (personName) {
+      const department = fact.subject.department?.trim() ?? "";
+      key = `person:${personIdentityKey(personName, department, aliases)}`;
+      title = personName;
+      description = department ? `Сведения о сотруднике · ${department}` : "Сведения о сотруднике";
+    } else if (fact.subject.entity_id && entityName) {
+      key = `entity:${fact.subject.entity_kind ?? "entity"}:${fact.subject.entity_id}`;
+      title = entityName;
+      description = fact.subject.entity_kind === "project" ? "Сведения о проекте"
+        : fact.subject.entity_kind === "event" ? "Сведения о мероприятии" : "Сведения об учреждении";
+    } else if (fact.field.startsWith("institution.")) {
+      key = `institution:${normalizeGroupPart(entityName ?? institutionName)}`;
+      title = entityName ?? institutionName;
+      description = "Сведения об учреждении";
+    } else if (fact.contact_owner && fact.contact_owner.kind !== "unknown") {
+      key = `contact:${fact.contact_owner.kind}:${normalizeGroupPart(fact.contact_owner.label)}`;
+      title = fact.contact_owner.label;
+      description = "Контактные сведения владельца";
+    } else {
+      key = `fact:${fact.fact_id}`;
+      title = fact.contact_owner?.label ?? "Контакт организации";
+      description = fields[fact.field] ?? fact.field;
+    }
+
+    const group = groups.get(key);
+    if (group) {
+      group.facts.push(fact);
+      if (personName && personName.trim().split(/\s+/).length > group.title.split(/\s+/).length) {
+        group.title = personName;
+      }
+    }
+    else groups.set(key, { key, title, description, facts: [fact] });
+  }
+  return [...groups.values()];
+}
+
+export const ResearchPanel = forwardRef<ResearchHandle, Props>(function ResearchPanel({ university, showFacts, reviewOutlet, onShowFacts, onConnected, onRunChange }, ref) {
   const [website, setWebsite] = useState(university.website ?? "");
   const [leadershipUrl, setLeadershipUrl] = useState("");
   const [biographyUrl, setBiographyUrl] = useState("");
@@ -86,11 +144,19 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [error, setError] = useState("");
   const [material, setMaterial] = useState<Material | null>(null);
   const [downloadFormat, setDownloadFormat] = useState<"pptx" | "docx">("pptx");
-  const [preview, setPreview] = useState("");
   const [formatPickerOpen, setFormatPickerOpen] = useState(false);
+  const [briefPreview, setBriefPreview] = useState("");
+  const [presentationPreview, setPresentationPreview] = useState<PptxPreviewData | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const [downloadingPresentation, setDownloadingPresentation] = useState(false);
+  const [savingToReports, setSavingToReports] = useState(false);
+  const [savedMaterialId, setSavedMaterialId] = useState<string | null>(null);
+  const [previewActionError, setPreviewActionError] = useState("");
   const [previewAfterGeneration, setPreviewAfterGeneration] = useState(false);
+  const [previewAfterGenerationFrom, setPreviewAfterGenerationFrom] = useState<string | null>(null);
+  const [showRejected, setShowRejected] = useState(false);
   const [meetingGoal, setMeetingGoal] = useState("");
   const [meetingDate, setMeetingDate] = useState("");
   const [partnership, setPartnership] = useState<{ key: string; matches: PartnershipMatch[] } | null>(null);
@@ -100,17 +166,21 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [comparison, setComparison] = useState<ChangeSet | null>(null);
   const [history, setHistory] = useState<ResearchHistory[]>([]);
   const [pastChanges, setPastChanges] = useState<ChangeSet | null>(null);
+  const [reviewTab, setReviewTab] = useState<ReviewTab>("candidates");
   const [replacePrevious, setReplacePrevious] = useState(false);
   const [recheckConfirmed, setRecheckConfirmed] = useState(false);
   const recheckRef = useRef<HTMLFieldSetElement>(null);
   const busy = saving || matching || job?.status === "queued" || job?.status === "running";
   const currentComparison = comparison?.run_id === run?.run_id && comparison?.revision === run?.revision ? comparison : null;
-  const accepted = currentComparison?.approved_facts.length ?? 0;
+  const accepted = currentComparison?.approved_facts.length
+    ?? run?.facts.filter((fact) => fact.verification_status === "verified" && fact.validation_status === "passed" && !fact.issues.length).length
+    ?? 0;
   const recheckIds = new Set(currentComparison?.recheck_fact_ids);
   const factsToRecheck = currentComparison?.approved_facts.filter((fact) => recheckIds.has(fact.fact_id)) ?? [];
   const meeting = { goal: meetingGoal.trim() || "Цель встречи не задана", date: meetingDate || null };
   const partnershipKey = JSON.stringify([run?.run_id, run?.revision, meeting]);
   const partnershipMatches = partnership?.key === partnershipKey ? partnership.matches : null;
+  const downloadUrl = material && `${material.download_url}${material.download_url.includes("?") ? "&" : "?"}format=${downloadFormat}`;
   const retirementIds = [...new Set((currentComparison?.entries ?? []).filter((change) => change.retirement_trigger_ids.some((id) => selected.includes(id)))
     .flatMap((change) => change.retirement_ids))];
   const reconfirmedIds = new Set(Object.values(run?.reconfirmed_facts ?? {}).flat());
@@ -127,6 +197,21 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   for (const fact of run?.facts ?? []) for (const code of fact.issues) issueCounts.set(code, (issueCounts.get(code) ?? 0) + 1);
   const stageErrors = run ? [...run.errors, ...Object.values(run.results).flatMap((result) => result.errors.map((item) => item.code))] : [];
   const gaps = run ? [...new Set(Object.values(run.results).flatMap((result) => result.gaps))] : [];
+  const conflictCount = currentComparison?.entries.filter((change) => change.kind === "changed" || change.kind === "head_change").length ?? 0;
+  const acceptedFacts = currentComparison?.approved_facts
+    ?? run?.facts.filter((fact) => fact.verification_status === "verified" && fact.validation_status === "passed" && !fact.issues.length)
+    ?? [];
+  const acceptedFactIds = new Set(acceptedFacts.map((fact) => fact.fact_id));
+  const selectedAcceptedCount = selected.filter((id) => acceptedFactIds.has(id)).length;
+  const candidateFactIds = new Set((run?.facts ?? []).filter((fact) => fact.verification_status !== "verified").map((fact) => fact.fact_id));
+  const selectedCandidateCount = selected.filter((id) => candidateFactIds.has(id)).length;
+  const identityFacts = [...(run?.facts ?? []), ...acceptedFacts];
+  const pending = candidates.filter((fact) => fact.verification_status === "pending").length;
+  const visibleFactGroups = run ? groupReviewFacts(
+    candidates.filter((fact) => fact.verification_status !== "verified" && (showRejected || fact.verification_status !== "rejected")),
+    university.name, identityFacts,
+  ) : [];
+  const acceptedFactGroups = acceptedFacts.length ? groupReviewFacts(acceptedFacts, university.name, identityFacts) : [];
 
   function load(detail: CardDetail) {
     setCard(detail); setWebsite(detail.website); setRun(detail.run); onRunChange(detail.run); setJob(detail.job);
@@ -147,6 +232,11 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         detail.job.identity?.expected_revision === detail.run?.revision) setMaterial(detail.job.result as Material);
   }
 
+  function showCandidates() {
+    setReviewTab("candidates");
+    onShowFacts();
+  }
+
   useEffect(() => {
     let active = true;
     if (university.backendId) api<CardDetail>(`/cards/${encodeURIComponent(university.backendId)}`)
@@ -155,8 +245,8 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     return () => { active = false; };
   }, [university.backendId]);
 
-  useEffect(() => { setSelected([]); setPastChanges(null); setRecheckConfirmed(false); }, [run?.run_id, run?.revision]);
-  useEffect(() => { setSourceChecked(false); setReplacePrevious(false); }, [run?.run_id, run?.revision, selected]);
+  useEffect(() => { setSelected([]); setPastChanges(null); setRecheckConfirmed(false); setReviewTab("candidates"); }, [run?.run_id, run?.revision]);
+  useEffect(() => { setSourceChecked(false); setReplacePrevious(false); }, [run?.run_id, run?.revision, selected.join("|")]);
 
   useEffect(() => {
     if (!run || !card) return;
@@ -186,6 +276,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
           if (next.result?.material_id) setMaterial(next.result as Material);
           if (next.status === "failed") {
             setPreviewAfterGeneration(false);
+            setPreviewAfterGenerationFrom(null);
             setError(next.message + (next.result?.code ? ` (${errorText(new Error(next.result.code))})` : ""));
           }
         }
@@ -211,14 +302,17 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         include_institution: includeInstitution,
         pdf_sources: pdfUrl.trim() ? [{url: pdfUrl.trim(), pages}] : [],
       });
-      setRun(null); onRunChange(null); setJob(next); onShowFacts();
+      setRun(null); onRunChange(null); setJob(next); showCandidates();
       return "Задание сбора создано. Состояние и результаты появятся в карточке руководства.";
     } catch (failure) { const message = errorText(failure); setError(message); return message; }
     finally { setSaving(false); }
   }
 
-  async function review(decision: "accept" | "reject") {
+  async function review(decision: "accept" | "reject" | "revoke") {
     if (!run) return;
+    const decisionIds = decision === "revoke" ? selected.filter((id) => acceptedFactIds.has(id))
+      : selected.filter((id) => candidateFactIds.has(id));
+    if (!decisionIds.length) { setError(decision === "revoke" ? "Выберите принятые сведения для отмены." : "Выберите сведения для решения."); return; }
     if (!reviewer.trim() || !reason.trim()) { setError("Укажите проверяющего и основание решения."); return; }
     if (decision === "accept" && !sourceChecked) { setError("Подтвердите проверку по первоисточникам."); return; }
     if (decision === "accept" && (!currentComparison || retirementIds.length > 0 && !replacePrevious)) {
@@ -228,7 +322,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     try {
       const updated = await post<ResearchRun>(`/runs/${run.run_id}/reviews`, {
         expected_revision: run.revision, reviewer,
-        decisions: selected.map((fact_id) => ({ fact_id, decision, source_checked: sourceChecked, reason })),
+        decisions: decisionIds.map((fact_id) => ({ fact_id, decision, source_checked: decision === "revoke" ? false : sourceChecked, reason })),
         retirements: decision === "accept" ? retirementIds.map((fact_id) => ({fact_id, source_checked: sourceChecked, reason})) : [],
       });
       setRun(updated); onRunChange(updated); setMaterial(null);
@@ -266,9 +360,9 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
 
   async function generate(): Promise<CardActionResult> {
     if (busy) return { message: "Для карточки уже выполняется задание. Дождитесь его завершения." };
-    if (!run || (currentComparison && !accepted)) {
+    if (!run || (!accepted && !material)) {
       const message = "Для презентации сначала примите проверенные факты о руководстве.";
-      setError(message); onShowFacts(); return { message };
+      setError(message); showCandidates(); return { message };
     }
     if (factsToRecheck.length) {
       const message = errorText(new Error("facts_require_freshness_check"));
@@ -308,31 +402,87 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
 
   async function openPreview() {
     if (!material) return false;
+    const currentMaterial = material;
+    setPreviewOpen(true);
     setPreviewLoading(true); setError("");
+    setPreviewError(""); setPreviewActionError(""); setPresentationPreview(null); setBriefPreview("");
+    setSavedMaterialId(null);
     try {
-      const response = await fetch(material.brief_url, { cache: "no-store" });
-      if (!response.ok) throw new Error("preview_unavailable");
-      setPreview(await response.text());
-      setPreviewOpen(true);
+      const previewRequest = downloadFormat === "docx"
+        ? fetch(currentMaterial.brief_url, { cache: "no-store" }).then(async (response) => {
+          if (!response.ok) throw new Error("presentation_preview_unavailable");
+          return response.text();
+        })
+        : api<PptxPreviewData>(`/materials/${encodeURIComponent(currentMaterial.material_id)}/preview`);
+      const [previewResult, reportsResult] = await Promise.allSettled([previewRequest, api<SavedMaterial[]>("/materials")]);
+      if (reportsResult.status === "fulfilled" && reportsResult.value.some((report) => report.id === currentMaterial.material_id)) {
+        setSavedMaterialId(currentMaterial.material_id);
+      }
+      if (previewResult.status === "rejected") throw previewResult.reason;
+      if (downloadFormat === "docx") setBriefPreview(previewResult.value as string);
+      else {
+        const result = previewResult.value as PptxPreviewData;
+        if (!result.slides.length) throw new Error("presentation_preview_unavailable");
+        setPresentationPreview(result);
+      }
       return true;
     } catch (failure) {
-      setError(failure instanceof Error && failure.message !== "preview_unavailable"
-        ? "Не удалось загрузить предварительный просмотр отчёта." : "Предварительный просмотр отчёта недоступен.");
+      setPreviewError(failure instanceof TypeError
+        ? "Нет связи с сервером. Проверьте, что backend запущен на порту 8000."
+        : errorText(failure));
       return false;
     } finally { setPreviewLoading(false); }
   }
 
+  async function downloadPresentation() {
+    if (!material) return;
+    setDownloadingPresentation(true);
+    setError("");
+    try {
+      await downloadFile(downloadUrl ?? material.download_url,
+        `${university.name} — отчёт.${downloadFormat}`);
+    } catch (failure) {
+      setError(errorText(failure));
+      setPreviewActionError(errorText(failure));
+    } finally {
+      setDownloadingPresentation(false);
+    }
+  }
+
+  async function addPresentationToReports() {
+    if (!material || downloadFormat !== "pptx") return;
+    setSavingToReports(true);
+    setPreviewActionError("");
+    try {
+      await api<{ saved: boolean }>(`/materials/${encodeURIComponent(material.material_id)}/report`, { method: "PUT" });
+      setSavedMaterialId(material.material_id);
+    } catch (failure) {
+      setPreviewActionError(errorText(failure));
+    } finally {
+      setSavingToReports(false);
+    }
+  }
+
+  async function openOrGeneratePresentation() {
+    setError("");
+    setFormatPickerOpen(true);
+  }
+
   async function continueToPreview() {
-    if (material) {
+    if (material?.presentation_variant === presentationVariant) {
       if (await openPreview()) setFormatPickerOpen(false);
       return;
     }
     if (busy && job?.task_type === "material") {
+      setPreviewAfterGenerationFrom(material?.material_id ?? null);
       setPreviewAfterGeneration(true);
       return;
     }
-    if (!run || !accepted) {
-      setError("Сначала соберите и примите проверенные факты о руководстве.");
+    if (!run || (!accepted && !material)) {
+      setError(!run
+        ? "Сначала нажмите «Найти и обновить информацию», чтобы собрать сведения."
+        : "Чтобы сформировать презентацию, проверьте кандидатов и примите факты из первоисточников.");
+      if (run) showCandidates();
       return;
     }
     if (busy) {
@@ -340,31 +490,33 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       return;
     }
     setError("");
+    setPreviewAfterGenerationFrom(material?.material_id ?? null);
     setPreviewAfterGeneration(true);
     const result = await generate();
     if (!result.queued) {
       setPreviewAfterGeneration(false);
+      setPreviewAfterGenerationFrom(null);
       setError(result.message);
       if (result.needsRecheck) {
         setFormatPickerOpen(false);
         showRecheck();
       }
-      return;
     }
   }
 
   function closeFormatPicker() {
     setFormatPickerOpen(false);
     setPreviewAfterGeneration(false);
+    setPreviewAfterGenerationFrom(null);
   }
 
   useEffect(() => {
-    if (!previewAfterGeneration || !material) return;
+    if (!previewAfterGeneration || !material || material.material_id === previewAfterGenerationFrom) return;
     setPreviewAfterGeneration(false);
+    setPreviewAfterGenerationFrom(null);
     void openPreview().then((opened) => { if (opened) setFormatPickerOpen(false); });
-  }, [material, previewAfterGeneration]);
+  }, [material, previewAfterGeneration, previewAfterGenerationFrom]);
 
-  const downloadUrl = material && `${material.download_url}?format=${downloadFormat}`;
   function showRecheck() {
     recheckRef.current?.scrollIntoView({ block: "center" });
     recheckRef.current?.focus({ preventScroll: true });
@@ -372,17 +524,28 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   useImperativeHandle(ref, () => ({ generate, refresh, showRecheck, openReportOptions: () => { setError(""); setFormatPickerOpen(true); } }));
 
   return <section className="content-card research-panel" aria-label="Актуализация и проверка фактов">
-    <div className="content-card__heading"><div><h2>Руководство и сведения об учреждении</h2><span>Официальные источники → проверка → презентация</span></div></div>
+    <div className="content-card__heading"><div><h2>Руководство и сведения об учреждении</h2></div></div>
     <div className="research-controls">
       <label>Официальный сайт<input type="url" value={website} disabled={Boolean(card) || Boolean(busy)}
         onChange={(event) => setWebsite(event.target.value)} placeholder="https://university.ru" aria-label="Официальный сайт" /></label>
-      <button className="button button--primary" type="button" disabled={Boolean(busy) || !website.trim()} onClick={() => { void refresh(); }}>Найти и обновить руководство</button>
       <label>Вариант презентации<select value={presentationVariant} disabled={Boolean(busy)}
         onChange={(event) => setPresentationVariant(event.target.value as "compact" | "detailed")}>
-        <option value="compact">Краткая карточка</option>
+        <option value="compact">Краткая карточка — 3 слайда</option>
         <option value="detailed">Подробная справка — все разделы</option>
       </select></label>
-      <button className="button button--soft" type="button" disabled={Boolean(busy) || !accepted} onClick={() => { void generate(); }}>Сформировать презентацию</button>
+    </div>
+    <fieldset className="research-meeting" disabled={Boolean(busy)}>
+      <legend>Контекст встречи</legend>
+      <div className="research-controls">
+        <label>Цель встречи<input value={meetingGoal} onChange={(event) => setMeetingGoal(event.target.value)}
+          maxLength={1000} placeholder="Например: обсудить подготовку ИТ-специалистов" /></label>
+        <label>Дата встречи (необязательно)<input type="date" value={meetingDate} onChange={(event) => setMeetingDate(event.target.value)} /></label>
+      </div>
+    </fieldset>
+    <div className="research-action-stack">
+      <button className="button button--primary" type="button" disabled={Boolean(busy) || !website.trim()} onClick={() => { void refresh(); }}>Найти и обновить информацию</button>
+      <button className="button button--soft" type="button" disabled={Boolean(busy)}
+        onClick={() => { void openOrGeneratePresentation(); }}>{busy && job?.task_type === "material" ? "Формируем презентацию…" : material?.presentation_variant === presentationVariant ? "Просмотреть и скачать презентацию" : material ? "Сформировать выбранный формат" : "Сформировать и просмотреть презентацию"}</button>
     </div>
     {factsToRecheck.length > 0 && <fieldset ref={recheckRef} tabIndex={-1} className="research-meeting" disabled={Boolean(busy)}>
       <legend>Повторная проверка перед экспортом</legend>
@@ -405,72 +568,9 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       <label className="research-ack"><input type="checkbox" checked={recheckConfirmed}
         onChange={(event) => setRecheckConfirmed(event.target.checked)} /> Я повторно сверил(а) все указанные сведения, значения актуальны</label>
     </fieldset>}
-    {run && (readyForReview.length > 0 || candidates.some((fact) => fact.verification_status === "verified")) && <div className="research-downloads">
-      <a className="button button--soft" href={`/api/v1/ai/runs/${encodeURIComponent(run.run_id)}/preview?expected_revision=${run.revision}&presentation_variant=${presentationVariant}`}
-        target="_blank" rel="noreferrer">Предпросмотр кандидатов (PPTX)</a>
-      <span>Для проверки содержания и вёрстки. Этот файл не означает принятие фактов.</span>
-    </div>}
-    <small>{presentationVariant === "compact" ? "Краткая карточка: руководитель, учреждение, повестка встречи. Полные значения и цитаты сохраняются в справке и заметках." : "Подробная справка: биография, руководство, показатели и отдельные слайды источников; объём зависит от данных."}</small>
-    <details className="research-source-options"><summary>Источники руководства, биографии и справки об учреждении</summary>
-      <label>Страница руководства<input type="url" value={leadershipUrl} disabled={Boolean(busy)}
-        onChange={(event) => setLeadershipUrl(event.target.value)} placeholder="https://university.ru/sveden/managers/" /></label>
-      <label>Официальная биография первого руководителя<input type="url" value={biographyUrl} disabled={Boolean(busy)}
-        onChange={(event) => setBiographyUrl(event.target.value)} placeholder="https://university.ru/about/rector/" /></label>
-      <label className="research-ack"><input type="checkbox" checked={includeInstitution} disabled={Boolean(busy)}
-        onChange={(event) => setIncludeInstitution(event.target.checked)} />Также собрать справку об учреждении</label>
-      <label>Страницы направлений, численности и структуры (до 3 ссылок, по одной в строке)<textarea value={institutionUrls} disabled={Boolean(busy)}
-        onChange={(event) => setInstitutionUrls(event.target.value)} rows={3} placeholder="https://university.ru/about/" /></label>
-      <label>Официальный отчёт в PDF<input type="url" value={pdfUrl} disabled={Boolean(busy)}
-        onChange={(event) => setPdfUrl(event.target.value)} placeholder="https://university.ru/report.pdf" /></label>
-      <label>Страницы PDF (номера с 1, до 20 страниц)<input value={pdfPages} disabled={Boolean(busy)}
-        onChange={(event) => setPdfPages(event.target.value)} placeholder="1, 3-5, 18" /></label>
-      <p>Без номеров обрабатываются первые 20 страниц PDF. Используются текстовые PDF и HTML официального сайта. Для численности нужны период и состав контингента; сканы пока не распознаются. Новые сведения потребуется проверить.</p>
-    </details>
-    <fieldset className="research-meeting" disabled={Boolean(busy)}>
-      <legend>Контекст встречи</legend>
-      <div className="research-controls">
-        <label>Цель встречи<input value={meetingGoal} onChange={(event) => setMeetingGoal(event.target.value)}
-          maxLength={1000} placeholder="Например: обсудить подготовку ИТ-специалистов" /></label>
-        <label>Дата встречи (необязательно)<input type="date" value={meetingDate} onChange={(event) => setMeetingDate(event.target.value)} /></label>
-      </div>
-      <small>Параметры используются при следующем формировании и сохраняются с материалом. Цель встречи не считается фактом о вузе.</small>
-    </fieldset>
-    <fieldset className="research-meeting" disabled={Boolean(busy)}>
-      <legend>Предложения к встрече</legend>
-      <button className="button button--soft" type="button" disabled={!accepted}
-        onClick={() => { void recommendPartnership(); }}>
-        {matching ? "Подбираем предложения…" : "Подобрать предложения"}
-      </button>
-      {partnershipMatches?.length === 0 && <small role="status">В принятых данных не нашлось оснований для предложений из каталога.</small>}
-      {Boolean(partnershipMatches?.length) && <>
-        <small>Проверьте аргументы и условия участия перед добавлением в презентацию.</small>
-        <ol>
-          {partnershipMatches?.map((match) => <li key={match.catalog_url}>
-            <p><strong>{match.product_name}</strong>{match.kind === "external_course" && " · внешний курс"}</p>
-            <p>{match.proposal}</p>
-            <p>{match.rationale}</p>
-            <p><strong>Вопрос для встречи</strong> {match.discussion_question}</p>
-            <p><a href={match.catalog_url} target="_blank" rel="noreferrer">Источник предложения</a></p>
-            <ul>{match.basis_fact_ids.map((id) => {
-              const fact = currentComparison?.approved_facts.find((item) => item.fact_id === id);
-              const source = fact?.evidence[0];
-              return fact && source ? <li key={id}><a href={source.url} target="_blank" rel="noreferrer">{fact.value}</a></li> : null;
-            })}</ul>
-          </li>)}
-        </ol>
-        <label className="research-ack"><input type="checkbox" checked={includePartnership}
-          onChange={(event) => { setIncludePartnership(event.target.checked); setMaterial(null); }} /> Добавить предложения в PPTX</label>
-      </>}
-    </fieldset>
     {job && <div className="research-progress" role="status"><span>{job.message}</span><progress value={job.progress} max={100} /></div>}
-    {error && !formatPickerOpen && <p className="research-error" role="alert">{error}</p>}
-    {material && <div className="research-downloads">
-      <button className="button button--soft" type="button" onClick={() => setFormatPickerOpen(true)}>Просмотреть и выбрать формат</button>
-      <a className="button button--primary" href={material.download_url}>Скачать PPTX</a>
-      <a className="button button--soft" href={material.brief_url} target="_blank" rel="noreferrer">Открыть справку</a>
-      <span>{material.presentation_variant === "compact" ? "Краткая карточка" : "Подробная справка"} · черновик для проверки перед встречей</span>
-    </div>}
-    {run && <p className="research-summary">На сверку: {readyForReview.length} · подтверждено повторным сбором: {reconfirmed} · в подтверждённой карточке: {accepted} · отклонено: {rejected} · {run.status === "partial" ? "сбор частичный" : run.status === "failed" ? "сбор не выполнен, прежние сведения сохранены" : "результат сохранён"}.
+    {error && <p className="research-error" role="alert">{error}</p>}
+    {run && <p className="research-summary">В последнем сборе: {run.facts.length} кандидатов · на проверке: {pending} · в подтверждённой карточке: {accepted} · отклонено: {rejected} · {run.status === "partial" ? "сбор частичный" : run.status === "failed" ? "сбор не выполнен; прежние принятые сведения сохранены" : "результат сохранён"}.
       {!showFacts && <button className="text-button" type="button" onClick={onShowFacts}>Проверить факты</button>}</p>}
     {run && Object.values(run.results).some((result) => result.run?.provider === "fixture") &&
       <p className="research-summary">Учебный прогон: сохранённые ответы модели, без обращения к GigaChat.</p>}
@@ -488,44 +588,124 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         {(run.parser_warnings?.length ?? 0) > 0 && <p>Парсер сообщил об ограничениях: {run.parser_warnings.length}. Проверьте, все ли нужные страницы обработаны.</p>}
         {gaps.length > 0 && <><p>Пропуски, отмеченные моделью (не доказывают отсутствие сведений):</p><ul>{gaps.map((gap) => <li key={gap}>{gap}</li>)}</ul></>}
       </details>}
-    {showFacts && run && <>
-      {currentComparison && <><ApprovedCard facts={currentComparison.approved_facts} labels={fields}/>
-        <ResearchChanges data={currentComparison} labels={fields} selected={selected} onSelect={setSelected} busy={Boolean(busy)}/></>}
-      {history.length > 0 && <details className="research-history"><summary>История сборов ({history.length})</summary>
-        {history.map((item) => <p key={item.run_id}>{new Date(item.created_at).toLocaleString("ru-RU")} · принятых сведений: {item.approved_count}
-          {item.run_id === run.run_id ? " · текущий сбор" : <button className="text-button" type="button" onClick={() => {
-            void api<ChangeSet>(`/runs/${item.run_id}/changes`).then(setPastChanges).catch((failure) => setError(errorText(failure)));
-          }}>Просмотреть</button>}</p>)}
-        {pastChanges && <><p>Архивный сбор: только просмотр.</p><ResearchChanges data={pastChanges} labels={fields}/>
-          <button className="text-button" type="button" onClick={() => setPastChanges(null)}>Закрыть архивный сбор</button></>}
-      </details>}
-      {problematic.length > 0 && <details className="research-change-detail"><summary>Конфликты и отклонённые сведения ({problematic.length})</summary>
-      <div className="research-facts">{problematic.map((fact) => <article className="research-fact" key={fact.fact_id}>
-        <label className="research-fact__selection"><input type="checkbox" checked={selected.includes(fact.fact_id)} disabled={Boolean(busy)}
-          hidden={fact.verification_status === "rejected"} onChange={(event) => setSelected((current) => event.target.checked ? [...current, fact.fact_id] : current.filter((id) => id !== fact.fact_id))} />
-          <span><strong>{fact.subject.person_name ?? fact.subject.entity_name ?? fact.contact_owner?.label ?? "Контакт организации"}</strong><span>{fields[fact.field] ?? fact.field}: {fact.value}</span></span>
-          <span className={`research-status research-status--${fact.verification_status}`}>{statuses[fact.verification_status]}</span>
-        </label>
-        {fact.subject.department && <p>Подразделение: {fact.subject.department}</p>}
-        {fact.metric_context && <p>Период: {fact.metric_context.period} · Состав: {fact.metric_context.scope} · Единица: {fact.metric_context.unit}{fact.metric_context.coverage ? ` · Охват: ${fact.metric_context.coverage}` : ""}</p>}
-        {fact.origin === "parser_projection" && <small>Кандидат из структурированных данных источника; требуется проверка сотрудником.</small>}
-        {fact.origin === "curated_candidate" && <small>Кандидат уточнён по источнику при подготовке предпросмотра; требуется проверка сотрудником.</small>}
-        {fact.issues.length > 0 && <div className="research-error">{fact.issues.map((code) => <p key={code}>{issueMessage(code)}</p>)}Принятие заблокировано до получения корректного кандидата.</div>}
-        <details><summary>Источники и подтверждающий текст ({fact.evidence.length})</summary>{fact.evidence.map((evidence, index) => <div className="research-evidence" key={index}>
-          <a href={evidence.page_number ? `${evidence.url.split("#")[0]}#page=${evidence.page_number}` : evidence.url} target="_blank" rel="noreferrer">{evidence.page_number ? `PDF · страница ${evidence.page_number} · ` : ""}{evidence.url}</a><small>Получено: {new Date(evidence.retrieved_at).toLocaleString("ru-RU")}</small><blockquote>{evidence.quote}</blockquote>
-        </div>)}</details>
-      </article>)}</div></details>}
-      {(readyForReview.length > 0 || problematic.some((fact) => fact.verification_status !== "rejected")) && <div className="research-review">
-        {blockedSelection && <p className="research-ack">В выбранных сведениях есть конфликт или ошибка. Их можно отклонить.</p>}
+    {showFacts && run && reviewOutlet && createPortal(<section className="content-card review-workspace" aria-label="Проверка найденных сведений">
+      <div className="research-review-tabs" role="tablist" aria-label="Разделы проверки">
+        <button className={`research-review-tab${reviewTab === "candidates" ? " research-review-tab--active" : ""}`} type="button" role="tab"
+          id="research-candidates-tab" aria-selected={reviewTab === "candidates"} aria-controls="research-candidates-panel" onClick={() => setReviewTab("candidates")}>
+          К принятию <span>{pending}</span>
+        </button>
+        <button className={`research-review-tab${reviewTab === "conflicts" ? " research-review-tab--active" : ""}`} type="button" role="tab"
+          id="research-conflicts-tab" aria-selected={reviewTab === "conflicts"} aria-controls="research-conflicts-panel" onClick={() => setReviewTab("conflicts")}>
+          Конфликты <span>{conflictCount}</span>
+        </button>
+        <button className={`research-review-tab${reviewTab === "accepted" ? " research-review-tab--active" : ""}`} type="button" role="tab"
+          id="research-accepted-tab" aria-selected={reviewTab === "accepted"} aria-controls="research-accepted-panel" onClick={() => setReviewTab("accepted")}>
+          Принято <span>{accepted}</span>
+        </button>
+      </div>
+      {reviewTab === "conflicts" ? <div id="research-conflicts-panel" role="tabpanel" aria-labelledby="research-conflicts-tab">
+        {currentComparison ? <ResearchChanges data={currentComparison} labels={fields} selected={selected} onSelect={setSelected} busy={Boolean(busy)} onlyConflicts />
+          : <p className="research-review-empty" role="status">Сравнение появится после завершения проверки данных.</p>}
+        {selected.length > 0 && <button className="text-button" type="button" onClick={() => setReviewTab("candidates")}>
+          Перейти к принятию выбранных сведений ({selected.length})</button>}
+        {history.length > 0 && <details className="research-history"><summary>История сборов ({history.length})</summary>
+          {history.map((item) => <p key={item.run_id}>{new Date(item.created_at).toLocaleString("ru-RU")} · принятых сведений: {item.approved_count}
+            {item.run_id === run.run_id ? " · текущий сбор" : <button className="text-button" type="button" onClick={() => {
+              void api<ChangeSet>(`/runs/${item.run_id}/changes`).then(setPastChanges).catch((failure) => setError(errorText(failure)));
+            }}>Просмотреть</button>}</p>)}
+          {pastChanges && <><p>Архивный сбор: только просмотр.</p><ResearchChanges data={pastChanges} labels={fields}/>
+            <button className="text-button" type="button" onClick={() => setPastChanges(null)}>Закрыть архивный сбор</button></>}
+        </details>}
+      </div> : reviewTab === "accepted" ? <div id="research-accepted-panel" role="tabpanel" aria-labelledby="research-accepted-tab">
+        {acceptedFactGroups.length ? <>
+          <p className="research-review-empty">Выберите принятые сведения, чтобы отменить их принятие. Если они заменили прежние данные, прежние значения восстановятся.</p>
+          <div className="research-facts">{acceptedFactGroups.map((group) => <article className="research-fact research-fact--group" key={group.key}>
+            <header className="research-fact__group-heading">
+              <label className="research-fact__group-select"><input type="checkbox" checked={group.facts.every((fact) => selected.includes(fact.fact_id))}
+                disabled={Boolean(busy)} aria-label={`Выбрать принятые сведения: ${group.title}`}
+                onChange={(event) => setSelected((current) => event.target.checked
+                  ? [...new Set([...current, ...group.facts.map((fact) => fact.fact_id)])]
+                  : current.filter((id) => !group.facts.some((fact) => fact.fact_id === id)))} />
+                <span><strong>{group.title}</strong><small>{group.description}</small></span>
+              </label>
+              <span className="research-fact__group-count">{group.facts.length} сведений</span>
+            </header>
+            <div className="research-fact__items">{group.facts.map((fact) => <section className="research-fact__item" key={fact.fact_id}>
+              <label className="research-fact__item-select"><input type="checkbox" checked={selected.includes(fact.fact_id)} disabled={Boolean(busy)}
+                aria-label={`Выбрать для отмены: ${group.title} — ${fields[fact.field] ?? fact.field}`}
+                onChange={(event) => setSelected((current) => event.target.checked
+                  ? [...current, fact.fact_id] : current.filter((id) => id !== fact.fact_id))} />
+                <span><strong>{fields[fact.field] ?? fact.field}</strong><span>{fact.value}</span></span>
+                <span className="research-status research-status--verified">Принято</span>
+              </label>
+              {fact.subject.department && <p>Подразделение: {fact.subject.department}</p>}
+              <details><summary>Источники ({fact.evidence.length})</summary>{fact.evidence.map((evidence, index) => <div className="research-evidence" key={index}>
+                <a href={evidence.page_number ? `${evidence.url.split("#")[0]}#page=${evidence.page_number}` : evidence.url} target="_blank" rel="noreferrer">{evidence.url}</a>
+                <blockquote>{evidence.quote}</blockquote>
+              </div>)}</details>
+            </section>)}</div>
+          </article>)}</div>
+          <div className="research-review">
+            <label>Проверяющий<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="Имя и фамилия" /></label>
+            <label>Основание отмены<input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Почему отменяется принятие" /></label>
+            <div className="research-controls"><button className="button button--soft" type="button" disabled={Boolean(busy) || !selectedAcceptedCount}
+              onClick={() => { void review("revoke"); }}>Отменить принятие ({selectedAcceptedCount})</button></div>
+          </div>
+        </> : <p className="research-review-empty" role="status">Пока нет принятых сведений.</p>}
+      </div> : <div id="research-candidates-panel" role="tabpanel" aria-labelledby="research-candidates-tab">
+      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(run.facts
+        .filter((fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length)
+        .map((fact) => fact.fact_id))}>Выбрать все факты без ошибок</button>
+      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(run.facts
+        .filter((fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length
+          && fact.subject.person_name && !fact.subject.department)
+        .map((fact) => fact.fact_id))}>Выбрать сотрудников без привязки к подразделению</button>
+      {rejected > 0 && <button className="text-button" type="button" onClick={() => setShowRejected((value) => !value)}>
+        {showRejected ? "Скрыть" : "Показать"} автоматически отклонённые факты ({rejected})</button>}
+      <div className="research-facts">{visibleFactGroups.map((group) => {
+        const eligibleIds = group.facts.filter((fact) => fact.verification_status === "pending"
+          && fact.validation_status === "passed" && !fact.issues.length).map((fact) => fact.fact_id);
+        const groupSelected = eligibleIds.length > 0 && eligibleIds.every((id) => selected.includes(id));
+        const pendingCount = group.facts.filter((fact) => fact.verification_status === "pending").length;
+        return <article className={`research-fact${group.facts.length > 1 ? " research-fact--group" : ""}`} key={group.key}>
+          {group.facts.length > 1 && <header className="research-fact__group-heading">
+            <label className="research-fact__group-select"><input type="checkbox" checked={groupSelected} disabled={Boolean(busy) || eligibleIds.length === 0}
+              aria-label={`Выбрать проверяемые факты: ${group.title}`}
+              onChange={(event) => setSelected((current) => event.target.checked
+                ? [...new Set([...current, ...eligibleIds])] : current.filter((id) => !eligibleIds.includes(id)))} />
+              <span><strong>{group.title}</strong><small>{group.description}</small></span>
+            </label>
+            <span className="research-fact__group-count">{group.facts.length} сведений{pendingCount ? ` · на проверке: ${pendingCount}` : ""}</span>
+          </header>}
+          <div className="research-fact__items">{group.facts.map((fact) => <section className="research-fact__item" key={fact.fact_id}>
+            <label className="research-fact__item-select"><input type="checkbox" checked={selected.includes(fact.fact_id)} disabled={Boolean(busy)}
+              aria-label={`Выбрать: ${group.title} — ${fields[fact.field] ?? fact.field}`}
+              onChange={(event) => setSelected((current) => event.target.checked
+                ? [...current, fact.fact_id] : current.filter((id) => id !== fact.fact_id))} />
+              <span><strong>{group.facts.length === 1 ? group.title : fields[fact.field] ?? fact.field}</strong><span>{group.facts.length === 1 ? `${fields[fact.field] ?? fact.field}: ${fact.value}` : fact.value}</span></span>
+              <span className={`research-status research-status--${fact.verification_status}`}>{statuses[fact.verification_status]}</span>
+            </label>
+            {fact.subject.department && <p>Подразделение: {fact.subject.department}</p>}
+            {fact.metric_context && <p>Период: {fact.metric_context.period} · Состав: {fact.metric_context.scope} · Единица: {fact.metric_context.unit}{fact.metric_context.coverage ? ` · Охват: ${fact.metric_context.coverage}` : ""}</p>}
+            {fact.origin === "parser_projection" && <small>Кандидат из структурированных данных источника; требуется проверка сотрудником.</small>}
+            {fact.origin === "curated_candidate" && <small>Кандидат уточнён по источнику при подготовке предпросмотра; требуется проверка сотрудником.</small>}
+            {fact.issues.length > 0 && <div className="research-error">{fact.issues.map((code) => <p key={code}>{issueMessage(code)}</p>)}Принятие заблокировано до получения корректного кандидата.</div>}
+            <details><summary>Источники и подтверждающий текст ({fact.evidence.length})</summary>{fact.evidence.map((evidence, index) => <div className="research-evidence" key={index}>
+              <a href={evidence.page_number ? `${evidence.url.split("#")[0]}#page=${evidence.page_number}` : evidence.url} target="_blank" rel="noreferrer">{evidence.page_number ? `PDF · страница ${evidence.page_number} · ` : ""}{evidence.url}</a><small>Получено: {new Date(evidence.retrieved_at).toLocaleString("ru-RU")}</small><blockquote>{evidence.quote}</blockquote>
+            </div>)}</details>
+          </section>)}</div>
+        </article>;
+      })}</div>
+      <div className="research-review">
         <label>Проверяющий<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="Имя и фамилия" /></label>
         <label>Основание решения<input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Что сверено или почему отклонено" /></label>
         <label className="research-ack"><input type="checkbox" checked={sourceChecked} onChange={(event) => setSourceChecked(event.target.checked)} />Я проверил(а) выбранные факты по действующим первоисточникам</label>
         {retirementIds.length > 0 && <label className="research-ack research-replacement"><input type="checkbox" checked={replacePrevious}
           onChange={(event) => setReplacePrevious(event.target.checked)} />Подтверждаю замену: прежних сведений будет архивировано {retirementIds.length}. Их значения и решения останутся в истории.</label>}
-        <div className="research-controls"><button className="button button--primary" type="button" disabled={Boolean(busy) || !selected.length || blockedSelection} onClick={() => { void review("accept"); }}>Принять выбранные ({selected.length})</button>
-        <button className="button button--soft" type="button" disabled={Boolean(busy) || !selected.length} onClick={() => { void review("reject"); }}>Отклонить выбранные</button></div>
-      </div>}
-    </>}
+        <div className="research-controls"><button className="button button--primary" type="button" disabled={Boolean(busy) || !selectedCandidateCount} onClick={() => { void review("accept"); }}>Принять выбранные ({selectedCandidateCount})</button>
+        <button className="button button--soft" type="button" disabled={Boolean(busy) || !selectedCandidateCount} onClick={() => { void review("reject"); }}>Отклонить выбранные</button></div>
+      </div>
+      </div>}</section>, reviewOutlet)}
     {formatPickerOpen && typeof document !== "undefined" && createPortal(<div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeFormatPicker(); }}>
       <section className="report-format-dialog" role="dialog" aria-modal="true" aria-labelledby="report-format-title">
         <header className="report-preview__header">
@@ -556,22 +736,31 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     {previewOpen && typeof document !== "undefined" && createPortal(<div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreviewOpen(false); }}>
       <section className="report-preview" role="dialog" aria-modal="true" aria-labelledby="report-preview-title">
         <header className="report-preview__header">
-          <div><span className="eyebrow">ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР</span><h2 id="report-preview-title">Отчёт к встрече: {university.name}</h2></div>
+          <div><span className="eyebrow">ПРЕДПРОСМОТР {downloadFormat.toUpperCase()}</span><h2 id="report-preview-title">Отчёт к встрече: {university.name}</h2></div>
           <button className="icon-button" type="button" onClick={() => setPreviewOpen(false)} aria-label="Закрыть предпросмотр"><Icon name="close" size={19} /></button>
         </header>
         <div className="report-preview__content">
-          {preview.split("\n").map((line, index) => {
+          {previewLoading && <div className="reports-empty" role="status"><Icon name="file" size={24} /><strong>Загружаем предпросмотр</strong><span>Открываем выбранный формат отчёта.</span></div>}
+          {previewError && <div className="reports-empty" role="alert"><Icon name="file" size={24} /><strong>Предпросмотр не загрузился</strong><span>{previewError}</span><button className="button button--soft" type="button" disabled={previewLoading} onClick={() => { void openPreview(); }}>Повторить</button></div>}
+          {!previewLoading && !previewError && presentationPreview && <PptxPreview preview={presentationPreview} />}
+          {!previewLoading && !previewError && downloadFormat === "docx" && briefPreview.split("\n").map((line, index) => {
             if (line.startsWith("# ")) return <h3 key={index}>{line.slice(2)}</h3>;
             if (line.startsWith("## ")) return <h4 key={index}>{line.slice(3)}</h4>;
-            if (line.startsWith("### ")) return <h5 key={index}>{line.slice(4)}</h5>;
-            if (line.startsWith("- ")) return <p className="report-preview__bullet" key={index}>{line.slice(2)}</p>;
-            if (!line.trim()) return <div className="report-preview__space" key={index} />;
-            return <p key={index}>{line.replaceAll("**", "")}</p>;
+            return line.trim() ? <p key={index}>{line}</p> : <br key={index} />;
           })}
         </div>
         <footer className="report-preview__actions">
-          <span>Предварительный просмотр отчёта · {downloadFormat.toUpperCase()}</span>
-          <a className="button button--primary" href={downloadUrl ?? undefined}><Icon name="download" size={16} /> Скачать {downloadFormat.toUpperCase()}</a>
+          <div className="report-preview__action-copy">
+            <span>{downloadFormat === "pptx" ? presentationPreview ? `${presentationPreview.slides.length} слайдов · файл PPTX` : "Файл PPTX" : "Предпросмотр справки · файл DOCX"}</span>
+            {previewActionError && <span className="report-preview__action-error" role="alert">{previewActionError}</span>}
+          </div>
+          <div className="report-preview__button-group">
+            {downloadFormat === "pptx" && <button className="button button--soft" type="button" disabled={!presentationPreview || savingToReports || savedMaterialId === material?.material_id} onClick={() => { void addPresentationToReports(); }}>
+              <Icon name={savedMaterialId === material?.material_id ? "check" : "plus"} size={16} />
+              {savingToReports ? "Добавляем…" : savedMaterialId === material?.material_id ? "Уже в отчётах" : "Добавить в отчёты"}
+            </button>}
+            <button className="button button--primary" type="button" disabled={!material || previewLoading || downloadingPresentation} onClick={() => { void downloadPresentation(); }}><Icon name="download" size={16} />{downloadingPresentation ? "Скачиваем…" : "Скачать на компьютер"}</button>
+          </div>
         </footer>
       </section>
     </div>, document.body)}

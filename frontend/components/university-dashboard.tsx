@@ -2,10 +2,12 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ResearchPanel, type ResearchHandle } from "@/components/research-panel";
-import { api, post, errorText, type ApiCard, type Fact, type ResearchRun, type SavedMaterial } from "@/lib/api";
+import { PptxPreview } from "@/components/pptx-preview";
+import { api, post, errorText, downloadFile, type ApiCard, type Fact, type PptxPreviewData, type ResearchRun, type SavedMaterial } from "@/lib/api";
 import { AgentChat } from "@/components/agent-chat";
 import { AgentSphere } from "@/components/agent-sphere";
 import { Icon, type IconName } from "@/components/icon";
+import { buildPersonAliases, personIdentityKey } from "@/lib/person-identity";
 import {
   initialsFor,
   type Section,
@@ -25,6 +27,7 @@ const tabs: { key: Section; label: string }[] = [
   { key: "contacts", label: "Руководство и контакты" },
   { key: "projects", label: "Проекты" },
   { key: "events", label: "Мероприятия" },
+  { key: "review", label: "Проверка" },
 ];
 
 export default function UniversityDashboard() {
@@ -49,6 +52,7 @@ export default function UniversityDashboard() {
   const [createWebsite, setCreateWebsite] = useState("");
   const [creating, setCreating] = useState(false);
   const researchRef = useRef<ResearchHandle>(null);
+  const [reviewOutlet, setReviewOutlet] = useState<HTMLDivElement | null>(null);
   const [runs, setRuns] = useState<Record<string, ResearchRun | null>>({});
   const [cardEditVersion, setCardEditVersion] = useState(0);
   const [reportSearch, setReportSearch] = useState("");
@@ -57,6 +61,13 @@ export default function UniversityDashboard() {
   const [reportsError, setReportsError] = useState("");
   const [reportFilter, setReportFilter] = useState("Все форматы");
   const [reportFilterOpen, setReportFilterOpen] = useState(false);
+  const [previewReport, setPreviewReport] = useState<SavedMaterial | null>(null);
+  const [presentationPreview, setPresentationPreview] = useState<PptxPreviewData | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const [reportDeleteTarget, setReportDeleteTarget] = useState<string | null>(null);
+  const [deletingReportId, setDeletingReportId] = useState<string | null>(null);
+  const [reportDeleteError, setReportDeleteError] = useState("");
   const [toast, setToast] = useState("");
 
   const selectedUniversity = universities.find((university) => university.id === selectedId);
@@ -69,6 +80,7 @@ export default function UniversityDashboard() {
     return matchesQuery && matchesRegion;
   });
   const filteredReports = reports.filter((report) => {
+    if (/^xls(?:x|m|b)?$/i.test(report.format.trim())) return false;
     const matchesQuery = `${report.name} ${report.format}`.toLocaleLowerCase("ru-RU").includes(reportSearch.toLocaleLowerCase("ru-RU").trim());
     return matchesQuery && (reportFilter === "Все форматы" || report.format === reportFilter);
   });
@@ -104,6 +116,26 @@ export default function UniversityDashboard() {
     return () => { active = false; };
   }, []);
 
+  useEffect(() => {
+    const restoreView = () => {
+      const params = new URLSearchParams(window.location.search);
+      const savedView = params.get("vuzView");
+      const nextView = navigation.some((item) => item.key === savedView) ? savedView as View : "universities";
+      const universityId = params.get("university");
+      setView(nextView);
+      if (nextView === "overview") setSection("about");
+      if (nextView === "events") setSection("events");
+      if (universityId) {
+        setSelectedId(universityId);
+        setHasChosenUniversity(true);
+      }
+      setReportFilterOpen(false);
+    };
+    window.addEventListener("popstate", restoreView);
+    restoreView();
+    return () => window.removeEventListener("popstate", restoreView);
+  }, []);
+
   useLayoutEffect(() => {
     const updateIndicator = () => {
       const tab = tabRefs.current[indicatorSection];
@@ -121,26 +153,77 @@ export default function UniversityDashboard() {
     window.setTimeout(() => setToast(""), 3200);
   };
 
-  const navigate = (nextView: View) => {
-    if ((nextView === "overview" || nextView === "events") && (!hasChosenUniversity || !selectedUniversity)) return;
+  const openPresentationPreview = async (report: SavedMaterial) => {
+    setPreviewReport(report);
+    setPresentationPreview(null);
+    setPreviewError("");
+    setPreviewLoading(true);
+    try {
+      const response = await fetch(report.preview_url, { cache: "no-store" });
+      if (!response.ok) throw new Error("preview_unavailable");
+      const preview = await response.json() as PptxPreviewData;
+      if (!preview.slides.length) throw new Error("preview_unavailable");
+      setPresentationPreview(preview);
+    } catch {
+      setPreviewError("Не удалось загрузить слайды презентации. Возможно, материал устарел.");
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const downloadPresentation = async (report: SavedMaterial) => {
+    try {
+      await downloadFile(report.download_url, `${report.name}.pptx`);
+    } catch (failure) {
+      notify(errorText(failure));
+    }
+  };
+
+  const deleteReport = async (report: SavedMaterial) => {
+    setDeletingReportId(report.id);
+    setReportDeleteError("");
+    try {
+      await api<{ deleted: boolean }>(`/materials/${encodeURIComponent(report.id)}/report`, { method: "DELETE" });
+      setReports((current) => current.filter((item) => item.id !== report.id));
+      setReportDeleteTarget(null);
+      notify("Отчет удален.");
+    } catch (failure) {
+      setReportDeleteError(errorText(failure));
+    } finally {
+      setDeletingReportId(null);
+    }
+  };
+
+  const changeView = (nextView: View, nextUniversityId = selectedId) => {
+    if (nextView === view) return;
+    const params = new URLSearchParams(window.location.search);
+    params.set("vuzView", nextView);
+    if (nextUniversityId) params.set("university", nextUniversityId);
+    else params.delete("university");
+    const nextUrl = `${window.location.pathname}?${params.toString()}${window.location.hash}`;
+    window.history.pushState(null, "", nextUrl);
     setView(nextView);
     if (nextView === "overview") setSection("about");
     if (nextView === "events") setSection("events");
     setReportFilterOpen(false);
   };
 
+  const navigate = (nextView: View) => {
+    if ((nextView === "overview" || nextView === "events") && (!hasChosenUniversity || !selectedUniversity)) return;
+    changeView(nextView);
+  };
+
   const openUniversity = (university: University) => {
     setSelectedId(university.id);
     setHasChosenUniversity(true);
-    setSection("about");
-    setView("overview");
+    changeView("overview", university.id);
   };
 
   const handleGlobalSearch = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setUniversitySearch(globalSearch);
     setRegionFilter("Все регионы");
-    setView("universities");
+    changeView("universities");
   };
 
   const openCreate = (suggestedName = "") => {
@@ -164,8 +247,7 @@ export default function UniversityDashboard() {
     setUniversitySearch("");
     setGlobalSearch("");
     setRegionFilter("Все регионы");
-    setSection("about");
-    setView("overview");
+    changeView("overview", university.id);
     notify("Создан черновик карточки. Факты можно добавить после проверки источников.");
     } catch (failure) { notify(errorText(failure)); }
     finally { setCreating(false); }
@@ -297,12 +379,12 @@ export default function UniversityDashboard() {
                 <input value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} placeholder="Поиск по вузам" aria-label="Поиск по вузам" />
               </form>
             </div>
-            <ProfileHero
-              university={selectedUniversity}
-              onPreview={() => researchRef.current?.openReportOptions()}
-              onDownload={() => { void researchRef.current?.generate(); }}
-              onChat={() => openChat("card")}
-            />
+            <ProfileHero university={selectedUniversity} />
+            <ResearchPanel key={selectedUniversity.id + "-" + cardEditVersion} ref={researchRef} university={selectedUniversity}
+              showFacts={section === "review"} reviewOutlet={reviewOutlet} onShowFacts={() => setSection("review")}
+              onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
+              onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
+                ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
             <div className="profile-tabs" role="tablist" aria-label="Разделы карточки" onMouseLeave={() => setHoveredSection(null)}>
               {tabs.map((tab) => (
                 <button
@@ -322,16 +404,13 @@ export default function UniversityDashboard() {
               ))}
               <span className="profile-tabs__indicator" aria-hidden="true" style={{ left: tabIndicator.left, width: tabIndicator.width }} />
             </div>
-            <ResearchPanel key={`${selectedUniversity.id}-${cardEditVersion}`} ref={researchRef} university={selectedUniversity}
-              showFacts={section === "contacts"} onShowFacts={() => setSection("contacts")}
-              onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
-              onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
-                ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
             <div className="profile-content page-enter" key={`${selectedUniversity.id}-${section}`}>
+              {section === "review" ? <div className="review-outlet" ref={setReviewOutlet} /> : <>
               {section === "about" && <AboutSection university={selectedUniversity} run={selectedRun} onAdd={() => openChat("card")} />}
               {section === "contacts" && <ContactsSection university={selectedUniversity} run={selectedRun} />}
               {section === "projects" && <ProjectsSection university={selectedUniversity} run={selectedRun} />}
               {section === "events" && <EventsSection university={selectedUniversity} run={selectedRun} />}
+              </>}
             </div>
           </section>
         )}
@@ -390,13 +469,32 @@ export default function UniversityDashboard() {
                   <div className="reports-empty"><Icon name="file" size={24} /><strong>Не удалось загрузить отчёты</strong><span>{reportsError}</span></div>
                 ) : <>
                   {filteredReports.map((report, index) => (
-                    <article className="report-row" key={report.id} style={{ animationDelay: `${index * 45}ms` }}>
+                    <article className={`report-row${reportDeleteTarget === report.id ? " report-row--delete-open" : ""}`} key={report.id} style={{ animationDelay: `${index * 45}ms` }}>
                       <div className={`report-format report-format--${report.format.toLowerCase()}`}>{report.format}</div>
                       <div className="report-row__name"><strong>{report.name}</strong><span>{report.stale ? "Факты изменились — сформируйте новую версию" : "Черновик по принятым фактам"}</span></div>
                       <time className="report-row__date">{new Date(report.created_at).toLocaleDateString("ru-RU")}</time>
-                      {report.stale ? <span className="demo-label">Архивная версия</span> : <a className="button button--small-primary" href={report.brief_url} target="_blank" rel="noreferrer">Справка</a>}
-                      {report.stale ? <span /> : <a className="icon-button icon-button--small" href={report.download_url} aria-label="Скачать PPTX"><Icon name="download" size={17} /></a>}
-                      <span />
+                      {report.stale ? <span className="demo-label">Архивная версия</span> : <button className="button button--small-primary report-preview-button" type="button" onClick={() => { void openPresentationPreview(report); }} aria-label={`Предпросмотр презентации: ${report.name}`}><Icon name="search" size={15} /><span>Предпросмотр</span></button>}
+                      {report.stale ? <span /> : <button className="icon-button icon-button--small report-download-button" type="button" onClick={() => { void downloadPresentation(report); }} aria-label="Скачать PPTX"><Icon name="download" size={17} /></button>}
+                      <div className="report-delete-control">
+                        <button className="icon-button icon-button--small report-delete-button" type="button"
+                          onClick={() => {
+                            setReportDeleteError("");
+                            setReportDeleteTarget((target) => target === report.id ? null : report.id);
+                          }}
+                          aria-label={`Удалить отчет: ${report.name}`} aria-expanded={reportDeleteTarget === report.id}
+                          aria-controls={`delete-report-${report.id}`}>
+                          <Icon name="trash" size={16} />
+                        </button>
+                        {reportDeleteTarget === report.id && <div className="report-delete-popover" id={`delete-report-${report.id}`} role="dialog" aria-label="Подтверждение удаления отчета">
+                          <strong>Удалить отчет?</strong>
+                          <span>{report.name}</span>
+                          {reportDeleteError && <span className="report-delete-popover__error" role="alert">{reportDeleteError}</span>}
+                          <div className="report-delete-popover__actions">
+                            <button className="button button--small-primary" type="button" disabled={deletingReportId === report.id} onClick={() => { void deleteReport(report); }}>{deletingReportId === report.id ? "Удаляем…" : "Удалить"}</button>
+                            <button className="button button--soft" type="button" disabled={deletingReportId === report.id} onClick={() => setReportDeleteTarget(null)}>Отмена</button>
+                          </div>
+                        </div>}
+                      </div>
                     </article>
                   ))}
                   {filteredReports.length === 0 && (
@@ -405,10 +503,33 @@ export default function UniversityDashboard() {
                 </>}
               </div>
             </div>
-            <p className="reports-disclaimer">Файлы сохраняются после фактической сборки презентации. Перед встречей проверьте итоговый текст.</p>
+            <p className="reports-disclaimer">В отчёты добавляются только материалы, которые вы сохранили вручную. Перед встречей проверьте итоговый текст.</p>
           </section>
         )}
       </main>
+
+      {previewReport && (
+        <div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreviewReport(null); }}>
+          <section className="report-preview" role="dialog" aria-modal="true" aria-labelledby="saved-presentation-preview-title">
+            <header className="report-preview__header">
+              <div><span className="eyebrow">ПРЕДПРОСМОТР ПРЕЗЕНТАЦИИ</span><h2 id="saved-presentation-preview-title">{previewReport.name}</h2></div>
+              <button className="icon-button" type="button" onClick={() => setPreviewReport(null)} aria-label="Закрыть предпросмотр"><Icon name="close" size={19} /></button>
+            </header>
+            <div className="report-preview__content">
+              {previewLoading && <div className="reports-empty"><Icon name="file" size={24} /><strong>Загружаем презентацию</strong><span>Подготавливаем предварительный просмотр слайдов.</span></div>}
+              {previewError && <div className="reports-empty" role="alert"><Icon name="file" size={24} /><strong>Предпросмотр недоступен</strong><span>{previewError}</span></div>}
+              {!previewLoading && !previewError && presentationPreview && <PptxPreview preview={presentationPreview} />}
+            </div>
+            <footer className="report-preview__actions">
+              <span>{previewLoading ? "Загрузка слайдов…" : presentationPreview ? `${presentationPreview.slides.length} слайдов · предпросмотр файла PPTX` : ""}</span>
+              <div className="report-preview__button-group">
+                <button className="button button--soft" type="button" disabled><Icon name="check" size={16} />Уже в отчётах</button>
+                <button className="button button--primary" type="button" disabled={!presentationPreview} onClick={() => { void downloadPresentation(previewReport); }}><Icon name="download" size={16} />Скачать на компьютер</button>
+              </div>
+            </footer>
+          </section>
+        </div>
+      )}
 
       <AgentSphere onClick={() => openChat("general")} hidden={chatOpen} />
       <AgentChat key={chatMode === "card" ? chatCard?.backendId : "general"} open={chatOpen}
@@ -447,9 +568,7 @@ export default function UniversityDashboard() {
   );
 }
 
-function ProfileHero({ university, onPreview, onDownload, onChat }: {
-  university: University; onPreview: () => void; onDownload: () => void; onChat: () => void;
-}) {
+function ProfileHero({ university }: { university: University }) {
   return (
     <section className="profile-hero">
       <div className="profile-hero__decor profile-hero__decor--one" />
@@ -457,12 +576,7 @@ function ProfileHero({ university, onPreview, onDownload, onChat }: {
       <div className="profile-hero__copy">
         <span className="profile-hero__overline">КАРТОЧКА ОБРАЗОВАТЕЛЬНОЙ ОРГАНИЗАЦИИ</span>
         <h1>{university.name}</h1>
-        <p className="profile-hero__meta"><Icon name="pin" size={15} /> {university.city}<span className="meta-separator">·</span>Проверка сведений по первоисточникам</p>
-        <div className="profile-hero__actions">
-          <button className="button button--primary profile-hero__download" type="button" onClick={onDownload}><Icon name="download" size={16} /> Сформировать материалы</button>
-          <button className="button button--soft profile-hero__download" type="button" onClick={onPreview}><Icon name="search" size={16} /> Просмотреть и выбрать формат</button>
-          <button className="button button--soft profile-hero__download" type="button" onClick={onChat}><Icon name="spark" size={16} /> Обсудить с агентом</button>
-        </div>
+        <p className="profile-hero__meta"><Icon name="pin" size={15} /> {university.city}</p>
       </div>
       <div className="profile-hero__metrics">
         <div className="hero-metric hero-metric--green"><span className="hero-metric__icon"><Icon name="spark" size={15} /></span><span>Точки соприкосновений</span><strong>—</strong></div>
@@ -490,7 +604,23 @@ function verifiedFacts(run: ResearchRun | null) {
   if (!run) return [];
   const retired = new Set(run.retired_fact_ids ?? []);
   const active = new Map([...(run.baseline_facts ?? []), ...run.facts].map((fact) => [fact.fact_id, fact]));
-  return [...active.values()].filter((fact) => isVerified(fact) && !retired.has(fact.fact_id));
+  const facts = [...active.values()].filter((fact) => isVerified(fact) && !retired.has(fact.fact_id));
+  const aliases = buildPersonAliases(facts.flatMap((fact) => {
+    const name = fact.subject.person_name ?? (fact.contact_owner?.kind === "person" ? fact.contact_owner.label : null);
+    return name ? [{ name, department: fact.subject.department }] : [];
+  }));
+  const seen = new Set<string>();
+  return facts.filter((fact) => {
+    const name = fact.subject.person_name ?? (fact.contact_owner?.kind === "person" ? fact.contact_owner.label : null);
+    const owner = name ? `person:${personIdentityKey(name, fact.subject.department, aliases)}`
+      : fact.subject.entity_id ? `entity:${fact.subject.entity_kind ?? "entity"}:${fact.subject.entity_id}`
+        : fact.contact_owner ? `contact:${fact.contact_owner.kind}:${fact.contact_owner.label.normalize("NFKC").toLocaleLowerCase("ru-RU").replace(/ё/g, "е").trim()}`
+          : `institution:${fact.subject.entity_name ?? ""}`;
+    const key = `${owner}\u0000${fact.field}\u0000${fact.value.normalize("NFKC").toLocaleLowerCase("ru-RU").replace(/ё/g, "е").replace(/\s+/g, " ").trim()}\u0000${JSON.stringify(fact.metric_context ?? null)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function groupVerifiedEntities(run: ResearchRun | null, kind: "project" | "event") {
@@ -525,21 +655,33 @@ function AboutSection({ university, run, onAdd }: { university: University; run:
 
 function ContactsSection({ university, run }: { university: University; run: ResearchRun | null }) {
   const people = new Map<string, { name: string; facts: Fact[] }>();
-  for (const fact of verifiedFacts(run)) {
+  const facts = verifiedFacts(run).filter((fact) => !fact.subject.entity_kind);
+  const aliases = buildPersonAliases(facts.flatMap((fact) => {
+    const name = fact.subject.person_name ?? (fact.contact_owner?.kind === "person" ? fact.contact_owner.label : null);
+    return name ? [{ name, department: fact.subject.department }] : [];
+  }));
+  for (const fact of facts) {
     if (fact.subject.entity_kind) continue;
-    const name = fact.subject.person_name ?? fact.contact_owner?.label ?? "Контакт организации";
-    const group = people.get(name) ?? { name, facts: [] };
+    const name = fact.subject.person_name ?? (fact.contact_owner?.kind === "person" ? fact.contact_owner.label : null) ?? fact.contact_owner?.label ?? "Контакт организации";
+    const key = fact.subject.person_name || fact.contact_owner?.kind === "person"
+      ? `person:${personIdentityKey(name, fact.subject.department, aliases)}`
+      : fact.contact_owner
+        ? `contact:${fact.contact_owner.kind}:${fact.contact_owner.label.normalize("NFKC").toLocaleLowerCase("ru-RU").replace(/ё/g, "е").trim()}`
+        : "contact:organization";
+    const group = people.get(key) ?? { name, facts: [] };
     group.facts.push(fact);
-    people.set(name, group);
+    if (name.split(/\s+/).length > group.name.split(/\s+/).length) group.name = name;
+    people.set(key, group);
   }
   const entries = [...people.entries()].map(([id, person]) => ({ id, ...person }));
+  const factPriority: Record<string, number> = { "appointment.position": 0, "contact.email": 1, "contact.phone": 2 };
   return (
     <section className="content-card contacts-card">
       <div className="content-card__heading"><span className="section-icon"><Icon name="phone" size={18} /></span><div><h2>Проверенное руководство и контакты</h2><span>{university.name} · данные из сохранённого исследования</span></div></div>
       {entries.length ? <div className="contact-list">
         {entries.map((person) => <article className="contact-row" key={person.id}>
           <span className="contact-row__avatar">{initialsFor(person.name)}</span>
-          <div className="contact-row__identity"><strong>{person.name}</strong>{person.facts.map((fact) => <span key={fact.fact_id}>{factLabels[fact.field] ?? fact.field}: {fact.value}</span>)}</div>
+          <div className="contact-row__identity"><strong>{person.name}</strong>{[...person.facts].sort((a, b) => (factPriority[a.field] ?? 3) - (factPriority[b.field] ?? 3)).map((fact) => <span key={fact.fact_id}>{factLabels[fact.field] ?? fact.field}: {fact.value}</span>)}</div>
           <div className="contact-row__methods">{person.facts.filter((fact) => fact.evidence[0]).slice(0, 2).map((fact) => <a key={fact.fact_id} href={fact.evidence[0].url} target="_blank" rel="noreferrer">Источник <Icon name="external" size={13} /></a>)}</div>
         </article>)}
       </div> : <div className="empty-inline"><span className="empty-inline__icon"><Icon name="phone" size={21} /></span><strong>Проверенных контактов пока нет</strong><p>Запустите сбор в панели выше и проверьте найденные факты и источники.</p></div>}

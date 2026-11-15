@@ -37,6 +37,10 @@ class DemoRepository(LLMRepository):
               id TEXT PRIMARY KEY, card_id TEXT NOT NULL REFERENCES llm_card(id),
               request_key TEXT NOT NULL, task_type TEXT NOT NULL,
               payload TEXT NOT NULL CHECK(json_valid(payload)), UNIQUE(card_id,request_key));
+            CREATE TABLE IF NOT EXISTS llm_saved_material (
+              material_id TEXT PRIMARY KEY REFERENCES llm_material(material_id), saved_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS llm_report_migration (
+              key TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS llm_chat_turn (
               id INTEGER PRIMARY KEY,
               card_id TEXT NOT NULL REFERENCES llm_card(id),
@@ -53,6 +57,10 @@ class DemoRepository(LLMRepository):
               answer TEXT NOT NULL CHECK(json_valid(answer)));
             CREATE INDEX IF NOT EXISTS llm_general_chat_history ON llm_general_chat_turn(user_id, id);
             ''')
+            # Keep reports that existed before explicit saving was introduced.
+            if not db.execute("SELECT 1 FROM llm_report_migration WHERE key='legacy_reports' ").fetchone():
+                db.execute("INSERT OR IGNORE INTO llm_saved_material(material_id,saved_at) SELECT material_id,created_at FROM llm_material")
+                db.execute("INSERT INTO llm_report_migration(key) VALUES ('legacy_reports')")
 
     def general_chat_history(self, user_id, limit):
         with closing(connect(self.path)) as db:
@@ -287,7 +295,9 @@ class DemoRepository(LLMRepository):
         with closing(connect(self.path)) as db:
             rows = db.execute("""SELECT m.material_id,m.created_at,m.run_id,m.payload,c.name
                 FROM llm_material m JOIN llm_run r ON r.run_id=m.run_id
-                JOIN llm_card c ON c.id=r.institution_id ORDER BY m.rowid DESC""").fetchall()
+                JOIN llm_card c ON c.id=r.institution_id
+                JOIN llm_saved_material s ON s.material_id=m.material_id
+                ORDER BY m.rowid DESC""").fetchall()
         result = []
         for row in rows:
             path = self.path.parent / "presentations" / f"{row['material_id']}.pptx"
@@ -303,5 +313,21 @@ class DemoRepository(LLMRepository):
             result.append({"id": row["material_id"], "name": f"{label}: {row['name']}", "presentation_variant": variant,
                 "format": "PPTX", "created_at": row["created_at"], "stale": stale,
                 "download_url": f"/api/v1/ai/materials/{row['material_id']}/download",
+                "preview_url": f"/api/v1/ai/materials/{row['material_id']}/preview",
                 "brief_url": f"/api/v1/ai/materials/{row['material_id']}/brief"})
         return result
+
+    def save_material_to_reports(self, material_id):
+        with closing(connect(self.path)) as db, db:
+            if not db.execute("SELECT 1 FROM llm_material WHERE material_id=?", (material_id,)).fetchone():
+                raise WorkflowError("material_not_found")
+            db.execute("INSERT OR IGNORE INTO llm_saved_material(material_id,saved_at) VALUES (?,?)",
+                       (material_id, stamp().isoformat()))
+        return {"saved": True}
+
+    def remove_material_from_reports(self, material_id):
+        with closing(connect(self.path)) as db, db:
+            if not db.execute("SELECT 1 FROM llm_saved_material WHERE material_id=?", (material_id,)).fetchone():
+                raise WorkflowError("report_not_found")
+            db.execute("DELETE FROM llm_saved_material WHERE material_id=?", (material_id,))
+        return {"deleted": True}

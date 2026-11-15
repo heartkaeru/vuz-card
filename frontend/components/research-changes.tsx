@@ -40,8 +40,9 @@ export function ApprovedCard({facts, labels}: {facts: Fact[]; labels: Record<str
   </details>;
 }
 
-export function ResearchChanges({data, labels, selected = [], onSelect, busy = false}: {
-  data: ChangeSet; labels: Record<string, string>; selected?: string[]; onSelect?: (ids: string[]) => void; busy?: boolean;
+export function ResearchChanges({data, labels, selected = [], onSelect, busy = false, onlyConflicts = false}: {
+  data: ChangeSet; labels: Record<string, string>; selected?: string[]; onSelect?: (ids: string[]) => void;
+  busy?: boolean; onlyConflicts?: boolean;
 }) {
   const reconfirmed = data.reconfirmed_facts ?? {};
   const matchedIds = new Set(Object.values(reconfirmed).flat());
@@ -49,9 +50,12 @@ export function ResearchChanges({data, labels, selected = [], onSelect, busy = f
   const selectedIds = new Set(selected);
   const isPending = (fact: Fact) => fact.verification_status === "pending" && !matchedIds.has(fact.fact_id);
   const groups = new Map<string, {label: string; changes: FactChange[]}>();
-  const missing = data.entries.filter((change) => change.kind === "not_confirmed");
+  const entries = onlyConflicts
+    ? data.entries.filter((change) => change.kind === "changed" || change.kind === "head_change")
+    : data.entries;
+  const missing = onlyConflicts ? [] : entries.filter((change) => change.kind === "not_confirmed");
   const refreshed = data.approved_facts.filter((fact) => Object.hasOwn(reconfirmed, fact.fact_id));
-  for (const change of data.entries) {
+  for (const change of entries) {
     if (change.kind === "not_confirmed" || change.after.every((fact) => matchedIds.has(fact.fact_id))
       || (onSelect && !change.after.some(isPending))) continue;
     const group = groups.get(change.group_id);
@@ -72,7 +76,8 @@ export function ResearchChanges({data, labels, selected = [], onSelect, busy = f
   }
 
   return <section className="research-changes" aria-label="Сравнение сведений">
-    <h3>{onSelect ? "Сведения на сверку" : "Результаты сбора"}</h3>
+    <h3>{onlyConflicts ? "Конфликты для сравнения" : onSelect ? "Сведения на сверку" : "Результаты сбора"}</h3>
+    {onlyConflicts && <p className="change-counts">Изменённые поля: {data.counts.changed} · возможная смена руководителя: {data.counts.head_change}</p>}
     {onSelect && groups.size === 0 && <p>Нет новых или изменившихся сведений, которые можно принять.</p>}
     {onSelect && groups.size > 0 && <p>Отметьте нужные сведения и примите решение внизу списка. Можно выбрать все поля объекта или указать их по отдельности.</p>}
     {onSelect && groups.size > 1 && <button type="button" className="text-button" disabled={busy}
@@ -98,7 +103,7 @@ export function ResearchChanges({data, labels, selected = [], onSelect, busy = f
         </article>)}
       </section>;
     })}
-    {refreshed.length > 0 && <details className="research-change-detail"><summary>Подтверждено повторным сбором ({refreshed.length})</summary>
+    {!onlyConflicts && refreshed.length > 0 && <details className="research-change-detail"><summary>Подтверждено повторным сбором ({refreshed.length})</summary>
       {refreshed.map((fact) => <div key={fact.fact_id}><strong>{fact.subject.person_name ?? fact.subject.entity_name ?? fact.contact_owner?.label}</strong>
         <Value fact={fact} labels={labels} reconfirmed/></div>)}
     </details>}

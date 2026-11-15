@@ -12,6 +12,40 @@ def normalized(value):
     return " ".join((value or "").lower().replace("ё", "е").split())
 
 
+PATRONYMIC_SUFFIXES = ("ович", "евич", "овна", "евна", "ична", "инична", "ич")
+
+
+def person_name_parts(value):
+    """Return order-independent given/surname tokens and an optional patronymic."""
+    tokens = re.findall(r"[^\W_]+(?:-[^\W_]+)*", normalized(value), flags=re.UNICODE)
+    patronymic_index = next((index for index, token in enumerate(tokens)
+                            if len(tokens) > 2 and token.endswith(PATRONYMIC_SUFFIXES)), None)
+    patronymic = tokens.pop(patronymic_index) if patronymic_index is not None else None
+    return " ".join(sorted(tokens)) or normalized(value), patronymic
+
+
+def person_aliases(facts):
+    """Map short names to a full form only when a scope has one known patronymic."""
+    patronymics = {}
+    for fact in facts:
+        if not fact.subject.person_name:
+            continue
+        core, patronymic = person_name_parts(fact.subject.person_name)
+        if patronymic:
+            scope = (core, normalized(fact.subject.department))
+            patronymics.setdefault(scope, set()).add(patronymic)
+    return {scope: next(iter(values)) if len(values) == 1 else None
+            for scope, values in patronymics.items()}
+
+
+def person_identity(fact, aliases=None):
+    core, patronymic = person_name_parts(fact.subject.person_name)
+    department = normalized(fact.subject.department)
+    if aliases:
+        patronymic = aliases.get((core, department)) or patronymic
+    return ("person", core, department, patronymic or "")
+
+
 def value_key(fact):
     if fact.metric_context and re.fullmatch(r"[\d\s]+", fact.value):
         return re.sub(r"\s", "", fact.value)
@@ -26,10 +60,10 @@ MULTIPLE = {"person.education", "person.degree", "person.academic_title", "perso
             "institution.education_levels", "institution.structure"}
 
 
-def slot(fact):
+def slot(fact, aliases=None):
     subject = fact.subject
     if subject.person_name:
-        owner = ("person", normalized(subject.person_name), normalized(subject.department))
+        owner = person_identity(fact, aliases)
     elif fact.contact_owner:
         owner = (fact.contact_owner.kind, normalized(fact.contact_owner.label),
                  normalized(getattr(subject, "department", None)))
@@ -48,10 +82,11 @@ def effective_facts(run):
     """Resolve active facts without granting a candidate human approval."""
     result = {}
     excluded = set(run.retired_fact_ids) | {f.fact_id for f in run.facts if f.verification_status == "rejected"}
+    aliases = person_aliases([*run.baseline_facts, *run.facts])
     for fact in [*run.baseline_facts, *run.facts]:
         if (fact.verification_status == "verified" and fact.validation_status == "passed"
                 and not fact.issues and fact.fact_id not in excluded):
-            result[(slot(fact), value_key(fact))] = fact
+            result[(slot(fact, aliases), value_key(fact))] = fact
     return list(result.values())
 
 
@@ -176,6 +211,7 @@ def compare_run(run):
     current = [f for f in run.facts if f.validation_status == "passed" and not f.issues
                and f.verification_status in {"pending", "verified"} and f.fact_id not in run.retired_fact_ids]
     active_ids = {f.fact_id for f in effective_facts(run)}
+    aliases = person_aliases([*baseline, *current])
     entries, suppressed = [], set()
 
     def entry(kind, key, before, after, retire=None):
@@ -201,20 +237,20 @@ def compare_run(run):
 
     baseline_ids = {f.fact_id for f in baseline}
     fresh = [f for f in current if f.fact_id not in baseline_ids]
-    old_names = {normalized(f.subject.person_name) for f in baseline if head_key(f)}
-    new_names = {normalized(f.subject.person_name) for f in fresh if head_key(f)}
+    old_names = {person_identity(f, aliases) for f in baseline if head_key(f)}
+    new_names = {person_identity(f, aliases) for f in fresh if head_key(f)}
     if len(old_names) == len(new_names) == 1 and old_names != new_names:
-        before = [f for f in baseline if normalized(f.subject.person_name) in old_names and not getattr(f.subject, "department", None)]
-        after = [f for f in current if normalized(f.subject.person_name) in new_names and not getattr(f.subject, "department", None)]
+        before = [f for f in baseline if person_identity(f, aliases) in old_names and not getattr(f.subject, "department", None)]
+        after = [f for f in current if person_identity(f, aliases) in new_names and not getattr(f.subject, "department", None)]
         entries.append(entry("head_change", ("head",), before, after, before))
         suppressed.update(f.fact_id for f in [*before, *after])
     old_groups, new_groups = {}, {}
     for fact in baseline:
         if fact.fact_id not in suppressed:
-            old_groups.setdefault(slot(fact), []).append(fact)
+            old_groups.setdefault(slot(fact, aliases), []).append(fact)
     for fact in fresh if run.previous_run_id else current:
         if fact.fact_id not in suppressed:
-            new_groups.setdefault(slot(fact), []).append(fact)
+            new_groups.setdefault(slot(fact, aliases), []).append(fact)
     for key in dict.fromkeys([*new_groups, *old_groups]):
         before, after = old_groups.get(key, []), new_groups.get(key, [])
         if not before:

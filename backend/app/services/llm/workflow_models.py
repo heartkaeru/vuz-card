@@ -39,7 +39,7 @@ class ResearchRun(StrictModel):
 
 class ReviewDecision(StrictModel):
     fact_id: str = Field(min_length=1)
-    decision: Literal["accept", "reject"]
+    decision: Literal["accept", "reject", "revoke"]
     source_checked: bool = False
     reason: str = Field(min_length=1)
 

@@ -28,12 +28,20 @@ export type ChangeSet = { run_id: string; revision: number; previous_run_id: str
   reconfirmed_facts?: Record<string, string[]>; warning: string };
 export type ResearchHistory = { run_id: string; revision: number; created_at: string; status: string; approved_count: number; candidate_count: number };
 export type PresentationVariant = "compact" | "detailed";
+export type PptxPreviewParagraph = { text: string; font_family: string; font_size_pt: number; color: string | null; bold: boolean; alignment: string };
+export type PptxPreviewShape =
+  | { type: "image"; image_key: string; x: number; y: number; width: number; height: number }
+  | { type: "text"; vertical_anchor: string; paragraphs: PptxPreviewParagraph[]; x: number; y: number; width: number; height: number };
+export type PptxPreviewData = {
+  width_inches: number; height_inches: number; images: Record<string, string>;
+  slides: { shapes: PptxPreviewShape[] }[];
+};
 export type PartnershipMatch = {
   product_name: string; proposal: string; rationale: string; discussion_question: string;
   catalog_url: string; basis_fact_ids: string[]; kind: "sber_product" | "external_course";
 };
 export type Material = { material_id: string; download_url: string; brief_url: string; presentation_variant?: PresentationVariant };
-export type SavedMaterial = { id: string; name: string; format: "PPTX"; created_at: string; stale: boolean; download_url: string; brief_url: string };
+export type SavedMaterial = { id: string; name: string; format: string; created_at: string; stale: boolean; download_url: string; preview_url: string; brief_url: string };
 export type Job = {
   job_id: string; status: string; task_type: string; progress: number; message: string;
   identity?: { expected_revision?: number; leadership_url?: string | null; biography_url?: string | null;
@@ -47,6 +55,13 @@ export type CardActionResult = { message: string; queued?: boolean; needsRecheck
 const errors: Record<string, string> = {
   gigachat_configuration_required: "На сервере не настроен доступ к GigaChat. Проверьте backend/.env и перезапустите сервер.",
   no_accepted_facts: "Сначала проверьте и примите факты по источникам.",
+  material_stale_after_review: "Факты изменились. Сформируйте новую версию презентации.",
+  material_not_found: "Презентация не найдена. Сформируйте ее заново.",
+  material_file_not_found: "Файл презентации не найден. Сформируйте материалы заново.",
+  report_not_found: "Отчет уже удален или недоступен. Обновите список отчетов.",
+  "Not Found": "Backend не распознал новый обработчик удаления. Перезапустите backend и повторите.",
+  "Method Not Allowed": "Backend не поддерживает удаление отчётов. Перезапустите backend и повторите.",
+  presentation_preview_unavailable: "Предпросмотр презентации недоступен.",
   facts_require_freshness_check: "Истёк срок проверки фактов. Откройте блок «Повторная проверка перед экспортом» в карточке.",
   fact_already_reconfirmed: "Эти сведения уже подтверждены повторным сбором. Обновите карточку.",
   run_not_ready_for_generation: "Сбор сведений ещё не завершён. Откройте карточку и проверьте статус задания.",
@@ -76,6 +91,7 @@ const errors: Record<string, string> = {
   card_job_already_running: "Для этой карточки уже выполняется задание.",
   facts_changed_during_generation: "Во время генерации факты изменились. Сформируйте материалы заново.",
   source_check_required: "Подтвердите проверку выбранных фактов по первоисточникам.",
+  fact_not_accepted: "Выбранные сведения уже не входят в принятые данные. Обновите карточку и повторите.",
   explicit_replacement_confirmation_required: "Изменения уже пересчитаны или не подтверждена замена прежних сведений. Обновите сравнение и подтвердите замену.",
   replacement_source_check_required: "Проверьте источники прежних и новых значений перед заменой.",
   ambiguous_head_replacement: "Найдено несколько вариантов руководства. Сначала отклоните неподходящих кандидатов и проверьте сравнение повторно.",
@@ -109,8 +125,25 @@ const errors: Record<string, string> = {
 };
 
 export function errorText(error: unknown) {
+  if (error instanceof TypeError && /fetch|network/i.test(error.message)) return "Не удалось подключиться к серверу. Убедитесь, что backend запущен.";
   return error instanceof Error ? errors[error.message] ?? (/^[a-z0-9_:.-]+$/.test(error.message)
     ? `Не удалось выполнить действие (код: ${error.message}).` : error.message) : "Не удалось выполнить действие.";
+}
+
+export async function downloadFile(path: string, filename: string) {
+  const response = await fetch(path, { cache: "no-store" });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(typeof body.detail === "string" ? body.detail : "Не удалось скачать файл.");
+  }
+  const blobUrl = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = blobUrl;
+  link.download = filename.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_");
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
 }
 
 export async function api<T>(path: string, options?: RequestInit): Promise<T> {
