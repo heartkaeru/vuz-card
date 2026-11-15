@@ -36,6 +36,8 @@ def render_markdown(draft: DraftResult, facts=None) -> str:
     lines += ["## Источники", ""]
     for fid, evidence_list in draft.sources.items():
         lines += [f"### {refs[fid]} — {fid}", ""]
+        if not evidence_list:
+            lines += ["Подтверждено сотрудником в чате.", ""]
         for evidence in evidence_list:
             lines += [f"- URL: {evidence.url}",
                       f"- Получено: {evidence.retrieved_at.isoformat()}",

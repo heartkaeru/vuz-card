@@ -137,20 +137,22 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
 
     if partnership_matches:
         for index, match in enumerate(partnership_matches):
-            slide = page("Предложения и партнерство со Сбером" + (f" · {index + 1}" if index else ""))
+            external = match.get("kind") == "external_course"
+            title = "Вариант обучения · внешний курс" if external else "Предложения и партнерство со Сбером"
+            slide = page(title + (f" · {index + 1}" if index else ""))
             put(slide, match["product_name"], .7, 1.55, 11.9, .62, 21, bold=True)
             put(slide, "Гипотеза для обсуждения: " + match["proposal"], .7, 2.35, 11.9, 1.05, 17)
             put(slide, "Основание: " + match["rationale"] + " " + citations(match["basis_fact_ids"]),
                 .7, 3.65, 11.9, 1.05, 17)
             put(slide, "Вопрос для встречи: " + match["discussion_question"], .7, 4.95, 11.9, .85, 17)
-            footer(slide, match["basis_fact_ids"], extra_link=(match["catalog_url"], "Каталог Сбера"))
+            footer(slide, match["basis_fact_ids"], extra_link=(match["catalog_url"],
+                   "Страница курса" if external else "Каталог Сбера"))
             slide.notes_slide.notes_text_frame.text += (
                 f"\n\nЗапись каталога: {match['catalog_url']}"
                 "\nСовпадение — гипотеза для обсуждения, не подтверждение партнёрства или доступности продукта."
             )
     else:
         slide = page("Предложения и партнерство со Сбером")
-        put(slide, "Данные матчинга с каталогом продуктов Сбера не переданы. "
-            "Предложения появятся после подключения каталога и сопоставления с принятыми фактами.",
+        put(slide, "Предложения из каталога в эту презентацию не включены.",
             .7, 1.75, 11.9, 1.6, 17)
         footer(slide, [])

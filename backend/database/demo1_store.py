@@ -7,6 +7,9 @@ from uuid import uuid4
 
 from .llm_store import LLMRepository, stamp
 from .schema import connect, execute_statements
+from parser.public_http import website_key
+from app.services.llm.card_edits import edited_fact
+from app.services.llm.changes import effective_facts, normalized
 from app.services.llm.workflow_models import WorkflowError
 
 
@@ -34,7 +37,124 @@ class DemoRepository(LLMRepository):
               id TEXT PRIMARY KEY, card_id TEXT NOT NULL REFERENCES llm_card(id),
               request_key TEXT NOT NULL, task_type TEXT NOT NULL,
               payload TEXT NOT NULL CHECK(json_valid(payload)), UNIQUE(card_id,request_key));
+            CREATE TABLE IF NOT EXISTS llm_chat_turn (
+              id INTEGER PRIMARY KEY,
+              card_id TEXT NOT NULL REFERENCES llm_card(id),
+              user_id TEXT NOT NULL,
+              run_id TEXT REFERENCES llm_run(run_id),
+              revision INTEGER,
+              question TEXT NOT NULL,
+              answer TEXT NOT NULL CHECK(json_valid(answer)));
+            CREATE INDEX IF NOT EXISTS llm_chat_history ON llm_chat_turn(user_id, card_id, id);
+            CREATE TABLE IF NOT EXISTS llm_general_chat_turn (
+              id INTEGER PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              question TEXT NOT NULL,
+              answer TEXT NOT NULL CHECK(json_valid(answer)));
+            CREATE INDEX IF NOT EXISTS llm_general_chat_history ON llm_general_chat_turn(user_id, id);
             ''')
+
+    def general_chat_history(self, user_id, limit):
+        with closing(connect(self.path)) as db:
+            rows = db.execute(
+                """SELECT id, question, answer FROM llm_general_chat_turn
+                   WHERE user_id=? ORDER BY id DESC LIMIT ?""", (user_id, limit),
+            ).fetchall()
+            return [{**dict(row), "answer": json.loads(row["answer"])} for row in reversed(rows)]
+
+    def save_general_chat_turn(self, user_id, last_id, question, answer, *, require_current=True):
+        with closing(connect(self.path)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            previous_id = db.execute(
+                "SELECT MAX(id) FROM llm_general_chat_turn WHERE user_id=?", (user_id,),
+            ).fetchone()[0]
+            if require_current and previous_id != last_id:
+                raise WorkflowError("chat_history_changed")
+            cursor = db.execute(
+                "INSERT INTO llm_general_chat_turn (user_id, question, answer) VALUES (?, ?, ?)",
+                (user_id, question, json.dumps(answer, ensure_ascii=False)),
+            )
+            return {"id": cursor.lastrowid, "question": question, "answer": answer}
+
+    def chat_snapshot(self, card_id, user_id, limit):
+        with closing(connect(self.path)) as db, db:
+            db.execute("BEGIN")
+            card = self._read_card(db, card_id)
+            run = self._read(db, card["latest_run"]) if card["latest_run"] else None
+            rows = db.execute(
+                """SELECT id, run_id, revision, question, answer FROM llm_chat_turn
+                   WHERE user_id=? AND card_id=? ORDER BY id DESC LIMIT ?""",
+                (user_id, card_id, limit),
+            ).fetchall()
+            return card, run, [{**dict(row), "answer": json.loads(row["answer"])} for row in reversed(rows)]
+
+    @staticmethod
+    def _read_card(db, card_id):
+        card = db.execute("SELECT * FROM llm_card WHERE id=?", (card_id,)).fetchone()
+        if card is None:
+            raise WorkflowError("card_not_found")
+        return dict(card)
+
+    def save_chat_turn(self, card_id, user_id, run_id, revision, last_id, question, answer):
+        with closing(connect(self.path)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            card = self._read_card(db, card_id)
+            if card["latest_run"] != run_id or (run_id and self._read(db, run_id).revision != revision):
+                raise WorkflowError("chat_card_changed")
+            previous_id = db.execute(
+                "SELECT MAX(id) FROM llm_chat_turn WHERE user_id=? AND card_id=?",
+                (user_id, card_id),
+            ).fetchone()[0]
+            if previous_id != last_id:
+                raise WorkflowError("chat_history_changed")
+            cursor = db.execute(
+                """INSERT INTO llm_chat_turn (card_id, user_id, run_id, revision, question, answer)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (card_id, user_id, run_id, revision, question, json.dumps(answer, ensure_ascii=False)),
+            )
+            return {"id": cursor.lastrowid, "question": question, "answer": answer}
+
+    def confirm_chat_edit(self, card_id, user_id, turn_id):
+        with closing(connect(self.path)) as db:
+            row = db.execute(
+                "SELECT run_id, revision FROM llm_chat_turn WHERE id=? AND card_id=? AND user_id=?",
+                (turn_id, card_id, user_id),
+            ).fetchone()
+        if row is None or row["run_id"] is None:
+            raise WorkflowError("chat_edit_not_found")
+        run_id, revision = row["run_id"], row["revision"]
+
+        def apply(run, db):
+            row = db.execute("SELECT answer FROM llm_chat_turn WHERE id=?", (turn_id,)).fetchone()
+            answer = json.loads(row["answer"])
+            edit = answer.get("edit")
+            if not edit or edit["status"] != "pending":
+                raise WorkflowError("chat_edit_not_pending")
+            if run.status not in {"needs_review", "partial", "failed"}:
+                raise WorkflowError("chat_edit_collection_running")
+            active = effective_facts(run)
+            old = next((fact for fact in active if fact.fact_id == edit["fact_id"]), None)
+            if old is None or old.value != edit["before"]:
+                raise WorkflowError("chat_card_changed")
+            now = stamp()
+            replacement = edited_fact(old, edit["after"], active).model_copy(update={
+                "fact_id": f"fact_{uuid4().hex}", "origin": "manual_edit", "evidence": [],
+                "reviewed_by": user_id, "reviewed_at": now, "last_checked_at": now,
+                "freshness_status": "within_window",
+            })
+            run.retired_fact_ids.append(old.fact_id)
+            run.facts.append(replacement)
+            db.execute("INSERT INTO llm_review VALUES (?,?,?,?,?,?,?,?,?,?)", (
+                f"review_{uuid4().hex}", run_id, revision + 1, old.fact_id, "manual_edit",
+                user_id, now.isoformat(), "Подтверждено сотрудником в чате",
+                old.model_dump_json(), replacement.model_dump_json(),
+            ))
+            edit["status"] = "applied"
+            answer["text"] = "Правка применена и сохранена в истории карточки."
+            db.execute("UPDATE llm_chat_turn SET answer=? WHERE id=?",
+                       (json.dumps(answer, ensure_ascii=False), turn_id))
+
+        self.mutate(run_id, revision, apply)
 
     @staticmethod
     def _check_target(db, institution, kind=None):
@@ -54,13 +174,42 @@ class DemoRepository(LLMRepository):
             raise WorkflowError("research_superseded_by_new_collection")
 
     def create_card(self, name, city, website):
+        with closing(connect(self.path)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            return self._create_card(db, name, city, website)
+
+    def _create_card(self, db, name, city, website):
         name, city = " ".join(name.split()), " ".join(city.split())
         digest = hashlib.sha256(json.dumps([name.casefold(), city.casefold(), website], ensure_ascii=False).encode()).hexdigest()[:24]
         card_id = f"draft:{digest}"
+        db.execute("INSERT OR IGNORE INTO llm_card(id,name,city,website,created_at) VALUES (?,?,?,?,?)",
+                   (card_id, name, city, website, stamp().isoformat()))
+        return self._read_card(db, card_id)
+
+    def start_card_intake(self, name, city, website, request_key, source_options):
         with closing(connect(self.path)) as db, db:
-            db.execute("INSERT OR IGNORE INTO llm_card(id,name,city,website,created_at) VALUES (?,?,?,?,?)",
-                       (card_id, name, city, website, stamp().isoformat()))
-        return self.card(card_id)
+            db.execute("BEGIN IMMEDIATE")
+            matches = [dict(row) for row in db.execute("SELECT * FROM llm_card")
+                       if website_key(row["website"]) == website_key(website)]
+            if len(matches) > 1 or (matches and city and matches[0]["city"]
+                                    and normalized(city) != normalized(matches[0]["city"])):
+                raise WorkflowError("chat_collection_card_ambiguous")
+            card = matches[0] if matches else self._create_card(db, name, city, website)
+            identity = {"version": card["version"], "leadership_url": None, **source_options}
+            previous = db.execute(
+                "SELECT payload FROM llm_job WHERE card_id=? AND request_key=?", (card["id"], request_key),
+            ).fetchone()
+            if previous:
+                job, _ = self._new_job(db, card["id"], request_key, "collect", identity)
+                return card, job, False
+            for row in db.execute("SELECT payload FROM llm_job WHERE card_id=? ORDER BY rowid DESC", (card["id"],)):
+                job = json.loads(row[0])
+                if job["status"] in {"queued", "running"}:
+                    if job["task_type"] != "collect":
+                        raise WorkflowError("card_job_already_running")
+                    return card, job, False
+            job, created = self._new_job(db, card["id"], request_key, "collect", identity)
+            return card, job, created
 
     def cards(self):
         with closing(connect(self.path)) as db:
@@ -68,30 +217,31 @@ class DemoRepository(LLMRepository):
 
     def card(self, card_id):
         with closing(connect(self.path)) as db:
-            row = db.execute("SELECT * FROM llm_card WHERE id=?", (card_id,)).fetchone()
-            if row is None:
-                raise WorkflowError("card_not_found")
-            return dict(row)
+            return self._read_card(db, card_id)
 
     def new_job(self, card_id, request_key, task_type, identity):
-        self.card(card_id)
         with closing(connect(self.path)) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            previous = db.execute("SELECT payload FROM llm_job WHERE card_id=? AND request_key=?", (card_id, request_key)).fetchone()
-            if previous:
-                job = json.loads(previous[0])
-                if job["identity"] != identity or job["task_type"] != task_type:
-                    raise WorkflowError("request_key_payload_mismatch")
-                return job, False
-            for row in db.execute("SELECT payload FROM llm_job WHERE card_id=?", (card_id,)):
-                if json.loads(row[0])["status"] in {"queued", "running"}:
-                    raise WorkflowError("card_job_already_running")
-            job = {"job_id": f"job_{uuid4().hex}", "card_id": card_id, "task_type": task_type,
-                   "status": "queued", "progress": 0, "message": "Задание создано",
-                   "created_at": stamp().isoformat(), "identity": identity, "result": None}
-            db.execute("INSERT INTO llm_job VALUES (?,?,?,?,?)", (
-                job["job_id"], card_id, request_key, task_type, json.dumps(job, ensure_ascii=False)))
-            return job, True
+            self._read_card(db, card_id)
+            return self._new_job(db, card_id, request_key, task_type, identity)
+
+    @staticmethod
+    def _new_job(db, card_id, request_key, task_type, identity):
+        previous = db.execute("SELECT payload FROM llm_job WHERE card_id=? AND request_key=?", (card_id, request_key)).fetchone()
+        if previous:
+            job = json.loads(previous[0])
+            if job["identity"] != identity or job["task_type"] != task_type:
+                raise WorkflowError("request_key_payload_mismatch")
+            return job, False
+        for row in db.execute("SELECT payload FROM llm_job WHERE card_id=?", (card_id,)):
+            if json.loads(row[0])["status"] in {"queued", "running"}:
+                raise WorkflowError("card_job_already_running")
+        job = {"job_id": f"job_{uuid4().hex}", "card_id": card_id, "task_type": task_type,
+               "status": "queued", "progress": 0, "message": "Задание создано",
+               "created_at": stamp().isoformat(), "identity": identity, "result": None}
+        db.execute("INSERT INTO llm_job VALUES (?,?,?,?,?)", (
+            job["job_id"], card_id, request_key, task_type, json.dumps(job, ensure_ascii=False)))
+        return job, True
 
     def job(self, job_id):
         with closing(connect(self.path)) as db:

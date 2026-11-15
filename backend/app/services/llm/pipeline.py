@@ -20,10 +20,18 @@ from .models import (
 )
 
 PROMPTS = Path(__file__).with_name("prompts")
+REVIEW_WINDOW_DAYS = 7
 
 
 class DraftValidationError(ValueError):
     pass
+
+
+def fact_needs_recheck(fact: Fact, now: datetime, window_days: int = REVIEW_WINDOW_DAYS) -> bool:
+    checked = fact.last_checked_at
+    return (fact.freshness_status != "within_window" or checked is None
+            or checked.utcoffset() is None or checked > now
+            or now - checked > timedelta(days=window_days))
 
 
 def normalize(text: str) -> str:
@@ -65,7 +73,7 @@ def chunks(text: str, size: int, overlap: int):
 
 class AssistantPipeline:
     def __init__(self, provider: JSONProvider, *, chunk_size: int = 12000,
-                 overlap: int = 1000, max_chunks: int = 50, review_window_days: int = 7):
+                 overlap: int = 1000, max_chunks: int = 50, review_window_days: int = REVIEW_WINDOW_DAYS):
         if (chunk_size < 100 or not 0 <= overlap < chunk_size // 2
                 or max_chunks < 1 or review_window_days < 1):
             raise ValueError("Invalid chunk limits")
@@ -236,15 +244,12 @@ class AssistantPipeline:
                     raise DraftValidationError("non_person_contact_has_person_subject")
             if (fact.institution_id != request.institution.id
                     or fact.validation_status != "passed" or fact.verification_status != "verified"
-                    or fact.issues or not fact.evidence or not fact.reviewed_by
+                    or fact.issues or (not fact.evidence and fact.origin != "manual_edit") or not fact.reviewed_by
                     or not fact.reviewed_at or fact.reviewed_at.utcoffset() is None
                     or fact.reviewed_at > now):
                 raise DraftValidationError("only_reviewed_facts_from_this_institution_are_allowed")
             # Pilot pre-meeting window. Historical data still needs a recorded check.
-            checked = fact.last_checked_at
-            if (fact.freshness_status != "within_window" or checked is None
-                    or checked.utcoffset() is None or checked > now
-                    or now - checked > timedelta(days=self.review_window_days)):
+            if fact_needs_recheck(fact, now, self.review_window_days):
                 raise DraftValidationError("facts_require_freshness_check")
         has_context = any(isinstance(f.subject, EntitySubject) for f in request.facts)
         prompt = (PROMPTS / ("draft_context.txt" if has_context else "draft.txt")).read_text(encoding="utf-8")

@@ -744,8 +744,9 @@ class RateLimiter:
 class RobotsPolicy:
     """Кэшированная проверка robots.txt с учётом Crawl-delay."""
 
-    def __init__(self, timeout: float = 10.0) -> None:
+    def __init__(self, timeout: float = 10.0, session: requests.Session | None = None) -> None:
         self.timeout = timeout
+        self.session = session
         self._parsers: dict[str, RobotFileParser | None] = {}
         self._delays: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -760,7 +761,8 @@ class RobotsPolicy:
         robots_url = f"{parsed.scheme}://{host}/robots.txt"
         parser: RobotFileParser | None = None
         try:
-            response = requests.get(
+            get = self.session.get if self.session is not None else requests.get
+            response = get(
                 robots_url,
                 headers={"User-Agent": "VuzCardBot/1.0 (+research; contact: local)"},
                 timeout=self.timeout,
@@ -802,11 +804,11 @@ class RobotsPolicy:
 class HttpClient:
     """HTTP-клиент: задержки, User-Agent, retry, robots.txt, блокировки."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, session: requests.Session | None = None) -> None:
         self.settings = settings
-        self.session = requests.Session()
+        self.session = session if session is not None else requests.Session()
         self.limiter = RateLimiter(settings.request_delay, settings.delay_jitter)
-        self.robots = RobotsPolicy(timeout=min(settings.timeout, 15.0))
+        self.robots = RobotsPolicy(timeout=min(settings.timeout, 15.0), session=session)
         self._ua_index = 0
         self._ua_lock = threading.Lock()
         self._requests_made = 0

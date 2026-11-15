@@ -75,6 +75,8 @@ def build_word_document(draft: DraftResult, output_path: Path) -> Path:
     _paragraph(body, "Источники", size=28, bold=True)
     for fact_id, evidence_list in draft.sources.items():
         _paragraph(body, f"{refs[fact_id]} — {fact_id}", bold=True)
+        if not evidence_list:
+            _paragraph(body, "Подтверждено сотрудником в чате.")
         for evidence in evidence_list:
             _paragraph(body, f"URL: {evidence.url}")
             _paragraph(body, f"Получено: {evidence.retrieved_at.isoformat()}")

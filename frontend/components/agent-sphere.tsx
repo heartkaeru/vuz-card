@@ -8,7 +8,7 @@ export function AgentSphere({ onClick, hidden = false }: AgentSphereProps) {
       className={`agent-sphere${hidden ? " agent-sphere--hidden" : ""}`}
       type="button"
       onClick={onClick}
-      aria-label="Открыть чат с ИИ-агентом"
+      aria-label="Открыть общий чат"
       aria-hidden={hidden}
       tabIndex={hidden ? -1 : 0}
     >

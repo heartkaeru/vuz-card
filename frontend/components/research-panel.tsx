@@ -1,13 +1,13 @@
 "use client";
 
-import { forwardRef, useEffect, useImperativeHandle, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, post, errorText, type ApiCard, type CardDetail, type ResearchRun, type Job, type Material, type ChangeSet, type ResearchHistory } from "@/lib/api";
+import { api, post, errorText, type ApiCard, type CardDetail, type Fact, type ResearchRun, type Job, type Material, type ChangeSet, type ResearchHistory, type PartnershipMatch, type CardActionResult } from "@/lib/api";
 import { Icon } from "@/components/icon";
 import { type University } from "@/data/universities";
 import { ApprovedCard, ResearchChanges } from "@/components/research-changes";
 
-export type ResearchHandle = { generate: () => Promise<string>; refresh: () => Promise<string>; openReportOptions: () => void };
+export type ResearchHandle = { generate: () => Promise<CardActionResult>; refresh: () => Promise<string>; openReportOptions: () => void; showRecheck: () => void };
 type Props = {
   university: University; showFacts: boolean; onShowFacts: () => void;
   onConnected: (card: ApiCard) => void; onRunChange: (run: ResearchRun | null) => void;
@@ -21,6 +21,10 @@ const fields: Record<string, string> = {
   "institution.profile": "Профиль учреждения", "institution.type": "Тип учреждения", "institution.location": "Местонахождение",
   "institution.founded": "Основание", "institution.education_areas": "Направления подготовки",
   "institution.education_levels": "Уровни образования", "institution.students": "Обучающиеся", "institution.structure": "Структура и филиалы",
+  "project.name": "Название проекта", "project.program": "Программа", "project.role": "Роль учреждения",
+  "project.status": "Статус проекта", "project.period": "Период проекта", "project.description": "Описание проекта",
+  "event.name": "Название события", "event.type": "Вид события", "event.date": "Дата события",
+  "event.status": "Статус события", "event.description": "Описание события",
 };
 const statuses: Record<string, string> = { pending: "На проверке", verified: "Принято", rejected: "Отклонено", conflict: "Конфликт" };
 const issueMessages: Record<string, string> = {
@@ -87,21 +91,38 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewAfterGeneration, setPreviewAfterGeneration] = useState(false);
-  const [showRejected, setShowRejected] = useState(false);
   const [meetingGoal, setMeetingGoal] = useState("");
   const [meetingDate, setMeetingDate] = useState("");
+  const [partnership, setPartnership] = useState<{ key: string; matches: PartnershipMatch[] } | null>(null);
+  const [matching, setMatching] = useState(false);
+  const [includePartnership, setIncludePartnership] = useState(false);
   const [presentationVariant, setPresentationVariant] = useState<"compact" | "detailed">("compact");
   const [comparison, setComparison] = useState<ChangeSet | null>(null);
   const [history, setHistory] = useState<ResearchHistory[]>([]);
   const [pastChanges, setPastChanges] = useState<ChangeSet | null>(null);
   const [replacePrevious, setReplacePrevious] = useState(false);
-  const busy = saving || job?.status === "queued" || job?.status === "running";
+  const [recheckConfirmed, setRecheckConfirmed] = useState(false);
+  const recheckRef = useRef<HTMLFieldSetElement>(null);
+  const busy = saving || matching || job?.status === "queued" || job?.status === "running";
   const currentComparison = comparison?.run_id === run?.run_id && comparison?.revision === run?.revision ? comparison : null;
   const accepted = currentComparison?.approved_facts.length ?? 0;
+  const recheckIds = new Set(currentComparison?.recheck_fact_ids);
+  const factsToRecheck = currentComparison?.approved_facts.filter((fact) => recheckIds.has(fact.fact_id)) ?? [];
+  const meeting = { goal: meetingGoal.trim() || "Цель встречи не задана", date: meetingDate || null };
+  const partnershipKey = JSON.stringify([run?.run_id, run?.revision, meeting]);
+  const partnershipMatches = partnership?.key === partnershipKey ? partnership.matches : null;
   const retirementIds = [...new Set((currentComparison?.entries ?? []).filter((change) => change.retirement_trigger_ids.some((id) => selected.includes(id)))
     .flatMap((change) => change.retirement_ids))];
+  const reconfirmedIds = new Set(Object.values(run?.reconfirmed_facts ?? {}).flat());
+  const candidates = run?.facts.filter((fact) => fact.origin !== "manual_edit" && !run.retired_fact_ids?.includes(fact.fact_id)
+    && !reconfirmedIds.has(fact.fact_id)) ?? [];
+  const canAccept = (fact: Fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length;
+  const readyForReview = candidates.filter(canAccept);
+  const problematic = candidates.filter((fact) => fact.verification_status === "rejected"
+    || fact.verification_status === "conflict" || fact.validation_status === "failed" || fact.issues.length > 0);
+  const blockedSelection = problematic.some((fact) => selected.includes(fact.fact_id));
   const rejected = run?.facts.filter((fact) => fact.verification_status === "rejected").length ?? 0;
-  const pending = run?.facts.filter((fact) => fact.verification_status === "pending").length ?? 0;
+  const reconfirmed = Object.keys(run?.reconfirmed_facts ?? {}).length;
   const issueCounts = new Map<string, number>();
   for (const fact of run?.facts ?? []) for (const code of fact.issues) issueCounts.set(code, (issueCounts.get(code) ?? 0) + 1);
   const stageErrors = run ? [...run.errors, ...Object.values(run.results).flatMap((result) => result.errors.map((item) => item.code))] : [];
@@ -120,6 +141,8 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       setMeetingGoal(detail.job.identity.meeting.goal);
       setMeetingDate(detail.job.identity.meeting.date ?? "");
     }
+    if (detail.job?.status === "failed" && detail.job.result?.code === "facts_require_freshness_check"
+        && detail.job.identity?.expected_revision !== detail.run?.revision) setJob(null);
     if (detail.job?.status === "completed" && detail.job.result?.material_id &&
         detail.job.identity?.expected_revision === detail.run?.revision) setMaterial(detail.job.result as Material);
   }
@@ -132,14 +155,17 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     return () => { active = false; };
   }, [university.backendId]);
 
-  useEffect(() => { setSelected([]); setSourceChecked(false); setPastChanges(null); }, [run?.run_id, run?.revision]);
-  useEffect(() => { setReplacePrevious(false); }, [run?.run_id, run?.revision, selected.join("|")]);
+  useEffect(() => { setSelected([]); setPastChanges(null); setRecheckConfirmed(false); }, [run?.run_id, run?.revision]);
+  useEffect(() => { setSourceChecked(false); setReplacePrevious(false); }, [run?.run_id, run?.revision, selected]);
 
   useEffect(() => {
     if (!run || !card) return;
     let active = true;
-    Promise.all([api<ChangeSet>(`/runs/${run.run_id}/changes`), api<ResearchHistory[]>(`/cards/${encodeURIComponent(card.id)}/history`)])
-      .then(([changes, runs]) => { if (active) { setComparison(changes); setHistory(runs); } })
+    api<ChangeSet>(`/runs/${run.run_id}/changes`)
+      .then((changes) => { if (active) setComparison(changes); })
+      .catch((failure) => { if (active) setError(errorText(failure)); });
+    api<ResearchHistory[]>(`/cards/${encodeURIComponent(card.id)}/history`)
+      .then((runs) => { if (active) setHistory(runs); })
       .catch((failure) => { if (active) setError(errorText(failure)); });
     return () => { active = false; };
   }, [run?.run_id, run?.revision, card?.id]);
@@ -210,18 +236,73 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     finally { setSaving(false); }
   }
 
-  async function generate() {
-    if (!run || !accepted) { const message = "Для презентации сначала примите проверенные факты о руководстве."; setError(message); onShowFacts(); return message; }
-    if (busy) return "Для карточки уже выполняется задание. Дождитесь его завершения.";
+  async function recommendPartnership() {
+    if (!run || !accepted || busy) return;
+    setMatching(true); setError("");
+    try {
+      const matches = await post<PartnershipMatch[]>(`/runs/${run.run_id}/partnership-matches`, {
+        expected_revision: run.revision, meeting,
+      });
+      setPartnership({ key: partnershipKey, matches });
+      setIncludePartnership(false);
+      setMaterial(null);
+    } catch (failure) { setError(errorText(failure)); }
+    finally { setMatching(false); }
+  }
+
+  async function recheck() {
+    if (!run || !factsToRecheck.length || !recheckConfirmed || !reviewer.trim() || busy) return;
+    setSaving(true); setError("");
+    try {
+      const updated = await post<ResearchRun>(`/runs/${run.run_id}/recheck`, {
+        expected_revision: run.revision, fact_ids: factsToRecheck.map((fact) => fact.fact_id),
+        reviewer: reviewer.trim(), source_checked: true,
+      });
+      setRun(updated); onRunChange(updated); setMaterial(null);
+      if (job?.status === "failed" && job.result?.code === "facts_require_freshness_check") setJob(null);
+    } catch (failure) { setError(errorText(failure)); }
+    finally { setSaving(false); }
+  }
+
+  async function generate(): Promise<CardActionResult> {
+    if (busy) return { message: "Для карточки уже выполняется задание. Дождитесь его завершения." };
+    if (!run || (currentComparison && !accepted)) {
+      const message = "Для презентации сначала примите проверенные факты о руководстве.";
+      setError(message); onShowFacts(); return { message };
+    }
+    if (factsToRecheck.length) {
+      const message = errorText(new Error("facts_require_freshness_check"));
+      setError(message);
+      return { message, needsRecheck: true };
+    }
     setSaving(true); setError("");
     try {
       setJob(await post<Job>(`/runs/${run.run_id}/materials`, {
         expected_revision: run.revision, request_key: crypto.randomUUID(),
-        meeting: { goal: meetingGoal.trim() || "Цель встречи не задана", date: meetingDate || null },
+        meeting,
         presentation_variant: presentationVariant,
+        partnership_matches: includePartnership ? partnershipMatches ?? [] : [],
       }));
-      return "Задание формирования презентации создано. Ссылка на PPTX появится после завершения.";
-    } catch (failure) { const message = errorText(failure); setError(message); return message; }
+      return { message: "Задание формирования презентации создано. Ссылка на PPTX появится в карточке после сборки.", queued: true };
+    } catch (failure) {
+      const needsRecheck = failure instanceof Error && failure.message === "facts_require_freshness_check";
+      if (needsRecheck) {
+        try {
+          const refreshed = await api<ChangeSet>(`/runs/${run.run_id}/changes`);
+          setComparison(refreshed);
+          if (!refreshed.recheck_fact_ids?.length) {
+            const message = "Список сведений для сверки недоступен. Перезапустите backend с текущей версией и обновите страницу.";
+            setError(message);
+            return { message };
+          }
+        } catch (refreshFailure) {
+          const message = "Не удалось загрузить сведения для сверки. " + errorText(refreshFailure);
+          setError(message);
+          return { message };
+        }
+      }
+      const message = errorText(failure); setError(message); return { message, needsRecheck };
+    }
     finally { setSaving(false); }
   }
 
@@ -261,9 +342,13 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     setError("");
     setPreviewAfterGeneration(true);
     const result = await generate();
-    if (!result.startsWith("Задание формирования презентации создано.")) {
+    if (!result.queued) {
       setPreviewAfterGeneration(false);
-      setError(result);
+      setError(result.message);
+      if (result.needsRecheck) {
+        setFormatPickerOpen(false);
+        showRecheck();
+      }
       return;
     }
   }
@@ -280,7 +365,11 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   }, [material, previewAfterGeneration]);
 
   const downloadUrl = material && `${material.download_url}?format=${downloadFormat}`;
-  useImperativeHandle(ref, () => ({ generate, refresh, openReportOptions: () => { setError(""); setFormatPickerOpen(true); } }));
+  function showRecheck() {
+    recheckRef.current?.scrollIntoView({ block: "center" });
+    recheckRef.current?.focus({ preventScroll: true });
+  }
+  useImperativeHandle(ref, () => ({ generate, refresh, showRecheck, openReportOptions: () => { setError(""); setFormatPickerOpen(true); } }));
 
   return <section className="content-card research-panel" aria-label="Актуализация и проверка фактов">
     <div className="content-card__heading"><div><h2>Руководство и сведения об учреждении</h2><span>Официальные источники → проверка → презентация</span></div></div>
@@ -290,13 +379,33 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       <button className="button button--primary" type="button" disabled={Boolean(busy) || !website.trim()} onClick={() => { void refresh(); }}>Найти и обновить руководство</button>
       <label>Вариант презентации<select value={presentationVariant} disabled={Boolean(busy)}
         onChange={(event) => setPresentationVariant(event.target.value as "compact" | "detailed")}>
-        <option value="compact">Краткая карточка — 3 слайда</option>
+        <option value="compact">Краткая карточка</option>
         <option value="detailed">Подробная справка — все разделы</option>
       </select></label>
       <button className="button button--soft" type="button" disabled={Boolean(busy) || !accepted} onClick={() => { void generate(); }}>Сформировать презентацию</button>
     </div>
-    {run && run.facts.some((fact) => fact.validation_status === "passed" && !fact.issues.length
-      && ["pending", "verified"].includes(fact.verification_status)) && <div className="research-downloads">
+    {factsToRecheck.length > 0 && <fieldset ref={recheckRef} tabIndex={-1} className="research-meeting" disabled={Boolean(busy)}>
+      <legend>Повторная проверка перед экспортом</legend>
+      <p>Сверьте принятые сведения с источниками. Если значение изменилось, обновите карточку перед экспортом.</p>
+      <details><summary>Сведения для сверки ({factsToRecheck.length})</summary>
+        <ul>{factsToRecheck.map((fact) => <li key={fact.fact_id}>
+          <strong>{fact.subject.person_name ?? fact.subject.entity_name ?? fact.contact_owner?.label ?? "Учреждение"}</strong>
+          {" · "}{fields[fact.field] ?? fact.field}{" · "}{fact.value}
+          {fact.evidence.map((source, index) => <div key={index}>
+            <a href={source.page_number ? `${source.url.split("#")[0]}#page=${source.page_number}` : source.url}
+              target="_blank" rel="noreferrer">Источник{source.page_number ? ` · страница ${source.page_number}` : ""}</a>
+          </div>)}
+        </li>)}</ul>
+      </details>
+      <div className="research-controls">
+        <label>Проверяющий<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} maxLength={160} /></label>
+        <button className="button button--soft" type="button" disabled={!reviewer.trim() || !recheckConfirmed}
+          onClick={() => { void recheck(); }}>Подтвердить актуальность</button>
+      </div>
+      <label className="research-ack"><input type="checkbox" checked={recheckConfirmed}
+        onChange={(event) => setRecheckConfirmed(event.target.checked)} /> Я повторно сверил(а) все указанные сведения, значения актуальны</label>
+    </fieldset>}
+    {run && (readyForReview.length > 0 || candidates.some((fact) => fact.verification_status === "verified")) && <div className="research-downloads">
       <a className="button button--soft" href={`/api/v1/ai/runs/${encodeURIComponent(run.run_id)}/preview?expected_revision=${run.revision}&presentation_variant=${presentationVariant}`}
         target="_blank" rel="noreferrer">Предпросмотр кандидатов (PPTX)</a>
       <span>Для проверки содержания и вёрстки. Этот файл не означает принятие фактов.</span>
@@ -326,15 +435,42 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       </div>
       <small>Параметры используются при следующем формировании и сохраняются с материалом. Цель встречи не считается фактом о вузе.</small>
     </fieldset>
+    <fieldset className="research-meeting" disabled={Boolean(busy)}>
+      <legend>Предложения к встрече</legend>
+      <button className="button button--soft" type="button" disabled={!accepted}
+        onClick={() => { void recommendPartnership(); }}>
+        {matching ? "Подбираем предложения…" : "Подобрать предложения"}
+      </button>
+      {partnershipMatches?.length === 0 && <small role="status">В принятых данных не нашлось оснований для предложений из каталога.</small>}
+      {Boolean(partnershipMatches?.length) && <>
+        <small>Проверьте аргументы и условия участия перед добавлением в презентацию.</small>
+        <ol>
+          {partnershipMatches?.map((match) => <li key={match.catalog_url}>
+            <p><strong>{match.product_name}</strong>{match.kind === "external_course" && " · внешний курс"}</p>
+            <p>{match.proposal}</p>
+            <p>{match.rationale}</p>
+            <p><strong>Вопрос для встречи</strong> {match.discussion_question}</p>
+            <p><a href={match.catalog_url} target="_blank" rel="noreferrer">Источник предложения</a></p>
+            <ul>{match.basis_fact_ids.map((id) => {
+              const fact = currentComparison?.approved_facts.find((item) => item.fact_id === id);
+              const source = fact?.evidence[0];
+              return fact && source ? <li key={id}><a href={source.url} target="_blank" rel="noreferrer">{fact.value}</a></li> : null;
+            })}</ul>
+          </li>)}
+        </ol>
+        <label className="research-ack"><input type="checkbox" checked={includePartnership}
+          onChange={(event) => { setIncludePartnership(event.target.checked); setMaterial(null); }} /> Добавить предложения в PPTX</label>
+      </>}
+    </fieldset>
     {job && <div className="research-progress" role="status"><span>{job.message}</span><progress value={job.progress} max={100} /></div>}
     {error && !formatPickerOpen && <p className="research-error" role="alert">{error}</p>}
     {material && <div className="research-downloads">
       <button className="button button--soft" type="button" onClick={() => setFormatPickerOpen(true)}>Просмотреть и выбрать формат</button>
       <a className="button button--primary" href={material.download_url}>Скачать PPTX</a>
       <a className="button button--soft" href={material.brief_url} target="_blank" rel="noreferrer">Открыть справку</a>
-      <span>{material.presentation_variant === "compact" ? "Краткая карточка · 3 слайда" : "Подробная справка"} · черновик для проверки перед встречей</span>
+      <span>{material.presentation_variant === "compact" ? "Краткая карточка" : "Подробная справка"} · черновик для проверки перед встречей</span>
     </div>}
-    {run && <p className="research-summary">В последнем сборе: {run.facts.length} кандидатов · на проверке: {pending} · в подтверждённой карточке: {accepted} · отклонено: {rejected} · {run.status === "partial" ? "сбор частичный" : run.status === "failed" ? "сбор не выполнен; прежние принятые сведения сохранены" : "результат сохранён"}.
+    {run && <p className="research-summary">На сверку: {readyForReview.length} · подтверждено повторным сбором: {reconfirmed} · в подтверждённой карточке: {accepted} · отклонено: {rejected} · {run.status === "partial" ? "сбор частичный" : run.status === "failed" ? "сбор не выполнен, прежние сведения сохранены" : "результат сохранён"}.
       {!showFacts && <button className="text-button" type="button" onClick={onShowFacts}>Проверить факты</button>}</p>}
     {run && Object.values(run.results).some((result) => result.run?.provider === "fixture") &&
       <p className="research-summary">Учебный прогон: сохранённые ответы модели, без обращения к GigaChat.</p>}
@@ -363,18 +499,10 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         {pastChanges && <><p>Архивный сбор: только просмотр.</p><ResearchChanges data={pastChanges} labels={fields}/>
           <button className="text-button" type="button" onClick={() => setPastChanges(null)}>Закрыть архивный сбор</button></>}
       </details>}
-      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(run.facts
-        .filter((fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length)
-        .map((fact) => fact.fact_id))}>Выбрать все факты без ошибок</button>
-      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(run.facts
-        .filter((fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length
-          && fact.subject.person_name && !fact.subject.department)
-        .map((fact) => fact.fact_id))}>Выбрать сотрудников без привязки к подразделению</button>
-      {rejected > 0 && <button className="text-button" type="button" onClick={() => setShowRejected((value) => !value)}>
-        {showRejected ? "Скрыть" : "Показать"} автоматически отклонённые факты ({rejected})</button>}
-      <div className="research-facts">{run.facts.filter((fact) => showRejected || fact.verification_status !== "rejected").map((fact) => <article className="research-fact" key={fact.fact_id}>
+      {problematic.length > 0 && <details className="research-change-detail"><summary>Конфликты и отклонённые сведения ({problematic.length})</summary>
+      <div className="research-facts">{problematic.map((fact) => <article className="research-fact" key={fact.fact_id}>
         <label className="research-fact__selection"><input type="checkbox" checked={selected.includes(fact.fact_id)} disabled={Boolean(busy)}
-          onChange={(event) => setSelected((current) => event.target.checked ? [...current, fact.fact_id] : current.filter((id) => id !== fact.fact_id))} />
+          hidden={fact.verification_status === "rejected"} onChange={(event) => setSelected((current) => event.target.checked ? [...current, fact.fact_id] : current.filter((id) => id !== fact.fact_id))} />
           <span><strong>{fact.subject.person_name ?? fact.subject.entity_name ?? fact.contact_owner?.label ?? "Контакт организации"}</strong><span>{fields[fact.field] ?? fact.field}: {fact.value}</span></span>
           <span className={`research-status research-status--${fact.verification_status}`}>{statuses[fact.verification_status]}</span>
         </label>
@@ -386,16 +514,17 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         <details><summary>Источники и подтверждающий текст ({fact.evidence.length})</summary>{fact.evidence.map((evidence, index) => <div className="research-evidence" key={index}>
           <a href={evidence.page_number ? `${evidence.url.split("#")[0]}#page=${evidence.page_number}` : evidence.url} target="_blank" rel="noreferrer">{evidence.page_number ? `PDF · страница ${evidence.page_number} · ` : ""}{evidence.url}</a><small>Получено: {new Date(evidence.retrieved_at).toLocaleString("ru-RU")}</small><blockquote>{evidence.quote}</blockquote>
         </div>)}</details>
-      </article>)}</div>
-      <div className="research-review">
+      </article>)}</div></details>}
+      {(readyForReview.length > 0 || problematic.some((fact) => fact.verification_status !== "rejected")) && <div className="research-review">
+        {blockedSelection && <p className="research-ack">В выбранных сведениях есть конфликт или ошибка. Их можно отклонить.</p>}
         <label>Проверяющий<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="Имя и фамилия" /></label>
         <label>Основание решения<input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Что сверено или почему отклонено" /></label>
         <label className="research-ack"><input type="checkbox" checked={sourceChecked} onChange={(event) => setSourceChecked(event.target.checked)} />Я проверил(а) выбранные факты по действующим первоисточникам</label>
         {retirementIds.length > 0 && <label className="research-ack research-replacement"><input type="checkbox" checked={replacePrevious}
           onChange={(event) => setReplacePrevious(event.target.checked)} />Подтверждаю замену: прежних сведений будет архивировано {retirementIds.length}. Их значения и решения останутся в истории.</label>}
-        <div className="research-controls"><button className="button button--primary" type="button" disabled={Boolean(busy) || !selected.length} onClick={() => { void review("accept"); }}>Принять выбранные ({selected.length})</button>
+        <div className="research-controls"><button className="button button--primary" type="button" disabled={Boolean(busy) || !selected.length || blockedSelection} onClick={() => { void review("accept"); }}>Принять выбранные ({selected.length})</button>
         <button className="button button--soft" type="button" disabled={Boolean(busy) || !selected.length} onClick={() => { void review("reject"); }}>Отклонить выбранные</button></div>
-      </div>
+      </div>}
     </>}
     {formatPickerOpen && typeof document !== "undefined" && createPortal(<div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeFormatPicker(); }}>
       <section className="report-format-dialog" role="dialog" aria-modal="true" aria-labelledby="report-format-title">

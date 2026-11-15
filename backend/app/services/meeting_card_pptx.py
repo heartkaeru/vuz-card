@@ -95,6 +95,8 @@ def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, can
         for fid in dict.fromkeys(ids):
             fact = by_id[fid]
             parts.append(f"{fid} {citations([fid])}: {fact.field.value} = {fact.value}; проверка: {fact.verification_status}")
+            if fact.origin == "manual_edit":
+                parts.append("Подтверждено сотрудником в чате.")
             if fact.metric_context:
                 parts.append(f"Контекст показателя: {fact.metric_context.model_dump_json()}")
             for evidence in fact.evidence:
@@ -322,13 +324,16 @@ def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, can
     if draft.presentation_variant != "compact":
         if partnership_matches:
             for index, match in enumerate(partnership_matches):
-                slide = page("Предложения и партнерство со Сбером" + (f" · {index + 1}" if index else ""))
+                external = match.get("kind") == "external_course"
+                title = "Вариант обучения · внешний курс" if external else "Предложения и партнерство со Сбером"
+                slide = page(title + (f" · {index + 1}" if index else ""))
                 put(slide, match["product_name"], .7, 1.55, 11.9, .62, 21, bold=True)
                 put(slide, "Гипотеза для обсуждения: " + match["proposal"], .7, 2.35, 11.9, 1.1, style["body_pt"])
                 put(slide, "Основание: " + match["rationale"] + " " + citations(match["basis_fact_ids"]),
                     .7, 3.65, 11.9, 1.1, style["body_pt"])
                 put(slide, "Вопрос для встречи: " + match["discussion_question"], .7, 4.95, 11.9, .85, style["body_pt"])
-                link = put(slide, "Источник в каталоге Сбера", .7, 6.05, 11.9, .35, 12, muted=True)
+                link = put(slide, "Страница курса" if external else "Источник предложения",
+                           .7, 6.05, 11.9, .35, 12, muted=True)
                 link.paragraphs[0].runs[0].hyperlink.address = match["catalog_url"]
                 notes(slide, match["basis_fact_ids"])
                 slide.notes_slide.notes_text_frame.text += (
@@ -337,8 +342,7 @@ def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, can
                 )
         else:
             slide = page("Предложения и партнерство со Сбером")
-            put(slide, "Данные матчинга с каталогом продуктов Сбера не переданы. "
-                "Предложения появятся после подключения каталога и сопоставления с принятыми фактами.",
+            put(slide, "Предложения из каталога в эту презентацию не включены.",
                 .7, 1.75, 11.9, 1.6, style["body_pt"])
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
