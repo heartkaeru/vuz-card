@@ -330,6 +330,16 @@ def material_list(repository=Depends(get_repository)):
     return repository.materials()
 
 
+@router.put("/materials/{material_id}/report")
+def save_material_to_reports(material_id: str, repository=Depends(get_repository)):
+    return checked(lambda: repository.save_material_to_reports(material_id))
+
+
+@router.delete("/materials/{material_id}/report")
+def remove_material_from_reports(material_id: str, repository=Depends(get_repository)):
+    return checked(lambda: repository.remove_material_from_reports(material_id))
+
+
 @router.get("/materials/{material_id}/preview")
 def material_preview(material_id: str, repository=Depends(get_repository)):
     _, stale = checked(lambda: repository.material(material_id))

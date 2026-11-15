@@ -60,6 +60,9 @@ export default function UniversityDashboard() {
   const [presentationPreview, setPresentationPreview] = useState<PptxPreviewData | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
+  const [reportDeleteTarget, setReportDeleteTarget] = useState<string | null>(null);
+  const [deletingReportId, setDeletingReportId] = useState<string | null>(null);
+  const [reportDeleteError, setReportDeleteError] = useState("");
   const [toast, setToast] = useState("");
 
   const selectedUniversity = universities.find((university) => university.id === selectedId);
@@ -147,6 +150,21 @@ export default function UniversityDashboard() {
       await downloadFile(report.download_url, `${report.name}.pptx`);
     } catch (failure) {
       notify(errorText(failure));
+    }
+  };
+
+  const deleteReport = async (report: SavedMaterial) => {
+    setDeletingReportId(report.id);
+    setReportDeleteError("");
+    try {
+      await api<{ deleted: boolean }>(`/materials/${encodeURIComponent(report.id)}/report`, { method: "DELETE" });
+      setReports((current) => current.filter((item) => item.id !== report.id));
+      setReportDeleteTarget(null);
+      notify("Отчет удален.");
+    } catch (failure) {
+      setReportDeleteError(errorText(failure));
+    } finally {
+      setDeletingReportId(null);
     }
   };
 
@@ -403,13 +421,32 @@ export default function UniversityDashboard() {
                   <div className="reports-empty"><Icon name="file" size={24} /><strong>Не удалось загрузить отчёты</strong><span>{reportsError}</span></div>
                 ) : <>
                   {filteredReports.map((report, index) => (
-                    <article className="report-row" key={report.id} style={{ animationDelay: `${index * 45}ms` }}>
+                    <article className={`report-row${reportDeleteTarget === report.id ? " report-row--delete-open" : ""}`} key={report.id} style={{ animationDelay: `${index * 45}ms` }}>
                       <div className={`report-format report-format--${report.format.toLowerCase()}`}>{report.format}</div>
                       <div className="report-row__name"><strong>{report.name}</strong><span>{report.stale ? "Факты изменились — сформируйте новую версию" : "Черновик по принятым фактам"}</span></div>
                       <time className="report-row__date">{new Date(report.created_at).toLocaleDateString("ru-RU")}</time>
                       {report.stale ? <span className="demo-label">Архивная версия</span> : <button className="button button--small-primary report-preview-button" type="button" onClick={() => { void openPresentationPreview(report); }} aria-label={`Предпросмотр презентации: ${report.name}`}><Icon name="search" size={15} /><span>Предпросмотр</span></button>}
                       {report.stale ? <span /> : <button className="icon-button icon-button--small report-download-button" type="button" onClick={() => { void downloadPresentation(report); }} aria-label="Скачать PPTX"><Icon name="download" size={17} /></button>}
-                      <span />
+                      <div className="report-delete-control">
+                        <button className="icon-button icon-button--small report-delete-button" type="button"
+                          onClick={() => {
+                            setReportDeleteError("");
+                            setReportDeleteTarget((target) => target === report.id ? null : report.id);
+                          }}
+                          aria-label={`Удалить отчет: ${report.name}`} aria-expanded={reportDeleteTarget === report.id}
+                          aria-controls={`delete-report-${report.id}`}>
+                          <Icon name="trash" size={16} />
+                        </button>
+                        {reportDeleteTarget === report.id && <div className="report-delete-popover" id={`delete-report-${report.id}`} role="dialog" aria-label="Подтверждение удаления отчета">
+                          <strong>Удалить отчет?</strong>
+                          <span>{report.name}</span>
+                          {reportDeleteError && <span className="report-delete-popover__error" role="alert">{reportDeleteError}</span>}
+                          <div className="report-delete-popover__actions">
+                            <button className="button button--small-primary" type="button" disabled={deletingReportId === report.id} onClick={() => { void deleteReport(report); }}>{deletingReportId === report.id ? "Удаляем…" : "Удалить"}</button>
+                            <button className="button button--soft" type="button" disabled={deletingReportId === report.id} onClick={() => setReportDeleteTarget(null)}>Отмена</button>
+                          </div>
+                        </div>}
+                      </div>
                     </article>
                   ))}
                   {filteredReports.length === 0 && (
@@ -418,7 +455,7 @@ export default function UniversityDashboard() {
                 </>}
               </div>
             </div>
-            <p className="reports-disclaimer">Файлы сохраняются после фактической сборки презентации. Перед встречей проверьте итоговый текст.</p>
+            <p className="reports-disclaimer">В отчёты добавляются только материалы, которые вы сохранили вручную. Перед встречей проверьте итоговый текст.</p>
           </section>
         )}
       </main>
@@ -435,7 +472,13 @@ export default function UniversityDashboard() {
               {previewError && <div className="reports-empty" role="alert"><Icon name="file" size={24} /><strong>Предпросмотр недоступен</strong><span>{previewError}</span></div>}
               {!previewLoading && !previewError && presentationPreview && <PptxPreview preview={presentationPreview} />}
             </div>
-            {!previewError && <footer className="report-preview__actions"><span>{previewLoading ? "Загрузка слайдов…" : presentationPreview ? `${presentationPreview.slides.length} слайдов · предпросмотр файла PPTX` : ""}</span></footer>}
+            <footer className="report-preview__actions">
+              <span>{previewLoading ? "Загрузка слайдов…" : presentationPreview ? `${presentationPreview.slides.length} слайдов · предпросмотр файла PPTX` : ""}</span>
+              <div className="report-preview__button-group">
+                <button className="button button--soft" type="button" disabled><Icon name="check" size={16} />Уже в отчётах</button>
+                <button className="button button--primary" type="button" disabled={!presentationPreview} onClick={() => { void downloadPresentation(previewReport); }}><Icon name="download" size={16} />Скачать на компьютер</button>
+              </div>
+            </footer>
           </section>
         </div>
       )}

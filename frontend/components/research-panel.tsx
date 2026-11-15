@@ -2,7 +2,7 @@
 
 import { forwardRef, useEffect, useImperativeHandle, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, post, errorText, downloadFile, type ApiCard, type CardDetail, type ResearchRun, type Job, type Material, type ChangeSet, type PptxPreviewData, type ResearchHistory } from "@/lib/api";
+import { api, post, errorText, downloadFile, type ApiCard, type CardDetail, type ResearchRun, type Job, type Material, type ChangeSet, type PptxPreviewData, type ResearchHistory, type SavedMaterial } from "@/lib/api";
 import { Icon } from "@/components/icon";
 import { PptxPreview } from "@/components/pptx-preview";
 import { type University } from "@/data/universities";
@@ -67,6 +67,9 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const [downloadingPresentation, setDownloadingPresentation] = useState(false);
+  const [savingToReports, setSavingToReports] = useState(false);
+  const [savedMaterialId, setSavedMaterialId] = useState<string | null>(null);
+  const [previewActionError, setPreviewActionError] = useState("");
   const [previewAfterGeneration, setPreviewAfterGeneration] = useState(false);
   const [previewAfterGenerationFrom, setPreviewAfterGenerationFrom] = useState<string | null>(null);
   const [showRejected, setShowRejected] = useState(false);
@@ -198,11 +201,21 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
 
   async function openPreview() {
     if (!material) return false;
+    const currentMaterial = material;
     setPreviewOpen(true);
     setPreviewLoading(true); setError("");
-    setPreviewError(""); setPresentationPreview(null);
+    setPreviewError(""); setPreviewActionError(""); setPresentationPreview(null);
+    setSavedMaterialId(null);
     try {
-      const result = await api<PptxPreviewData>(`/materials/${encodeURIComponent(material.material_id)}/preview`);
+      const [previewResult, reportsResult] = await Promise.allSettled([
+        api<PptxPreviewData>(`/materials/${encodeURIComponent(currentMaterial.material_id)}/preview`),
+        api<SavedMaterial[]>("/materials"),
+      ]);
+      if (reportsResult.status === "fulfilled" && reportsResult.value.some((report) => report.id === currentMaterial.material_id)) {
+        setSavedMaterialId(currentMaterial.material_id);
+      }
+      if (previewResult.status === "rejected") throw previewResult.reason;
+      const result = previewResult.value;
       if (!result.slides.length) throw new Error("presentation_preview_unavailable");
       setPresentationPreview(result);
       return true;
@@ -222,8 +235,23 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       await downloadFile(material.download_url, `${university.name} — презентация.pptx`);
     } catch (failure) {
       setError(errorText(failure));
+      setPreviewActionError(errorText(failure));
     } finally {
       setDownloadingPresentation(false);
+    }
+  }
+
+  async function addPresentationToReports() {
+    if (!material) return;
+    setSavingToReports(true);
+    setPreviewActionError("");
+    try {
+      await api<{ saved: boolean }>(`/materials/${encodeURIComponent(material.material_id)}/report`, { method: "PUT" });
+      setSavedMaterialId(material.material_id);
+    } catch (failure) {
+      setPreviewActionError(errorText(failure));
+    } finally {
+      setSavingToReports(false);
     }
   }
 
@@ -362,8 +390,17 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
           {!previewLoading && !previewError && presentationPreview && <PptxPreview preview={presentationPreview} />}
         </div>
         <footer className="report-preview__actions">
-          <span>{presentationPreview ? `${presentationPreview.slides.length} слайдов · сохранённый файл PPTX` : "Сохранённый файл PPTX"}</span>
-          <button className="button button--primary" type="button" disabled={downloadingPresentation} onClick={() => { void downloadPresentation(); }}><Icon name="download" size={16} />{downloadingPresentation ? "Скачиваем…" : "Скачать PPTX"}</button>
+          <div className="report-preview__action-copy">
+            <span>{presentationPreview ? `${presentationPreview.slides.length} слайдов · файл PPTX` : "Файл PPTX"}</span>
+            {previewActionError && <span className="report-preview__action-error" role="alert">{previewActionError}</span>}
+          </div>
+          <div className="report-preview__button-group">
+            <button className="button button--soft" type="button" disabled={!presentationPreview || savingToReports || savedMaterialId === material?.material_id} onClick={() => { void addPresentationToReports(); }}>
+              <Icon name={savedMaterialId === material?.material_id ? "check" : "plus"} size={16} />
+              {savingToReports ? "Добавляем…" : savedMaterialId === material?.material_id ? "Уже в отчётах" : "Добавить в отчёты"}
+            </button>
+            <button className="button button--primary" type="button" disabled={!presentationPreview || downloadingPresentation} onClick={() => { void downloadPresentation(); }}><Icon name="download" size={16} />{downloadingPresentation ? "Скачиваем…" : "Скачать на компьютер"}</button>
+          </div>
         </footer>
       </section>
     </div>, document.body)}
