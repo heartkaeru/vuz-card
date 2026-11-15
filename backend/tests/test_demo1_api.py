@@ -106,6 +106,9 @@ def test_ui_api_full_path_and_pptx_download(api_client):
         import sqlite3
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             db.execute("DELETE FROM llm_material_fact")
+    assert client.get("/api/v1/ai/materials").json() == []
+    saved = client.put(f"/api/v1/ai/materials/{job['result']['material_id']}/report")
+    assert saved.status_code == 200 and saved.json() == {"saved": True}
     reports = client.get("/api/v1/ai/materials").json()
     assert len(reports) == 1 and reports[0]["stale"] is False
 
@@ -629,6 +632,7 @@ def test_pptx_is_not_current_after_rejection(api_client):
     job = client.post(f"/api/v1/ai/runs/{run['run_id']}/materials", json={
         "expected_revision": run["revision"], "request_key": "export"}).json()
     result = client.get(f"/api/v1/ai/jobs/{job['job_id']}").json()["result"]
+    assert client.put(f"/api/v1/ai/materials/{result['material_id']}/report").status_code == 200
     client.post(f"/api/v1/ai/runs/{run['run_id']}/reviews", json=review_payload(run, "reject"))
     assert client.get(result["download_url"]).status_code == 409
     assert client.get("/api/v1/ai/materials").json()[0]["stale"] is True
@@ -844,6 +848,7 @@ def test_presentation_variant_is_persisted_and_downloaded_without_changing_facts
         assert fact["fact_id"] in notes and fact["value"] in notes
         assert fact["evidence"][0]["quote"] in notes
     assert "Полные значения выбранных фактов" in client.get(result["brief_url"]).text
+    assert client.put(f"/api/v1/ai/materials/{result['material_id']}/report").status_code == 200
     assert client.get("/api/v1/ai/materials").json()[0]["presentation_variant"] == variant
     assert repository.reviews(run["run_id"]) == reviews_before
     assert client.get(f"/api/v1/ai/runs/{run['run_id']}").json() == run
