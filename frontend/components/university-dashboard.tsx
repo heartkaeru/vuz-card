@@ -379,12 +379,7 @@ export default function UniversityDashboard() {
                 <input value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} placeholder="Поиск по вузам" aria-label="Поиск по вузам" />
               </form>
             </div>
-            <ProfileHero
-              university={selectedUniversity}
-              onPreview={() => researchRef.current?.openReportOptions()}
-              onDownload={() => { void researchRef.current?.generate(); }}
-              onChat={() => openChat("card")}
-            />
+            <ProfileHero university={selectedUniversity} />
             <ResearchPanel key={selectedUniversity.id + "-" + cardEditVersion} ref={researchRef} university={selectedUniversity}
               showFacts={section === "review"} reviewOutlet={reviewOutlet} onShowFacts={() => setSection("review")}
               onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
@@ -573,9 +568,7 @@ export default function UniversityDashboard() {
   );
 }
 
-function ProfileHero({ university, onPreview, onDownload, onChat }: {
-  university: University; onPreview: () => void; onDownload: () => void; onChat: () => void;
-}) {
+function ProfileHero({ university }: { university: University }) {
   return (
     <section className="profile-hero">
       <div className="profile-hero__decor profile-hero__decor--one" />
@@ -583,12 +576,7 @@ function ProfileHero({ university, onPreview, onDownload, onChat }: {
       <div className="profile-hero__copy">
         <span className="profile-hero__overline">КАРТОЧКА ОБРАЗОВАТЕЛЬНОЙ ОРГАНИЗАЦИИ</span>
         <h1>{university.name}</h1>
-        <p className="profile-hero__meta"><Icon name="pin" size={15} /> {university.city}<span className="meta-separator">·</span>Проверка сведений по первоисточникам</p>
-        <div className="profile-hero__actions">
-          <button className="button button--primary profile-hero__download" type="button" onClick={onDownload}><Icon name="download" size={16} /> Сформировать материалы</button>
-          <button className="button button--soft profile-hero__download" type="button" onClick={onPreview}><Icon name="search" size={16} /> Просмотреть и выбрать формат</button>
-          <button className="button button--soft profile-hero__download" type="button" onClick={onChat}><Icon name="spark" size={16} /> Обсудить с агентом</button>
-        </div>
+        <p className="profile-hero__meta"><Icon name="pin" size={15} /> {university.city}</p>
       </div>
       <div className="profile-hero__metrics">
         <div className="hero-metric hero-metric--green"><span className="hero-metric__icon"><Icon name="spark" size={15} /></span><span>Точки соприкосновений</span><strong>—</strong></div>

@@ -530,9 +530,22 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         onChange={(event) => setWebsite(event.target.value)} placeholder="https://university.ru" aria-label="Официальный сайт" /></label>
       <label>Вариант презентации<select value={presentationVariant} disabled={Boolean(busy)}
         onChange={(event) => setPresentationVariant(event.target.value as "compact" | "detailed")}>
-        <option value="compact">Краткая карточка</option>
+        <option value="compact">Краткая карточка — 3 слайда</option>
         <option value="detailed">Подробная справка — все разделы</option>
       </select></label>
+    </div>
+    <fieldset className="research-meeting" disabled={Boolean(busy)}>
+      <legend>Контекст встречи</legend>
+      <div className="research-controls">
+        <label>Цель встречи<input value={meetingGoal} onChange={(event) => setMeetingGoal(event.target.value)}
+          maxLength={1000} placeholder="Например: обсудить подготовку ИТ-специалистов" /></label>
+        <label>Дата встречи (необязательно)<input type="date" value={meetingDate} onChange={(event) => setMeetingDate(event.target.value)} /></label>
+      </div>
+    </fieldset>
+    <div className="research-action-stack">
+      <button className="button button--primary" type="button" disabled={Boolean(busy) || !website.trim()} onClick={() => { void refresh(); }}>Найти и обновить информацию</button>
+      <button className="button button--soft" type="button" disabled={Boolean(busy)}
+        onClick={() => { void openOrGeneratePresentation(); }}>{busy && job?.task_type === "material" ? "Формируем презентацию…" : material?.presentation_variant === presentationVariant ? "Просмотреть и скачать презентацию" : material ? "Сформировать выбранный формат" : "Сформировать и просмотреть презентацию"}</button>
     </div>
     {factsToRecheck.length > 0 && <fieldset ref={recheckRef} tabIndex={-1} className="research-meeting" disabled={Boolean(busy)}>
       <legend>Повторная проверка перед экспортом</legend>
@@ -555,76 +568,9 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       <label className="research-ack"><input type="checkbox" checked={recheckConfirmed}
         onChange={(event) => setRecheckConfirmed(event.target.checked)} /> Я повторно сверил(а) все указанные сведения, значения актуальны</label>
     </fieldset>}
-    {run && (readyForReview.length > 0 || candidates.some((fact) => fact.verification_status === "verified")) && <div className="research-downloads">
-      <a className="button button--soft" href={`/api/v1/ai/runs/${encodeURIComponent(run.run_id)}/preview?expected_revision=${run.revision}&presentation_variant=${presentationVariant}`}
-        target="_blank" rel="noreferrer">Предпросмотр кандидатов (PPTX)</a>
-      <span>Для проверки содержания и вёрстки. Этот файл не означает принятие фактов.</span>
-    </div>}
-    <small>{presentationVariant === "compact" ? "Краткая карточка: руководитель, учреждение, повестка встречи. Полные значения и цитаты сохраняются в справке и заметках." : "Подробная справка: биография, руководство, показатели и отдельные слайды источников; объём зависит от данных."}</small>
-    <details className="research-source-options"><summary>Источники руководства, биографии и справки об учреждении</summary>
-      <label>Страница руководства<input type="url" value={leadershipUrl} disabled={Boolean(busy)}
-        onChange={(event) => setLeadershipUrl(event.target.value)} placeholder="https://university.ru/sveden/managers/" /></label>
-      <label>Официальная биография первого руководителя<input type="url" value={biographyUrl} disabled={Boolean(busy)}
-        onChange={(event) => setBiographyUrl(event.target.value)} placeholder="https://university.ru/about/rector/" /></label>
-      <label className="research-ack"><input type="checkbox" checked={includeInstitution} disabled={Boolean(busy)}
-        onChange={(event) => setIncludeInstitution(event.target.checked)} />Также собрать справку об учреждении</label>
-      <label>Страницы направлений, численности и структуры (до 3 ссылок, по одной в строке)<textarea value={institutionUrls} disabled={Boolean(busy)}
-        onChange={(event) => setInstitutionUrls(event.target.value)} rows={3} placeholder="https://university.ru/about/" /></label>
-      <label>Официальный отчёт в PDF<input type="url" value={pdfUrl} disabled={Boolean(busy)}
-        onChange={(event) => setPdfUrl(event.target.value)} placeholder="https://university.ru/report.pdf" /></label>
-      <label>Страницы PDF (номера с 1, до 20 страниц)<input value={pdfPages} disabled={Boolean(busy)}
-        onChange={(event) => setPdfPages(event.target.value)} placeholder="1, 3-5, 18" /></label>
-      <p>Без номеров обрабатываются первые 20 страниц PDF. Используются текстовые PDF и HTML официального сайта. Для численности нужны период и состав контингента; сканы пока не распознаются. Новые сведения потребуется проверить.</p>
-    </details>
-    <fieldset className="research-meeting" disabled={Boolean(busy)}>
-      <legend>Контекст встречи</legend>
-      <div className="research-controls">
-        <label>Цель встречи<input value={meetingGoal} onChange={(event) => setMeetingGoal(event.target.value)}
-          maxLength={1000} placeholder="Например: обсудить подготовку ИТ-специалистов" /></label>
-        <label>Дата встречи (необязательно)<input type="date" value={meetingDate} onChange={(event) => setMeetingDate(event.target.value)} /></label>
-      </div>
-    </fieldset>
-    <div className="research-action-stack">
-      <button className="button button--primary" type="button" disabled={Boolean(busy) || !website.trim()} onClick={() => { void refresh(); }}>Найти и обновить информацию</button>
-      <button className="button button--soft" type="button" disabled={Boolean(busy)}
-        onClick={() => { void openOrGeneratePresentation(); }}>{busy && job?.task_type === "material" ? "Формируем презентацию…" : material?.presentation_variant === presentationVariant ? "Просмотреть и скачать презентацию" : material ? "Сформировать выбранный формат" : "Сформировать и просмотреть презентацию"}</button>
-    </div>
-    <fieldset className="research-meeting" disabled={Boolean(busy)}>
-      <legend>Предложения к встрече</legend>
-      <button className="button button--soft" type="button" disabled={!accepted}
-        onClick={() => { void recommendPartnership(); }}>
-        {matching ? "Подбираем предложения…" : "Подобрать предложения"}
-      </button>
-      {partnershipMatches?.length === 0 && <small role="status">В принятых данных не нашлось оснований для предложений из каталога.</small>}
-      {Boolean(partnershipMatches?.length) && <>
-        <small>Проверьте аргументы и условия участия перед добавлением в презентацию.</small>
-        <ol>
-          {partnershipMatches?.map((match) => <li key={match.catalog_url}>
-            <p><strong>{match.product_name}</strong>{match.kind === "external_course" && " · внешний курс"}</p>
-            <p>{match.proposal}</p>
-            <p>{match.rationale}</p>
-            <p><strong>Вопрос для встречи</strong> {match.discussion_question}</p>
-            <p><a href={match.catalog_url} target="_blank" rel="noreferrer">Источник предложения</a></p>
-            <ul>{match.basis_fact_ids.map((id) => {
-              const fact = currentComparison?.approved_facts.find((item) => item.fact_id === id);
-              const source = fact?.evidence[0];
-              return fact && source ? <li key={id}><a href={source.url} target="_blank" rel="noreferrer">{fact.value}</a></li> : null;
-            })}</ul>
-          </li>)}
-        </ol>
-        <label className="research-ack"><input type="checkbox" checked={includePartnership}
-          onChange={(event) => { setIncludePartnership(event.target.checked); setMaterial(null); }} /> Добавить предложения в PPTX</label>
-      </>}
-    </fieldset>
     {job && <div className="research-progress" role="status"><span>{job.message}</span><progress value={job.progress} max={100} /></div>}
-    {error && !formatPickerOpen && <p className="research-error" role="alert">{error}</p>}
-    {material && <div className="research-downloads">
-      <button className="button button--soft" type="button" onClick={() => setFormatPickerOpen(true)}>Просмотреть и выбрать формат</button>
-      <a className="button button--primary" href={downloadUrl ?? material.download_url}>Скачать {downloadFormat.toUpperCase()}</a>
-      <a className="button button--soft" href={material.brief_url} target="_blank" rel="noreferrer">Открыть справку</a>
-      <span>{material.presentation_variant === "compact" ? "Краткая карточка" : "Подробная справка"} · черновик для проверки перед встречей</span>
-    </div>}
-    {run && <p className="research-summary">На сверку: {readyForReview.length} · подтверждено повторным сбором: {reconfirmed} · в подтверждённой карточке: {accepted} · отклонено: {rejected} · {run.status === "partial" ? "сбор частичный" : run.status === "failed" ? "сбор не выполнен, прежние сведения сохранены" : "результат сохранён"}.
+    {error && <p className="research-error" role="alert">{error}</p>}
+    {run && <p className="research-summary">В последнем сборе: {run.facts.length} кандидатов · на проверке: {pending} · в подтверждённой карточке: {accepted} · отклонено: {rejected} · {run.status === "partial" ? "сбор частичный" : run.status === "failed" ? "сбор не выполнен; прежние принятые сведения сохранены" : "результат сохранён"}.
       {!showFacts && <button className="text-button" type="button" onClick={onShowFacts}>Проверить факты</button>}</p>}
     {run && Object.values(run.results).some((result) => result.run?.provider === "fixture") &&
       <p className="research-summary">Учебный прогон: сохранённые ответы модели, без обращения к GigaChat.</p>}
