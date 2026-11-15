@@ -153,6 +153,11 @@ export default function UniversityDashboard() {
     window.setTimeout(() => setToast(""), 3200);
   };
 
+  async function logout() {
+    await fetch("/api/auth/logout", { method: "POST", cache: "no-store" }).catch(() => undefined);
+    window.location.replace("/login");
+  }
+
   const openPresentationPreview = async (report: SavedMaterial) => {
     setPreviewReport(report);
     setPresentationPreview(null);
@@ -289,15 +294,18 @@ export default function UniversityDashboard() {
             ))}
           </nav>
         </div>
-        <button className="user-card" type="button" onClick={() => notify("Профиль сотрудника") }>
+        <button className="user-card" type="button" onClick={() => { void logout(); }} aria-label="Выйти из системы" title="Выйти из системы">
           <span className="user-card__avatar">ИИ</span>
-          <span className="user-card__name">Сотрудник</span>
-          <Icon className="user-card__dots" name="dots" size={20} />
+          <span className="user-card__name">Выйти</span>
+          <Icon className="user-card__dots" name="arrow" size={18} />
         </button>
       </aside>
 
       <main className="main-area" id="top">
         <div className="mobile-topbar">
+          <button className="mobile-agent-button" type="button" onClick={() => { void logout(); }}>
+            Выйти
+          </button>
           <button className="mobile-agent-button" type="button" onClick={() => openChat("general")}>
             <Icon name="spark" size={18} /> Агент
           </button>
@@ -534,7 +542,7 @@ export default function UniversityDashboard() {
       <AgentSphere onClick={() => openChat("general")} hidden={chatOpen} />
       <AgentChat key={chatMode === "card" ? chatCard?.backendId : "general"} open={chatOpen}
         cardId={chatCard?.backendId} mode={chatMode} onModeChange={setChatMode}
-        universityName={chatCard?.name ?? "ВУЗ-CRM"} onClose={onChatClose}
+        universityName={chatCard?.name ?? "Общий чат"} onClose={onChatClose}
         onOpenCard={(card) => { openChatCard(card); setChatMode("card"); }}
         onEditApplied={() => setCardEditVersion((version) => version + 1)}
         onCollection={(card, job) => {

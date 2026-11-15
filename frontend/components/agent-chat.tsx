@@ -12,8 +12,6 @@ type Turn = {
     edit?: { field: string; owner: string; before: string; after: string; status: "pending" | "applied" };
   };
 };
-const TOKEN_KEY = "vuz-crm-chat-token";
-
 type AgentChatProps = {
   open: boolean;
   universityName: string;
@@ -34,8 +32,6 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
   const [draft, setDraft] = useState("");
   const [typing, setTyping] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [token, setToken] = useState("");
-  const [register, setRegister] = useState(false);
   const [error, setError] = useState("");
   const [actionStatus, setActionStatus] = useState("");
   const [needsRecheck, setNeedsRecheck] = useState(false);
@@ -45,18 +41,17 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
   const inCard = mode === "card";
   const path = inCard && cardId ? `/cards/${encodeURIComponent(cardId)}/chat` : "/chat/general";
 
-  useEffect(() => { setToken(sessionStorage.getItem(TOKEN_KEY) ?? ""); }, []);
   useEffect(() => { if (!open) { setActionStatus(""); setNeedsRecheck(false); } }, [open]);
   useEffect(() => {
-    if (!open || !token) return;
+    if (!open) return;
     const controller = new AbortController();
     setLoading(true);
-    api<Turn[]>(path, { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal })
+    api<Turn[]>(path, { signal: controller.signal })
       .then((history) => { if (!controller.signal.aborted) setTurns(history); })
       .catch((failure) => { if (!controller.signal.aborted) showError(failure); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [open, token, path]);
+  }, [open, path]);
 
   useEffect(() => {
     if (!open) return;
@@ -69,49 +64,25 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
       window.clearTimeout(timer);
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [open, onClose, token, loading]);
+  }, [open, onClose, loading]);
 
   useEffect(() => {
     messageEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [turns, typing]);
 
-  function logout() {
-    sessionStorage.removeItem(TOKEN_KEY);
-    setToken(""); setTurns([]); setLoading(false); setDraft(""); setActionStatus("");
-  }
-
   function showError(failure: unknown) {
-    if (failure instanceof Error && failure.message === "chat_login_required") logout();
     setError(errorText(failure));
-  }
-
-  async function signIn(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    setTyping(true); setError(""); setActionStatus("");
-    try {
-      const response = await fetch(`/api/v1/auth/${register ? "register" : "login"}`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: form.get("email"), password: form.get("password") }),
-      });
-      const result = await response.json();
-      if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "Проверьте email, пароль и настройки авторизации.");
-      sessionStorage.setItem(TOKEN_KEY, result.access_token);
-      setLoading(true); setToken(result.access_token);
-    } catch (failure) { showError(failure); }
-    finally { setTyping(false); }
   }
 
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const message = draft.trim();
-    if (!message || typing || loading || !token) return;
+    if (!message || typing || loading) return;
     setTyping(true); setError(""); setActionStatus("");
-    const headers = { Authorization: `Bearer ${token}` };
     try {
       const request_key = requestKey.current ??= crypto.randomUUID();
       const result = await api<Turn | { collection: { card: ApiCard; job: Job } }>(
-        path, { method: "POST", headers, body: JSON.stringify({ message, request_key }) },
+        path, { method: "POST", body: JSON.stringify({ message, request_key }) },
       );
       if ("collection" in result) onCollection(result.collection.card, result.collection.job);
       else setTurns((current) => current.some((saved) => saved.id === result.id) ? current : [...current, result].slice(-20));
@@ -120,7 +91,7 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
     } catch (failure) {
       showError(failure);
       if (failure instanceof Error && failure.message === "chat_history_changed") {
-        try { setTurns(await api<Turn[]>(path, { headers })); }
+        try { setTurns(await api<Turn[]>(path)); }
         catch (historyFailure) { showError(historyFailure); }
       }
     } finally { setTyping(false); }
@@ -139,13 +110,12 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
   }
 
   async function confirmEdit(turnId: number) {
-    if (typing || loading || !token || !inCard || !cardId) return;
+    if (typing || loading || !inCard || !cardId) return;
     setTyping(true); setError("");
-    const headers = { Authorization: `Bearer ${token}` };
     try {
-      await api(`${path}/${turnId}/confirm`, { method: "POST", headers });
+      await api(`${path}/${turnId}/confirm`, { method: "POST" });
       onEditApplied?.();
-      setTurns(await api<Turn[]>(path, { headers }));
+      setTurns(await api<Turn[]>(path));
     } catch (failure) { showError(failure); }
     finally { setTyping(false); }
   }
@@ -172,7 +142,7 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
           <div className="agent-chat__avatar" aria-hidden="true">AI</div>
           <div className="agent-chat__identity">
             <h2>ИИ-агент</h2>
-            <p>{inCard ? universityName : "ВУЗ-CRM"}</p>
+            <p>{inCard ? universityName : "Общий чат"}</p>
           </div>
           <button className="icon-button agent-chat__close" type="button" onClick={onClose} aria-label="Закрыть чат">
             <Icon name="close" size={19} />
@@ -186,23 +156,9 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
         </div>
 
         <div className="agent-chat__conversation" aria-live="polite">
-          {!token ? (
-            <form className="modal-form" onSubmit={signIn}>
-              <h3>{register ? "Регистрация" : "Вход в чат"}</h3>
-              <label>Email<input name="email" type="email" autoComplete="username" required /></label>
-              <label>Пароль<input name="password" type="password" required minLength={5} maxLength={72}
-                autoComplete={register ? "new-password" : "current-password"} /></label>
-              <button className="button button--primary" disabled={typing} type="submit">
-                {register ? "Зарегистрироваться" : "Войти"}
-              </button>
-              <button className="text-button" type="button" disabled={typing}
-                onClick={() => { setRegister(!register); setError(""); }}>
-                {register ? "Уже есть аккаунт" : "Создать аккаунт"}
-              </button>
-            </form>
-          ) : loading ? <p role="status">Загружаем историю…</p> : turns.length === 0 && !typing ? (
+          {loading ? <p role="status">Загружаем историю…</p> : turns.length === 0 && !typing ? (
             <div className="agent-chat__welcome">
-              <h3>{inCard ? "Что узнать о вузе?" : "Чем помочь в ВУЗ-CRM?"}</h3>
+              <h3>{inCard ? "Что узнать о вузе?" : "Чем могу помочь?"}</h3>
               <p>{inCard ? "Спросите о руководстве, контактах, образовательных направлениях, проектах или событиях."
                 : "Спросите о реестре или работе с карточками. Для сбора по новому вузу укажите название и официальный URL."}</p>
             </div>
@@ -260,9 +216,8 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
               <button type="button" disabled={typing} onClick={() => { void runAction("presentation"); }}>Презентация</button>
               <button type="button" disabled={typing} onClick={() => { void runAction("refresh"); }}>Обновить данные</button>
             </>}
-            {token && <button type="button" disabled={typing} onClick={() => { logout(); setError(""); }}>Выйти</button>}
           </div>
-          {token && <form className="agent-chat__composer" onSubmit={sendMessage}>
+          <form className="agent-chat__composer" onSubmit={sendMessage}>
             <input
               ref={inputRef}
               value={draft}
@@ -275,7 +230,7 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
             <button className="agent-chat__send" type="submit" disabled={!draft.trim() || typing || loading} aria-label="Отправить сообщение">
               <Icon name="send" size={19} />
             </button>
-          </form>}
+          </form>
         </div>
       </aside>
     </>
