@@ -132,6 +132,11 @@ export function errorText(error: unknown) {
 
 export async function downloadFile(path: string, filename: string) {
   const response = await fetch(path, { cache: "no-store" });
+  if (response.status === 401 && typeof window !== "undefined") {
+    await fetch("/api/auth/logout", { method: "POST", cache: "no-store" }).catch(() => undefined);
+    window.location.replace("/login");
+    throw new Error("chat_login_required");
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(typeof body.detail === "string" ? body.detail : "Не удалось скачать файл.");
@@ -152,6 +157,10 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
   }});
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
+    if (response.status === 401 && typeof window !== "undefined") {
+      await fetch("/api/auth/logout", { method: "POST", cache: "no-store" }).catch(() => undefined);
+      window.location.replace("/login");
+    }
     throw new Error(typeof body.detail === "string" ? body.detail : "Проверьте введённые данные и доступность сервера.");
   }
   return response.json() as Promise<T>;
