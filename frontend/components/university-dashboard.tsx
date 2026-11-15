@@ -7,6 +7,7 @@ import { api, post, errorText, downloadFile, type ApiCard, type Fact, type PptxP
 import { AgentChat } from "@/components/agent-chat";
 import { AgentSphere } from "@/components/agent-sphere";
 import { Icon, type IconName } from "@/components/icon";
+import { buildPersonAliases, personIdentityKey } from "@/lib/person-identity";
 import {
   initialsFor,
   type Section,
@@ -26,6 +27,7 @@ const tabs: { key: Section; label: string }[] = [
   { key: "contacts", label: "Руководство и контакты" },
   { key: "projects", label: "Проекты" },
   { key: "events", label: "Мероприятия" },
+  { key: "review", label: "Проверка" },
 ];
 
 export default function UniversityDashboard() {
@@ -49,6 +51,7 @@ export default function UniversityDashboard() {
   const [createWebsite, setCreateWebsite] = useState("");
   const [creating, setCreating] = useState(false);
   const researchRef = useRef<ResearchHandle>(null);
+  const [reviewOutlet, setReviewOutlet] = useState<HTMLDivElement | null>(null);
   const [runs, setRuns] = useState<Record<string, ResearchRun | null>>({});
   const [reportSearch, setReportSearch] = useState("");
   const [reports, setReports] = useState<SavedMaterial[]>([]);
@@ -335,7 +338,7 @@ export default function UniversityDashboard() {
             </div>
             <ProfileHero university={selectedUniversity} />
             <ResearchPanel key={selectedUniversity.id} ref={researchRef} university={selectedUniversity}
-              showFacts={section === "contacts"} onShowFacts={() => setSection("contacts")}
+              showFacts={section === "review"} reviewOutlet={reviewOutlet} onShowFacts={() => setSection("review")}
               onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
               onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
                 ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
@@ -359,10 +362,12 @@ export default function UniversityDashboard() {
               <span className="profile-tabs__indicator" aria-hidden="true" style={{ left: tabIndicator.left, width: tabIndicator.width }} />
             </div>
             <div className="profile-content page-enter" key={`${selectedUniversity.id}-${section}`}>
+              {section === "review" ? <div className="review-outlet" ref={setReviewOutlet} /> : <>
               {section === "about" && <AboutSection university={selectedUniversity} run={selectedRun} onAdd={() => setChatOpen(true)} />}
               {section === "contacts" && <ContactsSection university={selectedUniversity} run={selectedRun} />}
               {section === "projects" && <ProjectsSection university={selectedUniversity} run={selectedRun} />}
               {section === "events" && <EventsSection university={selectedUniversity} run={selectedRun} />}
+              </>}
             </div>
           </section>
         )}
@@ -540,7 +545,26 @@ function isVerified(fact: Fact) {
 }
 
 function verifiedFacts(run: ResearchRun | null) {
-  return run?.facts.filter(isVerified) ?? [];
+  if (!run) return [];
+  const retired = new Set(run.retired_fact_ids ?? []);
+  const facts = [...run.facts, ...(run.baseline_facts ?? [])]
+    .filter((fact) => isVerified(fact) && !retired.has(fact.fact_id));
+  const aliases = buildPersonAliases(facts.flatMap((fact) => {
+    const name = fact.subject.person_name ?? (fact.contact_owner?.kind === "person" ? fact.contact_owner.label : null);
+    return name ? [{ name, department: fact.subject.department }] : [];
+  }));
+  const seen = new Set<string>();
+  return facts.filter((fact) => {
+    const name = fact.subject.person_name ?? (fact.contact_owner?.kind === "person" ? fact.contact_owner.label : null);
+    const owner = name ? `person:${personIdentityKey(name, fact.subject.department, aliases)}`
+      : fact.subject.entity_id ? `entity:${fact.subject.entity_kind ?? "entity"}:${fact.subject.entity_id}`
+        : fact.contact_owner ? `contact:${fact.contact_owner.kind}:${fact.contact_owner.label.normalize("NFKC").toLocaleLowerCase("ru-RU").replace(/ё/g, "е").trim()}`
+          : `institution:${fact.subject.entity_name ?? ""}`;
+    const key = `${owner}\u0000${fact.field}\u0000${fact.value.normalize("NFKC").toLocaleLowerCase("ru-RU").replace(/ё/g, "е").replace(/\s+/g, " ").trim()}\u0000${JSON.stringify(fact.metric_context ?? null)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function groupVerifiedEntities(run: ResearchRun | null, kind: "project" | "event") {
@@ -575,21 +599,33 @@ function AboutSection({ university, run, onAdd }: { university: University; run:
 
 function ContactsSection({ university, run }: { university: University; run: ResearchRun | null }) {
   const people = new Map<string, { name: string; facts: Fact[] }>();
-  for (const fact of verifiedFacts(run)) {
+  const facts = verifiedFacts(run).filter((fact) => !fact.subject.entity_kind);
+  const aliases = buildPersonAliases(facts.flatMap((fact) => {
+    const name = fact.subject.person_name ?? (fact.contact_owner?.kind === "person" ? fact.contact_owner.label : null);
+    return name ? [{ name, department: fact.subject.department }] : [];
+  }));
+  for (const fact of facts) {
     if (fact.subject.entity_kind) continue;
-    const name = fact.subject.person_name ?? fact.contact_owner?.label ?? "Контакт организации";
-    const group = people.get(name) ?? { name, facts: [] };
+    const name = fact.subject.person_name ?? (fact.contact_owner?.kind === "person" ? fact.contact_owner.label : null) ?? fact.contact_owner?.label ?? "Контакт организации";
+    const key = fact.subject.person_name || fact.contact_owner?.kind === "person"
+      ? `person:${personIdentityKey(name, fact.subject.department, aliases)}`
+      : fact.contact_owner
+        ? `contact:${fact.contact_owner.kind}:${fact.contact_owner.label.normalize("NFKC").toLocaleLowerCase("ru-RU").replace(/ё/g, "е").trim()}`
+        : "contact:organization";
+    const group = people.get(key) ?? { name, facts: [] };
     group.facts.push(fact);
-    people.set(name, group);
+    if (name.split(/\s+/).length > group.name.split(/\s+/).length) group.name = name;
+    people.set(key, group);
   }
   const entries = [...people.entries()].map(([id, person]) => ({ id, ...person }));
+  const factPriority: Record<string, number> = { "appointment.position": 0, "contact.email": 1, "contact.phone": 2 };
   return (
     <section className="content-card contacts-card">
       <div className="content-card__heading"><span className="section-icon"><Icon name="phone" size={18} /></span><div><h2>Проверенное руководство и контакты</h2><span>{university.name} · данные из сохранённого исследования</span></div></div>
       {entries.length ? <div className="contact-list">
         {entries.map((person) => <article className="contact-row" key={person.id}>
           <span className="contact-row__avatar">{initialsFor(person.name)}</span>
-          <div className="contact-row__identity"><strong>{person.name}</strong>{person.facts.map((fact) => <span key={fact.fact_id}>{factLabels[fact.field] ?? fact.field}: {fact.value}</span>)}</div>
+          <div className="contact-row__identity"><strong>{person.name}</strong>{[...person.facts].sort((a, b) => (factPriority[a.field] ?? 3) - (factPriority[b.field] ?? 3)).map((fact) => <span key={fact.fact_id}>{factLabels[fact.field] ?? fact.field}: {fact.value}</span>)}</div>
           <div className="contact-row__methods">{person.facts.filter((fact) => fact.evidence[0]).slice(0, 2).map((fact) => <a key={fact.fact_id} href={fact.evidence[0].url} target="_blank" rel="noreferrer">Источник <Icon name="external" size={13} /></a>)}</div>
         </article>)}
       </div> : <div className="empty-inline"><span className="empty-inline__icon"><Icon name="phone" size={21} /></span><strong>Проверенных контактов пока нет</strong><p>Запустите сбор в панели выше и проверьте найденные факты и источники.</p></div>}

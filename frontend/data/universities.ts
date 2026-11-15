@@ -9,7 +9,7 @@ export type University = {
   version?: number;
 };
 
-export type Section = "about" | "contacts" | "projects" | "events";
+export type Section = "about" | "contacts" | "projects" | "events" | "review";
 export type View = "overview" | "universities" | "events" | "reports";
 
 export const initialUniversities: University[] = [

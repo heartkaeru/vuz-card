@@ -15,7 +15,7 @@ from .fragment_models import parse_extraction_request
 from .models import GenerationRequest, Institution, MeetingContext
 from .pipeline import AssistantPipeline, DraftValidationError
 from .workflow_models import ResearchRun, ReviewBatch, WorkflowError
-from .changes import compare_run, effective_facts, head_key, normalized
+from .changes import compare_run, effective_facts, head_key, person_aliases, person_identity
 
 
 def documents_for(card, mode):
@@ -130,22 +130,28 @@ class LLMWorkflow:
             raise WorkflowError("duplicate_review_fact_id")
 
         def apply(run, db):
-            if run.status not in {"needs_review", "partial"}:
+            revoke_only = all(decision.decision == "revoke" for decision in batch.decisions)
+            if run.status not in {"needs_review", "partial"} and not (run.status == "failed" and revoke_only):
                 raise WorkflowError("run_not_reviewable")
             by_id = {f.fact_id: f for f in run.facts}
-            if not set(ids) <= by_id.keys():
+            active = {f.fact_id: f for f in effective_facts(run)}
+            revoking_ids = {d.fact_id for d in batch.decisions if d.decision == "revoke"}
+            deciding_current_ids = {d.fact_id for d in batch.decisions if d.decision != "revoke"}
+            if not deciding_current_ids <= by_id.keys():
                 raise WorkflowError("unknown_review_fact_id")
+            if not revoking_ids <= active.keys():
+                raise WorkflowError("fact_not_accepted")
             retirement_ids = [decision.fact_id for decision in batch.retirements]
             if len(retirement_ids) != len(set(retirement_ids)) or set(retirement_ids) & set(ids):
                 raise WorkflowError("invalid_retirement_fact_ids")
             accepted_ids = {d.fact_id for d in batch.decisions if d.decision == "accept"}
             changes = compare_run(run)["entries"]
-            active = {f.fact_id: f for f in effective_facts(run)}
-            active_heads = {normalized(f.subject.person_name) for f in active.values() if head_key(f)}
+            aliases = person_aliases([*active.values(), *by_id.values()])
+            active_heads = {person_identity(f, aliases) for f in active.values() if head_key(f)}
             for fid in accepted_ids:
                 candidate = by_id[fid]
                 if (head_key(candidate) and active_heads
-                        and normalized(candidate.subject.person_name) not in active_heads
+                        and person_identity(candidate, aliases) not in active_heads
                         and not any(c["kind"] == "head_change" and fid in c["retirement_trigger_ids"] for c in changes)):
                     raise WorkflowError("ambiguous_head_replacement")
             required = set()
@@ -160,6 +166,25 @@ class LLMWorkflow:
                     raise WorkflowError("replacement_source_check_required")
             now = stamp()
             for decision in batch.decisions:
+                if decision.decision == "revoke":
+                    fact = active[decision.fact_id]
+                    before = fact.model_dump_json()
+                    if fact.fact_id in by_id:
+                        current_fact = by_id[fact.fact_id]
+                        current_fact.verification_status = "pending"
+                        current_fact.last_checked_at = None
+                        current_fact.freshness_status = "unknown"
+                        current_fact.reviewed_by, current_fact.reviewed_at = actor, now
+                        after = current_fact.model_dump_json()
+                    else:
+                        run.retired_fact_ids.append(fact.fact_id)
+                        after = json.dumps({"fact": fact.model_dump(mode="json"), "active": False,
+                                            "revoked": True}, ensure_ascii=False)
+                    db.execute("INSERT INTO llm_review VALUES (?,?,?,?,?,?,?,?,?,?)", (
+                        f"review_{uuid4().hex}", run_id, run.revision + 1, fact.fact_id,
+                        "revoke", actor, now.isoformat(), decision.reason, before, after))
+                    continue
+
                 fact = by_id[decision.fact_id]
                 if decision.decision == "accept":
                     if fact.validation_status != "passed" or fact.issues or fact.verification_status == "conflict":
@@ -177,11 +202,28 @@ class LLMWorkflow:
             for retirement in batch.retirements:
                 fact = active[retirement.fact_id]
                 run.retired_fact_ids.append(fact.fact_id)
+                replaced_by = sorted({candidate.fact_id for change in changes
+                                      if fact.fact_id in change["retirement_ids"]
+                                      for candidate in change["after"] if candidate.fact_id in accepted_ids})
                 after = {"fact": fact.model_dump(mode="json"), "active": False,
-                         "replaced_by": sorted(accepted_ids)}
+                         "replaced_by": replaced_by or sorted(accepted_ids)}
                 db.execute("INSERT INTO llm_review VALUES (?,?,?,?,?,?,?,?,?,?)", (
                     f"review_{uuid4().hex}", run_id, run.revision + 1, fact.fact_id,
                     "retire", actor, now.isoformat(), retirement.reason, fact.model_dump_json(), json.dumps(after, ensure_ascii=False)))
+
+            # Restore the prior active value when the accepted replacement that retired it is undone.
+            if revoking_ids:
+                still_active_ids = active.keys() - revoking_ids
+                retirements_by_fact = {}
+                for retired_id, after_json in db.execute(
+                        "SELECT fact_id,after_json FROM llm_review WHERE run_id=? AND decision='retire'", (run_id,)):
+                    retirements_by_fact.setdefault(retired_id, []).append(
+                        set(json.loads(after_json).get("replaced_by", [])))
+                for retired_id, replacements in retirements_by_fact.items():
+                    directly_undone = any(ids & revoking_ids for ids in replacements)
+                    replacement_still_active = any(ids & still_active_ids for ids in replacements)
+                    if directly_undone and not replacement_still_active and retired_id in run.retired_fact_ids:
+                        run.retired_fact_ids.remove(retired_id)
 
         return self.repository.mutate(run_id, batch.expected_revision, apply)
 
