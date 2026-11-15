@@ -177,7 +177,7 @@ class Fact(StrictModel):
     subject: Subject | NonPersonSubject | EntitySubject
     field: FactField
     value: str
-    origin: Literal["llm", "subject_projection", "parser_projection", "curated_candidate"] = "llm"
+    origin: Literal["llm", "subject_projection", "parser_projection", "curated_candidate", "manual_edit"] = "llm"
     contact_owner: ContactOwner | None = None
     metric_context: MetricContext | None = None
     evidence: list[Evidence]

@@ -1,16 +1,17 @@
 import asyncio
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.services.llm.changes import compare_run, effective_facts
+from app.services.llm.changes import compare_run, effective_facts, reconfirmation_matches
 from app.services.llm.client import FixtureProvider
 from app.services.llm.models import Institution
 from app.services.llm.pipeline import AssistantPipeline
 from app.services.llm.workflow import LLMWorkflow
 from app.services.llm.workflow_models import ReviewBatch, WorkflowError
 from database.demo1_store import DemoRepository
+from database.llm_store import stamp
 from parser.cleaner import HTMLCleaner
 from parser.models import UniversityData, UniversityInfo
 
@@ -35,7 +36,8 @@ def collect(repo, card, key, name=NAME, phone=OLD, empty=False):
 def review(workflow, run, ids=None, decision="accept", retire=()):
     return workflow.review(run.run_id, ReviewBatch(expected_revision=run.revision, decisions=[
         {"fact_id": fid, "decision": decision, "source_checked": True, "reason": "Synthetic source checked"}
-        for fid in (ids if ids is not None else [f.fact_id for f in run.facts])], retirements=[
+        for fid in (ids if ids is not None else [f.fact_id for f in run.facts
+                                                if f.fact_id not in run.reconfirmed_candidate_ids])], retirements=[
         {"fact_id": fid, "source_checked": True, "reason": "Explicit replacement of synthetic old value"} for fid in retire]), actor="test-reviewer")
 
 
@@ -53,6 +55,8 @@ def test_phone_update_requires_explicit_replacement_and_keeps_history(initial):
     workflow, run, _ = collect(repo, card, "second", phone=NEW)
     changes = compare_run(run)
     change = next(c for c in changes["entries"] if c["kind"] == "changed")
+    assert len({c["group_id"] for c in changes["entries"]}) == 1
+    assert set(run.reconfirmed_facts) == {f.fact_id for f in old.facts if f.field.value != "contact.phone"}
     assert change["before"][0].value == OLD and change["after"][0].value == NEW
     assert run.previous_run_id == old.run_id and len(run.baseline_facts) == 3
     assert {f.value for f in effective_facts(run) if f.field.value == "contact.phone"} == {OLD}
@@ -94,14 +98,24 @@ def test_empty_repeat_does_not_delete_or_recheck_old_facts_and_can_export_them(i
     assert any("сбор не удался" in warning for warning in draft.warnings)
 
 
-def test_unchanged_values_still_need_review_of_new_source(initial):
+def test_unchanged_values_refresh_official_evidence_and_preserve_review(initial):
     repo, card, old = initial
     workflow, run, parsed = collect(repo, card, "unchanged")
     assert compare_run(run)["counts"]["unchanged"] == 3
-    assert all(f.verification_status == "pending" for f in run.facts)
-    assert effective_facts(run) == effective_facts(old)
+    assert run.reconfirmed_candidate_ids == {fact.fact_id for fact in run.facts}
+    for fact, previous in zip(effective_facts(run), effective_facts(old), strict=True):
+        assert fact.fact_id == previous.fact_id and fact.value == previous.value
+        assert (fact.reviewed_by, fact.reviewed_at) == (previous.reviewed_by, previous.reviewed_at)
+        assert fact.last_checked_at == parsed.documents[0].retrieved_at > previous.last_checked_at
+        assert fact.evidence[0].retrieved_at == fact.last_checked_at
+    assert repo.get(old.run_id) == old
+    with pytest.raises(WorkflowError, match="fact_already_reconfirmed"):
+        review(workflow, run, [run.facts[0].fact_id])
+    assert len(repo.reviews(run.run_id)) == 3
+    assert all(record["decision"] == "source_recheck" and record["actor"] == "system" for record in repo.reviews(run.run_id))
     again, created = workflow.create(run.institution, parsed, "unchanged", modes=("0.2",))
     assert not created and again.run_id == run.run_id
+    assert len(repo.reviews(again.run_id)) == 3
     assert repo.card(card["id"])["latest_run"] == run.run_id
 
 
@@ -115,6 +129,37 @@ def test_possible_rector_change_archives_previous_profile_only_on_explicit_revie
     run = review(workflow, run, retire=entry["retirement_ids"])
     assert {f.subject.person_name for f in effective_facts(run)} == {"Петров Пётр Петрович"}
     assert all(f.verification_status == "verified" for f in repo.get(old.run_id).facts)
+
+
+@pytest.mark.parametrize("competing", ["different-value", "different-owner", "conflict"])
+def test_competing_contact_observations_keep_the_old_phone_for_human_review(initial, competing):
+    repo, card, old = initial
+    _, run, parsed = collect(repo, card, "repeat")
+    run.baseline_facts = copy.deepcopy(old.facts)
+    phone = next(f for f in run.facts if f.field.value == "contact.phone")
+    other = phone.model_copy(deep=True, update={"fact_id": "conflicting-observation"})
+    if competing == "different-value":
+        other.value = NEW
+    elif competing == "different-owner":
+        other.subject.person_name = other.contact_owner.label = "Петров Пётр Петрович"
+    else:
+        other.verification_status = "conflict"
+    run.facts.append(other)
+    now = stamp()
+    matches = list(reconfirmation_matches(run, parsed, cutoff=now - timedelta(days=7), now=now))
+    assert {fact.field.value for fact, _, _ in matches} == {"person.name", "appointment.position"}
+
+
+def test_same_values_on_new_url_wait_for_human_review(initial):
+    repo, card, old = initial
+    _, run, parsed = collect(repo, card, "repeat")
+    run.baseline_facts = copy.deepcopy(old.facts)
+    parsed.documents[0].url = "https://university.example/old-news"
+    for fact in run.facts:
+        for proof in fact.evidence:
+            proof.url = parsed.documents[0].url
+    now = stamp()
+    assert list(reconfirmation_matches(run, parsed, cutoff=now - timedelta(days=7), now=now)) == []
 
 
 def test_unrelated_retirement_and_superseded_review_are_blocked(initial):

@@ -97,3 +97,72 @@ def test_nested_profiles_do_not_transfer_contact_between_owners():
     for f in doc.fragments:
         assert not all(name in doc.text[f.start:f.end] for name in ("Иванов Иван Иванович", "Петров Пётр Петрович"))
     request(doc)
+
+
+def test_shared_email_is_not_projected_and_explicit_deputy_keeps_local_phone():
+    doc = document(
+        profile(email="common@example.org", extra='<span itemprop="telephone">552-07-26</span>') +
+        '<div itemprop="teachingStaff"><span itemprop="fio">Петров Пётр Петрович</span>'
+        '<span itemprop="post">Зам.директора по учебной работе</span>'
+        '<span itemprop="telephone">297-10-35</span><span itemprop="email">COMMON@example.org</span></div>'
+    )
+    req = request(doc)
+    req.project_structured_contacts = True
+    assert [(h.field, h.value, h.owner.label) for h in hints(doc)] == [
+        ("contact.phone", "552-07-26", "Иванов Иван Иванович"),
+        ("contact.phone", "297-10-35", "Петров Пётр Петрович"),
+    ]
+    assert "common@example.org" in doc.text
+    response = {"facts": [{
+        "subject": {"person_name": "Иванов Иван Иванович"}, "field": "contact.email",
+        "value": "common@example.org", "fragment_ids": [doc.fragments[0].fragment_id],
+        "contact_owner": {"kind": "person", "label": "Иванов Иван Иванович"},
+    }], "gaps": []}
+    result = asyncio.run(AssistantPipeline(FixtureProvider([response])).extract_facts(req))
+    email, = [f for f in result.facts if f.field.value == "contact.email"]
+    assert email.issues == ["contact_owner_requires_source_scope"]
+    assert [f.value for f in result.facts if f.field.value == "contact.phone"] == ["552-07-26", "297-10-35"]
+
+
+def test_institution_email_in_footer_is_not_assigned_to_single_leader():
+    doc = HTMLCleaner().to_document(
+        "<main>" + profile(email="common@example.org") + "</main>"
+        '<footer><a href="mailto:common@example.org">Почта колледжа</a></footer>',
+        url="https://university.example/managers", section="leadership",
+    )
+    assert not hints(doc)
+    request(doc)
+
+
+def test_repeated_main_phone_is_not_personal_but_extensions_are_distinct():
+    def phone_profile(name, email, phone):
+        return profile(name, email, extra=f'<span itemprop="telephone">{phone}</span>')
+
+    doc = document("".join([
+        phone_profile("Иванов Иван Иванович", "ivanov@example.org", "+7 (495) 111-22-33"),
+        phone_profile("Петров Пётр Петрович", "petrov@example.org", "8 (495) 111-22-33"),
+        phone_profile("Сидоров Сидор Сидорович", "sidorov@example.org", "+7 (495) 111-22-33 доб. 12"),
+    ]))
+    assert [h.value for h in hints(doc) if h.field == "contact.phone"] == ["+7 (495) 111-22-33 доб. 12"]
+    request(doc)
+
+
+def test_structured_position_recovers_paraphrase_from_explicit_profile_only_once():
+    doc = document(profile().replace("Ректор", "И. о. ректора"))
+    fragment = doc.fragments[0]
+    req = request(doc)
+    response = {"facts": [{
+        "subject": {"person_name": "Иванов Иван Иванович"}, "field": "appointment.position",
+        "value": "Исполняющий обязанности ректора", "fragment_ids": [fragment.fragment_id],
+    }], "gaps": []}
+    result = asyncio.run(AssistantPipeline(FixtureProvider([response])).extract_facts(req))
+    valid = [f for f in result.facts if f.field.value == "appointment.position" and f.validation_status == "passed"]
+    assert [(f.value, f.origin, f.verification_status) for f in valid] == [
+        ("И. о. ректора", "parser_projection", "pending"),
+    ]
+    assert valid[0].evidence[0].quote == doc.text
+    response["facts"][0]["value"] = "И. о. ректора"
+    result = asyncio.run(AssistantPipeline(FixtureProvider([response])).extract_facts(req))
+    assert [(f.value, f.origin) for f in result.facts if f.field.value == "appointment.position"] == [
+        ("И. о. ректора", "llm"),
+    ]

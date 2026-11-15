@@ -1,15 +1,15 @@
 "use client";
 
-import { forwardRef, useEffect, useImperativeHandle, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, post, errorText, downloadFile, type ApiCard, type CardDetail, type Fact, type ResearchRun, type Job, type Material, type ChangeSet, type PptxPreviewData, type ResearchHistory, type SavedMaterial } from "@/lib/api";
+import { api, post, errorText, downloadFile, type ApiCard, type CardDetail, type Fact, type ResearchRun, type Job, type Material, type ChangeSet, type PptxPreviewData, type ResearchHistory, type SavedMaterial, type PartnershipMatch, type CardActionResult } from "@/lib/api";
 import { Icon } from "@/components/icon";
 import { PptxPreview } from "@/components/pptx-preview";
 import { type University } from "@/data/universities";
 import { ResearchChanges } from "@/components/research-changes";
 import { buildPersonAliases, personIdentityKey } from "@/lib/person-identity";
 
-export type ResearchHandle = { generate: () => Promise<string>; refresh: () => Promise<string> };
+export type ResearchHandle = { generate: () => Promise<CardActionResult>; refresh: () => Promise<string>; openReportOptions: () => void; showRecheck: () => void };
 type Props = {
   university: University; showFacts: boolean; reviewOutlet: HTMLDivElement | null; onShowFacts: () => void;
   onConnected: (card: ApiCard) => void; onRunChange: (run: ResearchRun | null) => void;
@@ -24,6 +24,10 @@ const fields: Record<string, string> = {
   "institution.profile": "Профиль учреждения", "institution.type": "Тип учреждения", "institution.location": "Местонахождение",
   "institution.founded": "Основание", "institution.education_areas": "Направления подготовки",
   "institution.education_levels": "Уровни образования", "institution.students": "Обучающиеся", "institution.structure": "Структура и филиалы",
+  "project.name": "Название проекта", "project.program": "Программа", "project.role": "Роль учреждения",
+  "project.status": "Статус проекта", "project.period": "Период проекта", "project.description": "Описание проекта",
+  "event.name": "Название события", "event.type": "Вид события", "event.date": "Дата события",
+  "event.status": "Статус события", "event.description": "Описание события",
 };
 const statuses: Record<string, string> = { pending: "На проверке", verified: "Принято", rejected: "Отклонено", conflict: "Конфликт" };
 const issueMessages: Record<string, string> = {
@@ -50,6 +54,20 @@ const issueMessages: Record<string, string> = {
 };
 function issueMessage(code: string) {
   return issueMessages[code] ?? "Кандидат не прошёл автоматическую проверку доказательств.";
+}
+
+function parsePdfPages(value: string): number[] | null {
+  if (!value.trim()) return null;
+  const pages = new Set<number>();
+  for (const part of value.split(",")) {
+    const match = part.trim().match(/^(\d{1,3})(?:\s*-\s*(\d{1,3}))?$/);
+    if (!match) throw new Error("Страницы PDF: укажите номера или диапазоны через запятую, например 1, 3-5, 18.");
+    const first = Number(match[1]), last = Number(match[2] ?? match[1]);
+    if (first < 1 || last > 300 || last < first || last - first >= 20) throw new Error("Допустимо до 20 страниц PDF с номерами от 1 до 300.");
+    for (let number = first; number <= last; number++) pages.add(number);
+    if (pages.size > 20) throw new Error("За один сбор можно выбрать до 20 страниц PDF.");
+  }
+  return [...pages].sort((a, b) => a - b);
 }
 
 type FactGroup = { key: string; title: string; description: string; facts: Fact[] };
@@ -109,6 +127,12 @@ function groupReviewFacts(facts: Fact[], institutionName: string, identityFacts 
 
 export const ResearchPanel = forwardRef<ResearchHandle, Props>(function ResearchPanel({ university, showFacts, reviewOutlet, onShowFacts, onConnected, onRunChange }, ref) {
   const [website, setWebsite] = useState(university.website ?? "");
+  const [leadershipUrl, setLeadershipUrl] = useState("");
+  const [biographyUrl, setBiographyUrl] = useState("");
+  const [institutionUrls, setInstitutionUrls] = useState("");
+  const [includeInstitution, setIncludeInstitution] = useState(true);
+  const [pdfUrl, setPdfUrl] = useState("");
+  const [pdfPages, setPdfPages] = useState("");
   const [card, setCard] = useState<ApiCard | null>(null);
   const [run, setRun] = useState<ResearchRun | null>(null);
   const [job, setJob] = useState<Job | null>(null);
@@ -119,6 +143,9 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [material, setMaterial] = useState<Material | null>(null);
+  const [downloadFormat, setDownloadFormat] = useState<"pptx" | "docx">("pptx");
+  const [formatPickerOpen, setFormatPickerOpen] = useState(false);
+  const [briefPreview, setBriefPreview] = useState("");
   const [presentationPreview, setPresentationPreview] = useState<PptxPreviewData | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -132,21 +159,40 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [showRejected, setShowRejected] = useState(false);
   const [meetingGoal, setMeetingGoal] = useState("");
   const [meetingDate, setMeetingDate] = useState("");
+  const [partnership, setPartnership] = useState<{ key: string; matches: PartnershipMatch[] } | null>(null);
+  const [matching, setMatching] = useState(false);
+  const [includePartnership, setIncludePartnership] = useState(false);
   const [presentationVariant, setPresentationVariant] = useState<"compact" | "detailed">("compact");
   const [comparison, setComparison] = useState<ChangeSet | null>(null);
   const [history, setHistory] = useState<ResearchHistory[]>([]);
   const [pastChanges, setPastChanges] = useState<ChangeSet | null>(null);
   const [reviewTab, setReviewTab] = useState<ReviewTab>("candidates");
   const [replacePrevious, setReplacePrevious] = useState(false);
-  const busy = saving || job?.status === "queued" || job?.status === "running";
+  const [recheckConfirmed, setRecheckConfirmed] = useState(false);
+  const recheckRef = useRef<HTMLFieldSetElement>(null);
+  const busy = saving || matching || job?.status === "queued" || job?.status === "running";
   const currentComparison = comparison?.run_id === run?.run_id && comparison?.revision === run?.revision ? comparison : null;
   const accepted = currentComparison?.approved_facts.length
     ?? run?.facts.filter((fact) => fact.verification_status === "verified" && fact.validation_status === "passed" && !fact.issues.length).length
     ?? 0;
+  const recheckIds = new Set(currentComparison?.recheck_fact_ids);
+  const factsToRecheck = currentComparison?.approved_facts.filter((fact) => recheckIds.has(fact.fact_id)) ?? [];
+  const meeting = { goal: meetingGoal.trim() || "Цель встречи не задана", date: meetingDate || null };
+  const partnershipKey = JSON.stringify([run?.run_id, run?.revision, meeting]);
+  const partnershipMatches = partnership?.key === partnershipKey ? partnership.matches : null;
+  const downloadUrl = material && `${material.download_url}${material.download_url.includes("?") ? "&" : "?"}format=${downloadFormat}`;
   const retirementIds = [...new Set((currentComparison?.entries ?? []).filter((change) => change.retirement_trigger_ids.some((id) => selected.includes(id)))
     .flatMap((change) => change.retirement_ids))];
+  const reconfirmedIds = new Set(Object.values(run?.reconfirmed_facts ?? {}).flat());
+  const candidates = run?.facts.filter((fact) => fact.origin !== "manual_edit" && !run.retired_fact_ids?.includes(fact.fact_id)
+    && !reconfirmedIds.has(fact.fact_id)) ?? [];
+  const canAccept = (fact: Fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length;
+  const readyForReview = candidates.filter(canAccept);
+  const problematic = candidates.filter((fact) => fact.verification_status === "rejected"
+    || fact.verification_status === "conflict" || fact.validation_status === "failed" || fact.issues.length > 0);
+  const blockedSelection = problematic.some((fact) => selected.includes(fact.fact_id));
   const rejected = run?.facts.filter((fact) => fact.verification_status === "rejected").length ?? 0;
-  const pending = run?.facts.filter((fact) => fact.verification_status === "pending").length ?? 0;
+  const reconfirmed = Object.keys(run?.reconfirmed_facts ?? {}).length;
   const issueCounts = new Map<string, number>();
   for (const fact of run?.facts ?? []) for (const code of fact.issues) issueCounts.set(code, (issueCounts.get(code) ?? 0) + 1);
   const stageErrors = run ? [...run.errors, ...Object.values(run.results).flatMap((result) => result.errors.map((item) => item.code))] : [];
@@ -160,8 +206,9 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const candidateFactIds = new Set((run?.facts ?? []).filter((fact) => fact.verification_status !== "verified").map((fact) => fact.fact_id));
   const selectedCandidateCount = selected.filter((id) => candidateFactIds.has(id)).length;
   const identityFacts = [...(run?.facts ?? []), ...acceptedFacts];
+  const pending = candidates.filter((fact) => fact.verification_status === "pending").length;
   const visibleFactGroups = run ? groupReviewFacts(
-    run.facts.filter((fact) => fact.verification_status !== "verified" && (showRejected || fact.verification_status !== "rejected")),
+    candidates.filter((fact) => fact.verification_status !== "verified" && (showRejected || fact.verification_status !== "rejected")),
     university.name, identityFacts,
   ) : [];
   const acceptedFactGroups = acceptedFacts.length ? groupReviewFacts(acceptedFacts, university.name, identityFacts) : [];
@@ -169,10 +216,18 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   function load(detail: CardDetail) {
     setCard(detail); setWebsite(detail.website); setRun(detail.run); onRunChange(detail.run); setJob(detail.job);
     if (detail.job?.identity?.presentation_variant) setPresentationVariant(detail.job.identity.presentation_variant);
+    if (detail.job?.identity?.leadership_url) setLeadershipUrl(detail.job.identity.leadership_url);
+    if (detail.job?.identity?.biography_url) setBiographyUrl(detail.job.identity.biography_url);
+    if (detail.job?.identity?.institution_urls) setInstitutionUrls(detail.job.identity.institution_urls.join("\n"));
+    if (detail.job?.identity?.include_institution !== undefined) setIncludeInstitution(detail.job.identity.include_institution);
+    const pdf = detail.job?.identity?.pdf_sources?.[0];
+    if (pdf) { setPdfUrl(pdf.url); setPdfPages(pdf.pages?.join(", ") ?? ""); }
     if (detail.job?.identity?.meeting) {
       setMeetingGoal(detail.job.identity.meeting.goal);
       setMeetingDate(detail.job.identity.meeting.date ?? "");
     }
+    if (detail.job?.status === "failed" && detail.job.result?.code === "facts_require_freshness_check"
+        && detail.job.identity?.expected_revision !== detail.run?.revision) setJob(null);
     if (detail.job?.status === "completed" && detail.job.result?.material_id &&
         detail.job.identity?.expected_revision === detail.run?.revision) setMaterial(detail.job.result as Material);
   }
@@ -190,14 +245,17 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     return () => { active = false; };
   }, [university.backendId]);
 
-  useEffect(() => { setSelected([]); setSourceChecked(false); setPastChanges(null); setReviewTab("candidates"); }, [run?.run_id, run?.revision]);
-  useEffect(() => { setReplacePrevious(false); }, [run?.run_id, run?.revision, selected.join("|")]);
+  useEffect(() => { setSelected([]); setPastChanges(null); setRecheckConfirmed(false); setReviewTab("candidates"); }, [run?.run_id, run?.revision]);
+  useEffect(() => { setSourceChecked(false); setReplacePrevious(false); }, [run?.run_id, run?.revision, selected.join("|")]);
 
   useEffect(() => {
     if (!run || !card) return;
     let active = true;
-    Promise.all([api<ChangeSet>(`/runs/${run.run_id}/changes`), api<ResearchHistory[]>(`/cards/${encodeURIComponent(card.id)}/history`)])
-      .then(([changes, runs]) => { if (active) { setComparison(changes); setHistory(runs); } })
+    api<ChangeSet>(`/runs/${run.run_id}/changes`)
+      .then((changes) => { if (active) setComparison(changes); })
+      .catch((failure) => { if (active) setError(errorText(failure)); });
+    api<ResearchHistory[]>(`/cards/${encodeURIComponent(card.id)}/history`)
+      .then((runs) => { if (active) setHistory(runs); })
       .catch((failure) => { if (active) setError(errorText(failure)); });
     return () => { active = false; };
   }, [run?.run_id, run?.revision, card?.id]);
@@ -230,6 +288,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   async function refresh() {
     setSaving(true); setError(""); setMaterial(null);
     try {
+      const pages = pdfUrl.trim() ? parsePdfPages(pdfPages) : null;
       let target = card;
       if (!target) {
         target = await post<ApiCard>("/cards", { name: university.name, city: university.city, website });
@@ -237,6 +296,11 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       }
       const next = await post<Job>(`/cards/${encodeURIComponent(target.id)}/refresh`, {
         version: target.version, request_key: crypto.randomUUID(),
+        leadership_url: leadershipUrl.trim() || null,
+        biography_url: biographyUrl.trim() || null,
+        institution_urls: institutionUrls.split(/\n/).map((url) => url.trim()).filter(Boolean),
+        include_institution: includeInstitution,
+        pdf_sources: pdfUrl.trim() ? [{url: pdfUrl.trim(), pages}] : [],
       });
       setRun(null); onRunChange(null); setJob(next); showCandidates();
       return "Задание сбора создано. Состояние и результаты появятся в карточке руководства.";
@@ -266,18 +330,73 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     finally { setSaving(false); }
   }
 
-  async function generate() {
-    if (!run || (!accepted && !material)) { const message = "Для презентации сначала примите проверенные факты о руководстве."; setError(message); showCandidates(); return message; }
-    if (busy) return "Для карточки уже выполняется задание. Дождитесь его завершения.";
+  async function recommendPartnership() {
+    if (!run || !accepted || busy) return;
+    setMatching(true); setError("");
+    try {
+      const matches = await post<PartnershipMatch[]>(`/runs/${run.run_id}/partnership-matches`, {
+        expected_revision: run.revision, meeting,
+      });
+      setPartnership({ key: partnershipKey, matches });
+      setIncludePartnership(false);
+      setMaterial(null);
+    } catch (failure) { setError(errorText(failure)); }
+    finally { setMatching(false); }
+  }
+
+  async function recheck() {
+    if (!run || !factsToRecheck.length || !recheckConfirmed || !reviewer.trim() || busy) return;
+    setSaving(true); setError("");
+    try {
+      const updated = await post<ResearchRun>(`/runs/${run.run_id}/recheck`, {
+        expected_revision: run.revision, fact_ids: factsToRecheck.map((fact) => fact.fact_id),
+        reviewer: reviewer.trim(), source_checked: true,
+      });
+      setRun(updated); onRunChange(updated); setMaterial(null);
+      if (job?.status === "failed" && job.result?.code === "facts_require_freshness_check") setJob(null);
+    } catch (failure) { setError(errorText(failure)); }
+    finally { setSaving(false); }
+  }
+
+  async function generate(): Promise<CardActionResult> {
+    if (busy) return { message: "Для карточки уже выполняется задание. Дождитесь его завершения." };
+    if (!run || (!accepted && !material)) {
+      const message = "Для презентации сначала примите проверенные факты о руководстве.";
+      setError(message); showCandidates(); return { message };
+    }
+    if (factsToRecheck.length) {
+      const message = errorText(new Error("facts_require_freshness_check"));
+      setError(message);
+      return { message, needsRecheck: true };
+    }
     setSaving(true); setError("");
     try {
       setJob(await post<Job>(`/runs/${run.run_id}/materials`, {
         expected_revision: run.revision, request_key: crypto.randomUUID(),
-        meeting: { goal: meetingGoal.trim() || "Цель встречи не задана", date: meetingDate || null },
+        meeting,
         presentation_variant: presentationVariant,
+        partnership_matches: includePartnership ? partnershipMatches ?? [] : [],
       }));
-      return "Задание формирования презентации создано. Ссылка на PPTX появится после завершения.";
-    } catch (failure) { const message = errorText(failure); setError(message); return message; }
+      return { message: "Задание формирования презентации создано. Ссылка на PPTX появится в карточке после сборки.", queued: true };
+    } catch (failure) {
+      const needsRecheck = failure instanceof Error && failure.message === "facts_require_freshness_check";
+      if (needsRecheck) {
+        try {
+          const refreshed = await api<ChangeSet>(`/runs/${run.run_id}/changes`);
+          setComparison(refreshed);
+          if (!refreshed.recheck_fact_ids?.length) {
+            const message = "Список сведений для сверки недоступен. Перезапустите backend с текущей версией и обновите страницу.";
+            setError(message);
+            return { message };
+          }
+        } catch (refreshFailure) {
+          const message = "Не удалось загрузить сведения для сверки. " + errorText(refreshFailure);
+          setError(message);
+          return { message };
+        }
+      }
+      const message = errorText(failure); setError(message); return { message, needsRecheck };
+    }
     finally { setSaving(false); }
   }
 
@@ -286,20 +405,26 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     const currentMaterial = material;
     setPreviewOpen(true);
     setPreviewLoading(true); setError("");
-    setPreviewError(""); setPreviewActionError(""); setPresentationPreview(null);
+    setPreviewError(""); setPreviewActionError(""); setPresentationPreview(null); setBriefPreview("");
     setSavedMaterialId(null);
     try {
-      const [previewResult, reportsResult] = await Promise.allSettled([
-        api<PptxPreviewData>(`/materials/${encodeURIComponent(currentMaterial.material_id)}/preview`),
-        api<SavedMaterial[]>("/materials"),
-      ]);
+      const previewRequest = downloadFormat === "docx"
+        ? fetch(currentMaterial.brief_url, { cache: "no-store" }).then(async (response) => {
+          if (!response.ok) throw new Error("presentation_preview_unavailable");
+          return response.text();
+        })
+        : api<PptxPreviewData>(`/materials/${encodeURIComponent(currentMaterial.material_id)}/preview`);
+      const [previewResult, reportsResult] = await Promise.allSettled([previewRequest, api<SavedMaterial[]>("/materials")]);
       if (reportsResult.status === "fulfilled" && reportsResult.value.some((report) => report.id === currentMaterial.material_id)) {
         setSavedMaterialId(currentMaterial.material_id);
       }
       if (previewResult.status === "rejected") throw previewResult.reason;
-      const result = previewResult.value;
-      if (!result.slides.length) throw new Error("presentation_preview_unavailable");
-      setPresentationPreview(result);
+      if (downloadFormat === "docx") setBriefPreview(previewResult.value as string);
+      else {
+        const result = previewResult.value as PptxPreviewData;
+        if (!result.slides.length) throw new Error("presentation_preview_unavailable");
+        setPresentationPreview(result);
+      }
       return true;
     } catch (failure) {
       setPreviewError(failure instanceof TypeError
@@ -314,7 +439,8 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     setDownloadingPresentation(true);
     setError("");
     try {
-      await downloadFile(material.download_url, `${university.name} — презентация.pptx`);
+      await downloadFile(downloadUrl ?? material.download_url,
+        `${university.name} — отчёт.${downloadFormat}`);
     } catch (failure) {
       setError(errorText(failure));
       setPreviewActionError(errorText(failure));
@@ -324,7 +450,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   }
 
   async function addPresentationToReports() {
-    if (!material) return;
+    if (!material || downloadFormat !== "pptx") return;
     setSavingToReports(true);
     setPreviewActionError("");
     try {
@@ -338,11 +464,20 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   }
 
   async function openOrGeneratePresentation() {
+    setError("");
+    setFormatPickerOpen(true);
+  }
+
+  async function continueToPreview() {
     if (material?.presentation_variant === presentationVariant) {
-      await openPreview();
+      if (await openPreview()) setFormatPickerOpen(false);
       return;
     }
-    if (busy) return;
+    if (busy && job?.task_type === "material") {
+      setPreviewAfterGenerationFrom(material?.material_id ?? null);
+      setPreviewAfterGeneration(true);
+      return;
+    }
     if (!run || (!accepted && !material)) {
       setError(!run
         ? "Сначала нажмите «Найти и обновить информацию», чтобы собрать сведения."
@@ -350,26 +485,43 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       if (run) showCandidates();
       return;
     }
+    if (busy) {
+      setError("Дождитесь завершения текущего задания, затем откройте предпросмотр.");
+      return;
+    }
     setError("");
     setPreviewAfterGenerationFrom(material?.material_id ?? null);
     setPreviewAfterGeneration(true);
     const result = await generate();
-    if (!result.startsWith("Задание формирования презентации создано.")) {
+    if (!result.queued) {
       setPreviewAfterGeneration(false);
       setPreviewAfterGenerationFrom(null);
-      setError(result);
+      setError(result.message);
+      if (result.needsRecheck) {
+        setFormatPickerOpen(false);
+        showRecheck();
+      }
     }
+  }
+
+  function closeFormatPicker() {
+    setFormatPickerOpen(false);
+    setPreviewAfterGeneration(false);
+    setPreviewAfterGenerationFrom(null);
   }
 
   useEffect(() => {
     if (!previewAfterGeneration || !material || material.material_id === previewAfterGenerationFrom) return;
     setPreviewAfterGeneration(false);
     setPreviewAfterGenerationFrom(null);
-    void openPreview();
+    void openPreview().then((opened) => { if (opened) setFormatPickerOpen(false); });
   }, [material, previewAfterGeneration, previewAfterGenerationFrom]);
 
-  const downloadUrl = material?.download_url;
-  useImperativeHandle(ref, () => ({ generate, refresh }));
+  function showRecheck() {
+    recheckRef.current?.scrollIntoView({ block: "center" });
+    recheckRef.current?.focus({ preventScroll: true });
+  }
+  useImperativeHandle(ref, () => ({ generate, refresh, showRecheck, openReportOptions: () => { setError(""); setFormatPickerOpen(true); } }));
 
   return <section className="content-card research-panel" aria-label="Актуализация и проверка фактов">
     <div className="content-card__heading"><div><h2>Руководство и сведения об учреждении</h2></div></div>
@@ -378,10 +530,52 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         onChange={(event) => setWebsite(event.target.value)} placeholder="https://university.ru" aria-label="Официальный сайт" /></label>
       <label>Вариант презентации<select value={presentationVariant} disabled={Boolean(busy)}
         onChange={(event) => setPresentationVariant(event.target.value as "compact" | "detailed")}>
-        <option value="compact">Краткая карточка — 3 слайда</option>
+        <option value="compact">Краткая карточка</option>
         <option value="detailed">Подробная справка — все разделы</option>
       </select></label>
     </div>
+    {factsToRecheck.length > 0 && <fieldset ref={recheckRef} tabIndex={-1} className="research-meeting" disabled={Boolean(busy)}>
+      <legend>Повторная проверка перед экспортом</legend>
+      <p>Сверьте принятые сведения с источниками. Если значение изменилось, обновите карточку перед экспортом.</p>
+      <details><summary>Сведения для сверки ({factsToRecheck.length})</summary>
+        <ul>{factsToRecheck.map((fact) => <li key={fact.fact_id}>
+          <strong>{fact.subject.person_name ?? fact.subject.entity_name ?? fact.contact_owner?.label ?? "Учреждение"}</strong>
+          {" · "}{fields[fact.field] ?? fact.field}{" · "}{fact.value}
+          {fact.evidence.map((source, index) => <div key={index}>
+            <a href={source.page_number ? `${source.url.split("#")[0]}#page=${source.page_number}` : source.url}
+              target="_blank" rel="noreferrer">Источник{source.page_number ? ` · страница ${source.page_number}` : ""}</a>
+          </div>)}
+        </li>)}</ul>
+      </details>
+      <div className="research-controls">
+        <label>Проверяющий<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} maxLength={160} /></label>
+        <button className="button button--soft" type="button" disabled={!reviewer.trim() || !recheckConfirmed}
+          onClick={() => { void recheck(); }}>Подтвердить актуальность</button>
+      </div>
+      <label className="research-ack"><input type="checkbox" checked={recheckConfirmed}
+        onChange={(event) => setRecheckConfirmed(event.target.checked)} /> Я повторно сверил(а) все указанные сведения, значения актуальны</label>
+    </fieldset>}
+    {run && (readyForReview.length > 0 || candidates.some((fact) => fact.verification_status === "verified")) && <div className="research-downloads">
+      <a className="button button--soft" href={`/api/v1/ai/runs/${encodeURIComponent(run.run_id)}/preview?expected_revision=${run.revision}&presentation_variant=${presentationVariant}`}
+        target="_blank" rel="noreferrer">Предпросмотр кандидатов (PPTX)</a>
+      <span>Для проверки содержания и вёрстки. Этот файл не означает принятие фактов.</span>
+    </div>}
+    <small>{presentationVariant === "compact" ? "Краткая карточка: руководитель, учреждение, повестка встречи. Полные значения и цитаты сохраняются в справке и заметках." : "Подробная справка: биография, руководство, показатели и отдельные слайды источников; объём зависит от данных."}</small>
+    <details className="research-source-options"><summary>Источники руководства, биографии и справки об учреждении</summary>
+      <label>Страница руководства<input type="url" value={leadershipUrl} disabled={Boolean(busy)}
+        onChange={(event) => setLeadershipUrl(event.target.value)} placeholder="https://university.ru/sveden/managers/" /></label>
+      <label>Официальная биография первого руководителя<input type="url" value={biographyUrl} disabled={Boolean(busy)}
+        onChange={(event) => setBiographyUrl(event.target.value)} placeholder="https://university.ru/about/rector/" /></label>
+      <label className="research-ack"><input type="checkbox" checked={includeInstitution} disabled={Boolean(busy)}
+        onChange={(event) => setIncludeInstitution(event.target.checked)} />Также собрать справку об учреждении</label>
+      <label>Страницы направлений, численности и структуры (до 3 ссылок, по одной в строке)<textarea value={institutionUrls} disabled={Boolean(busy)}
+        onChange={(event) => setInstitutionUrls(event.target.value)} rows={3} placeholder="https://university.ru/about/" /></label>
+      <label>Официальный отчёт в PDF<input type="url" value={pdfUrl} disabled={Boolean(busy)}
+        onChange={(event) => setPdfUrl(event.target.value)} placeholder="https://university.ru/report.pdf" /></label>
+      <label>Страницы PDF (номера с 1, до 20 страниц)<input value={pdfPages} disabled={Boolean(busy)}
+        onChange={(event) => setPdfPages(event.target.value)} placeholder="1, 3-5, 18" /></label>
+      <p>Без номеров обрабатываются первые 20 страниц PDF. Используются текстовые PDF и HTML официального сайта. Для численности нужны период и состав контингента; сканы пока не распознаются. Новые сведения потребуется проверить.</p>
+    </details>
     <fieldset className="research-meeting" disabled={Boolean(busy)}>
       <legend>Контекст встречи</legend>
       <div className="research-controls">
@@ -395,9 +589,42 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       <button className="button button--soft" type="button" disabled={Boolean(busy)}
         onClick={() => { void openOrGeneratePresentation(); }}>{busy && job?.task_type === "material" ? "Формируем презентацию…" : material?.presentation_variant === presentationVariant ? "Просмотреть и скачать презентацию" : material ? "Сформировать выбранный формат" : "Сформировать и просмотреть презентацию"}</button>
     </div>
+    <fieldset className="research-meeting" disabled={Boolean(busy)}>
+      <legend>Предложения к встрече</legend>
+      <button className="button button--soft" type="button" disabled={!accepted}
+        onClick={() => { void recommendPartnership(); }}>
+        {matching ? "Подбираем предложения…" : "Подобрать предложения"}
+      </button>
+      {partnershipMatches?.length === 0 && <small role="status">В принятых данных не нашлось оснований для предложений из каталога.</small>}
+      {Boolean(partnershipMatches?.length) && <>
+        <small>Проверьте аргументы и условия участия перед добавлением в презентацию.</small>
+        <ol>
+          {partnershipMatches?.map((match) => <li key={match.catalog_url}>
+            <p><strong>{match.product_name}</strong>{match.kind === "external_course" && " · внешний курс"}</p>
+            <p>{match.proposal}</p>
+            <p>{match.rationale}</p>
+            <p><strong>Вопрос для встречи</strong> {match.discussion_question}</p>
+            <p><a href={match.catalog_url} target="_blank" rel="noreferrer">Источник предложения</a></p>
+            <ul>{match.basis_fact_ids.map((id) => {
+              const fact = currentComparison?.approved_facts.find((item) => item.fact_id === id);
+              const source = fact?.evidence[0];
+              return fact && source ? <li key={id}><a href={source.url} target="_blank" rel="noreferrer">{fact.value}</a></li> : null;
+            })}</ul>
+          </li>)}
+        </ol>
+        <label className="research-ack"><input type="checkbox" checked={includePartnership}
+          onChange={(event) => { setIncludePartnership(event.target.checked); setMaterial(null); }} /> Добавить предложения в PPTX</label>
+      </>}
+    </fieldset>
     {job && <div className="research-progress" role="status"><span>{job.message}</span><progress value={job.progress} max={100} /></div>}
-    {error && <p className="research-error" role="alert">{error}</p>}
-    {run && <p className="research-summary">В последнем сборе: {run.facts.length} кандидатов · на проверке: {pending} · в подтверждённой карточке: {accepted} · отклонено: {rejected} · {run.status === "partial" ? "сбор частичный" : run.status === "failed" ? "сбор не выполнен; прежние принятые сведения сохранены" : "результат сохранён"}.
+    {error && !formatPickerOpen && <p className="research-error" role="alert">{error}</p>}
+    {material && <div className="research-downloads">
+      <button className="button button--soft" type="button" onClick={() => setFormatPickerOpen(true)}>Просмотреть и выбрать формат</button>
+      <a className="button button--primary" href={downloadUrl ?? material.download_url}>Скачать {downloadFormat.toUpperCase()}</a>
+      <a className="button button--soft" href={material.brief_url} target="_blank" rel="noreferrer">Открыть справку</a>
+      <span>{material.presentation_variant === "compact" ? "Краткая карточка" : "Подробная справка"} · черновик для проверки перед встречей</span>
+    </div>}
+    {run && <p className="research-summary">На сверку: {readyForReview.length} · подтверждено повторным сбором: {reconfirmed} · в подтверждённой карточке: {accepted} · отклонено: {rejected} · {run.status === "partial" ? "сбор частичный" : run.status === "failed" ? "сбор не выполнен, прежние сведения сохранены" : "результат сохранён"}.
       {!showFacts && <button className="text-button" type="button" onClick={onShowFacts}>Проверить факты</button>}</p>}
     {run && Object.values(run.results).some((result) => result.run?.provider === "fixture") &&
       <p className="research-summary">Учебный прогон: сохранённые ответы модели, без обращения к GigaChat.</p>}
@@ -533,28 +760,60 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         <button className="button button--soft" type="button" disabled={Boolean(busy) || !selectedCandidateCount} onClick={() => { void review("reject"); }}>Отклонить выбранные</button></div>
       </div>
       </div>}</section>, reviewOutlet)}
+    {formatPickerOpen && typeof document !== "undefined" && createPortal(<div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeFormatPicker(); }}>
+      <section className="report-format-dialog" role="dialog" aria-modal="true" aria-labelledby="report-format-title">
+        <header className="report-preview__header">
+          <div><span className="eyebrow">ОТЧЁТ К ВСТРЕЧЕ</span><h2 id="report-format-title">Выберите формат файла</h2></div>
+          <button className="icon-button" type="button" onClick={closeFormatPicker} aria-label="Закрыть выбор формата"><Icon name="close" size={19} /></button>
+        </header>
+        <div className="report-format-options">
+          <label className={`report-format-option${downloadFormat === "pptx" ? " report-format-option--selected" : ""}`}>
+            <input type="radio" name="report-format" value="pptx" checked={downloadFormat === "pptx"} onChange={() => setDownloadFormat("pptx")} />
+            <span><strong>PowerPoint</strong><small>Презентация (.pptx)</small></span>
+          </label>
+          <label className={`report-format-option${downloadFormat === "docx" ? " report-format-option--selected" : ""}`}>
+            <input type="radio" name="report-format" value="docx" checked={downloadFormat === "docx"} onChange={() => setDownloadFormat("docx")} />
+            <span><strong>Word</strong><small>Документ (.docx)</small></span>
+          </label>
+        </div>
+        {!material && run && accepted > 0 && <p className="report-format-hint">Отчёт ещё не сформирован. После выбора формата он подготовится и откроется для просмотра.</p>}
+        {busy && job?.task_type === "material" && <p className="report-format-hint" role="status">{job.message} · {job.progress}%</p>}
+        {error && <p className="research-error" role="alert">{error}</p>}
+        <div className="report-format-actions">
+          <button className="button button--soft" type="button" onClick={closeFormatPicker}>Отмена</button>
+          <button className="button button--primary" type="button" disabled={previewLoading || previewAfterGeneration || (!material && (!run || !accepted)) || (busy && job?.task_type !== "material")} onClick={() => { void continueToPreview(); }}>
+            {previewLoading ? "Открываем…" : previewAfterGeneration || (busy && job?.task_type === "material") ? "Ждём завершения…" : material ? "Открыть предпросмотр" : !run || !accepted ? "Нет проверенных данных" : "Сформировать и просмотреть"}
+          </button>
+        </div>
+      </section>
+    </div>, document.body)}
     {previewOpen && typeof document !== "undefined" && createPortal(<div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreviewOpen(false); }}>
       <section className="report-preview" role="dialog" aria-modal="true" aria-labelledby="report-preview-title">
         <header className="report-preview__header">
-          <div><span className="eyebrow">ПРЕДПРОСМОТР PPTX</span><h2 id="report-preview-title">Презентация: {university.name}</h2></div>
+          <div><span className="eyebrow">ПРЕДПРОСМОТР {downloadFormat.toUpperCase()}</span><h2 id="report-preview-title">Отчёт к встрече: {university.name}</h2></div>
           <button className="icon-button" type="button" onClick={() => setPreviewOpen(false)} aria-label="Закрыть предпросмотр"><Icon name="close" size={19} /></button>
         </header>
         <div className="report-preview__content">
-          {previewLoading && <div className="reports-empty" role="status"><Icon name="file" size={24} /><strong>Загружаем слайды</strong><span>Открываем предпросмотр презентации.</span></div>}
+          {previewLoading && <div className="reports-empty" role="status"><Icon name="file" size={24} /><strong>Загружаем предпросмотр</strong><span>Открываем выбранный формат отчёта.</span></div>}
           {previewError && <div className="reports-empty" role="alert"><Icon name="file" size={24} /><strong>Предпросмотр не загрузился</strong><span>{previewError}</span><button className="button button--soft" type="button" disabled={previewLoading} onClick={() => { void openPreview(); }}>Повторить</button></div>}
           {!previewLoading && !previewError && presentationPreview && <PptxPreview preview={presentationPreview} />}
+          {!previewLoading && !previewError && downloadFormat === "docx" && briefPreview.split("\n").map((line, index) => {
+            if (line.startsWith("# ")) return <h3 key={index}>{line.slice(2)}</h3>;
+            if (line.startsWith("## ")) return <h4 key={index}>{line.slice(3)}</h4>;
+            return line.trim() ? <p key={index}>{line}</p> : <br key={index} />;
+          })}
         </div>
         <footer className="report-preview__actions">
           <div className="report-preview__action-copy">
-            <span>{presentationPreview ? `${presentationPreview.slides.length} слайдов · файл PPTX` : "Файл PPTX"}</span>
+            <span>{downloadFormat === "pptx" ? presentationPreview ? `${presentationPreview.slides.length} слайдов · файл PPTX` : "Файл PPTX" : "Предпросмотр справки · файл DOCX"}</span>
             {previewActionError && <span className="report-preview__action-error" role="alert">{previewActionError}</span>}
           </div>
           <div className="report-preview__button-group">
-            <button className="button button--soft" type="button" disabled={!presentationPreview || savingToReports || savedMaterialId === material?.material_id} onClick={() => { void addPresentationToReports(); }}>
+            {downloadFormat === "pptx" && <button className="button button--soft" type="button" disabled={!presentationPreview || savingToReports || savedMaterialId === material?.material_id} onClick={() => { void addPresentationToReports(); }}>
               <Icon name={savedMaterialId === material?.material_id ? "check" : "plus"} size={16} />
               {savingToReports ? "Добавляем…" : savedMaterialId === material?.material_id ? "Уже в отчётах" : "Добавить в отчёты"}
-            </button>
-            <button className="button button--primary" type="button" disabled={!presentationPreview || downloadingPresentation} onClick={() => { void downloadPresentation(); }}><Icon name="download" size={16} />{downloadingPresentation ? "Скачиваем…" : "Скачать на компьютер"}</button>
+            </button>}
+            <button className="button button--primary" type="button" disabled={!material || previewLoading || downloadingPresentation} onClick={() => { void downloadPresentation(); }}><Icon name="download" size={16} />{downloadingPresentation ? "Скачиваем…" : "Скачать на компьютер"}</button>
           </div>
         </footer>
       </section>

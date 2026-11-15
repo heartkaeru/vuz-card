@@ -34,6 +34,11 @@ class BiographySubject(StrictModel):
     anchor_fragment_id: str = Field(min_length=1)
 
 
+class LeadershipPosition(StrictModel):
+    person_name: str = Field(min_length=1)
+    position: str = Field(min_length=1)
+
+
 class SourceFragment(StrictModel):
     fragment_id: str = Field(min_length=1)
     start: int = Field(ge=0)
@@ -42,6 +47,7 @@ class SourceFragment(StrictModel):
     subject_department: str | None = Field(default=None, min_length=1)
     biography_subject: BiographySubject | None = None
     page_number: int | None = Field(default=None, ge=1)
+    leadership_position: LeadershipPosition | None = None
 
 
 class FragmentDocument(SourceDocument):
@@ -62,6 +68,10 @@ class FragmentDocument(SourceDocument):
             content = self.text[fragment.start:fragment.end]
             if not content.strip():
                 raise ValueError("Empty source fragment")
+            leader = fragment.leadership_position
+            if leader and (not person_name_in_quote(leader.person_name, content)
+                           or not literal_value_in_text(leader.position, content)):
+                raise ValueError("Leadership position is absent from its source fragment")
             if fragment.subject_department and not literal_value_in_text(fragment.subject_department, content):
                 raise ValueError("Subject department is absent from its source fragment")
             if fragment.biography_subject:

@@ -496,6 +496,16 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .agent-chat__welcome h3 { margin: 0 0 19px; font-size: 15px; font-weight: 600; }
 .agent-chat__welcome p { max-width: 320px; margin: 0; color: #738078; font-size: 12px; line-height: 1.8; }
 .agent-chat__messages { display: flex; min-height: 100%; flex-direction: column; align-items: stretch; gap: 12px; }
+.agent-chat__turn { display: flex; flex-direction: column; gap: 12px; }
+.agent-chat__modes { display: flex; gap: 8px; padding: 12px 23px 0; }
+.agent-chat__modes button { padding: 6px 12px; border: 1px solid #d1edd6; border-radius: 14px; background: #fcfdfc; color: #324e3b; font-size: 12px; cursor: pointer; }
+.agent-chat__modes button[aria-pressed="true"] { background: #e9f8ed; border-color: #88c69a; font-weight: 600; }
+.agent-chat__modes button:disabled { opacity: .5; cursor: default; }
+.chat-message__cards { list-style: none; margin: 8px 0 0; padding: 0; }
+.chat-message__cards button { text-align: left; }
+.chat-message__sources { margin-top: 8px; font-size: 12px; overflow-wrap: anywhere; }
+.chat-message__sources ul { margin: 6px 0 0; padding-left: 18px; }
+.chat-message__sources summary { cursor: pointer; }
 .chat-message { max-width: 87%; padding: 11px 13px; border-radius: 14px; animation: message-in .28s var(--ease-out) both; }
 .chat-message p { margin: 0; font-size: 11px; line-height: 1.65; white-space: pre-wrap; }
 .chat-message--user { align-self: flex-end; border-bottom-right-radius: 5px; background: #e9f8ed; color: #263d2d; }
@@ -817,6 +827,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .approved-card section { border-top: 1px solid #e1e9e5; margin-top: 15px; }
 .research-changes { margin: 24px 0; }
 .research-changes > p { color: #52655a; font-size: 13px; line-height: 1.6; }
+.research-change-group { margin: 18px 0; padding: 16px; border: 1px solid #cde2d6; border-radius: 12px; }
+.research-change-group > header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }
+.research-change-group h4 { margin: 0; overflow-wrap: anywhere; }
+.research-change-group .research-change:last-child { margin-bottom: 0; }
+.research-change-detail { margin: 15px 0; padding: 12px 16px; border: 1px solid #dce8e0; border-radius: 10px; }
+.research-change-detail > summary { cursor: pointer; font-weight: 600; }
+.research-change-detail > div { margin-top: 12px; }
 .research-change { margin: 14px 0; padding: 18px; border: 1px solid #dce8e0; border-radius: 12px; background: #fcfefd; }
 .research-change--changed, .research-change--head_change { border-color: #d8b77a; background: #fffcf5; }
 .research-change--not_confirmed { border-color: #cbd5df; }
@@ -830,9 +847,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .research-change__heading { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 14px; }
 .research-change__heading > span { font-size: 12px; color: #607064; }
 .change-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 15px 0; }
+.change-columns--new { grid-template-columns: 1fr; }
 .change-columns > div { min-width: 0; }
-.change-columns h4 { font-size: 12px; color: #63746a; margin: 0 0 12px; }
+.change-columns h5 { font-size: 12px; color: #63746a; margin: 0 0 12px; }
 .change-value { display: grid; gap: 8px; padding: 12px 0; border-bottom: 1px solid #e4ece7; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.change-selection { display: flex; align-items: baseline; gap: 8px; cursor: pointer; }
+.change-selection input { accent-color: #159764; flex: none; }
 .change-value small { display: block; color: #64746c; }
 .change-sources { font-size: 12px; }
 .change-sources summary { cursor: pointer; color: #26704c; }

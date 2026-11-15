@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from datetime import timedelta
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -13,9 +14,9 @@ from parser.models import UniversityData
 from .client import LLMError
 from .fragment_models import parse_extraction_request
 from .models import GenerationRequest, Institution, MeetingContext
-from .pipeline import AssistantPipeline, DraftValidationError
+from .pipeline import REVIEW_WINDOW_DAYS, AssistantPipeline, DraftValidationError
 from .workflow_models import ResearchRun, ReviewBatch, WorkflowError
-from .changes import compare_run, effective_facts, head_key, person_aliases, person_identity
+from .changes import compare_run, effective_facts, head_key, person_aliases, person_identity, reconfirmation_matches
 
 
 def documents_for(card, mode):
@@ -100,12 +101,7 @@ class LLMWorkflow:
         except Exception:
             # Keep the source snapshot and failure; do not expose source/SDK details.
             errors.append("unexpected_extraction_error")
-        try:
-            self.repository.check_current(run_id, run.revision)
-        except WorkflowError as exc:
-            errors.append(str(exc))
-
-        def finish(current, db):
+        def finish(current, db, *, reconfirm=True):
             current.results = results
             current.facts = [f.model_copy(deep=True) for result in results.values() for f in result.facts]
             current.errors = errors
@@ -114,8 +110,30 @@ class LLMWorkflow:
                 current.status = "failed"
             else:
                 current.status = "partial" if partial else "needs_review"
+            if reconfirm and not cancelled and current.status != "failed":
+                now = stamp()
+                for fact, candidates, evidence in reconfirmation_matches(
+                    current, card, cutoff=now - timedelta(days=REVIEW_WINDOW_DAYS), now=now,
+                ):
+                    before = fact.model_dump_json()
+                    fact.evidence = evidence
+                    fact.last_checked_at = max(item.retrieved_at for item in evidence)
+                    fact.freshness_status = "within_window"
+                    current.reconfirmed_facts[fact.fact_id] = candidates
+                    db.execute("INSERT INTO llm_review VALUES (?,?,?,?,?,?,?,?,?,?)", (
+                        f"review_{uuid4().hex}", run_id, current.revision + 1, fact.fact_id,
+                        "source_recheck", "system", now.isoformat(),
+                        "Точное совпадение по повторно полученному официальному источнику",
+                        before, fact.model_dump_json(),
+                    ))
 
-        result = self.repository.mutate(run_id, run.revision, finish, check_target=False)
+        try:
+            result = self.repository.mutate(run_id, run.revision, finish)
+        except WorkflowError as exc:
+            errors.append(str(exc))
+            # Preserve a superseded extraction as history without refreshing its accepted facts.
+            result = self.repository.mutate(run_id, run.revision,
+                                            lambda current, db: finish(current, db, reconfirm=False), check_target=False)
         if cancelled:
             raise asyncio.CancelledError
         return result
@@ -141,6 +159,8 @@ class LLMWorkflow:
                 raise WorkflowError("unknown_review_fact_id")
             if not revoking_ids <= active.keys():
                 raise WorkflowError("fact_not_accepted")
+            if set(ids) & run.reconfirmed_candidate_ids:
+                raise WorkflowError("fact_already_reconfirmed")
             retirement_ids = [decision.fact_id for decision in batch.retirements]
             if len(retirement_ids) != len(set(retirement_ids)) or set(retirement_ids) & set(ids):
                 raise WorkflowError("invalid_retirement_fact_ids")
@@ -186,6 +206,8 @@ class LLMWorkflow:
                     continue
 
                 fact = by_id[decision.fact_id]
+                if fact.fact_id in run.retired_fact_ids or fact.origin == "manual_edit":
+                    raise WorkflowError("chat_edit_requires_new_proposal")
                 if decision.decision == "accept":
                     if fact.validation_status != "passed" or fact.issues or fact.verification_status == "conflict":
                         raise WorkflowError("resolve_conflict_or_validation_before_acceptance")
@@ -227,12 +249,31 @@ class LLMWorkflow:
 
         return self.repository.mutate(run_id, batch.expected_revision, apply)
 
-    async def generate(self, run_id: str, expected_revision: int, *, fact_ids=None,
-                       meeting: MeetingContext | None = None, presentation_variant="detailed"):
-        if presentation_variant not in {"compact", "detailed"}:
-            raise WorkflowError("unsupported_presentation_variant")
-        if self.pipeline is None:
-            raise WorkflowError("llm_provider_required")
+    def recheck(self, run_id, expected_revision, fact_ids, *, actor):
+        ids = set(fact_ids)
+        if len(ids) != len(fact_ids):
+            raise WorkflowError("duplicate_review_fact_id")
+
+        def apply(run, db):
+            if run.status not in {"needs_review", "partial", "failed"}:
+                raise WorkflowError("run_not_reviewable")
+            active = {fact.fact_id: fact for fact in effective_facts(run)}
+            if not ids <= active.keys():
+                raise WorkflowError("unknown_review_fact_id")
+            now = stamp()
+            for fid in fact_ids:
+                fact = active[fid]
+                before = fact.model_dump_json()
+                fact.last_checked_at, fact.freshness_status = now, "within_window"
+                db.execute("INSERT INTO llm_review VALUES (?,?,?,?,?,?,?,?,?,?)", (
+                    f"review_{uuid4().hex}", run_id, run.revision + 1, fid,
+                    "recheck", actor, now.isoformat(), "Повторная сверка перед встречей",
+                    before, fact.model_dump_json(),
+                ))
+
+        return self.repository.mutate(run_id, expected_revision, apply)
+
+    def material_facts(self, run_id, expected_revision, fact_ids=None):
         run = self.repository.check_current(run_id, expected_revision)
         if run.status not in {"needs_review", "partial", "failed"}:
             raise WorkflowError("run_not_ready_for_generation")
@@ -248,6 +289,15 @@ class LLMWorkflow:
             selected = [by_id[fid] for fid in fact_ids]
         if not selected:
             raise WorkflowError("no_accepted_facts")
+        return run, selected
+
+    async def generate(self, run_id: str, expected_revision: int, *, fact_ids=None,
+                       meeting: MeetingContext | None = None, presentation_variant="detailed"):
+        if presentation_variant not in {"compact", "detailed"}:
+            raise WorkflowError("unsupported_presentation_variant")
+        if self.pipeline is None:
+            raise WorkflowError("llm_provider_required")
+        run, selected = self.material_facts(run_id, expected_revision, fact_ids)
         request = GenerationRequest(schema_version="0.3", institution=run.institution,
                                     facts=selected, meeting=meeting or MeetingContext())
         draft = await self.pipeline.generate_materials(request)

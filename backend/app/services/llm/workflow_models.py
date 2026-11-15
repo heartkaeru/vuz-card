@@ -30,6 +30,11 @@ class ResearchRun(StrictModel):
     previous_run_id: str | None = None
     baseline_facts: list[Fact] = Field(default_factory=list)
     retired_fact_ids: list[str] = Field(default_factory=list)
+    reconfirmed_facts: dict[str, list[str]] = Field(default_factory=dict)
+
+    @property
+    def reconfirmed_candidate_ids(self) -> set[str]:
+        return {candidate_id for ids in self.reconfirmed_facts.values() for candidate_id in ids}
 
 
 class ReviewDecision(StrictModel):

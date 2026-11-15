@@ -295,6 +295,11 @@ class BiographySubject(BaseModel):
     anchor_fragment_id: str
 
 
+class LeadershipPosition(BaseModel):
+    person_name: str
+    position: str
+
+
 class DocumentFragment(BaseModel):
     """Фрагмент очищенного текста с Unicode-смещениями.
 
@@ -314,6 +319,7 @@ class DocumentFragment(BaseModel):
     institution_anchor_id: str | None = None
     page_number: int | None = Field(default=None, ge=1)
     contact_hints: list[ContactHint] = Field(default_factory=list)
+    leadership_position: LeadershipPosition | None = None
 
 
 class SourceDocument(BaseModel):

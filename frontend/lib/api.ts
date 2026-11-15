@@ -5,7 +5,7 @@ export type Fact = {
     person_name: string | null; entity_name?: string; entity_id?: string;
     entity_kind?: "institution" | "project" | "event"; department?: string | null; position?: string | null;
   };
-  origin?: "llm" | "subject_projection" | "parser_projection" | "curated_candidate";
+  origin?: "llm" | "subject_projection" | "parser_projection" | "curated_candidate" | "manual_edit";
   contact_owner?: { kind: string; label: string } | null;
   metric_context?: { period: string; scope: string; unit: string; coverage?: string | null } | null;
   verification_status: "pending" | "verified" | "conflict" | "rejected";
@@ -18,11 +18,14 @@ export type ResearchRun = {
   parser_errors: string[]; parser_warnings: string[]; errors: string[];
   results: Record<string, { gaps: string[]; errors: { code: string }[]; run?: { provider: string } }>;
   previous_run_id?: string | null; baseline_facts?: Fact[]; retired_fact_ids?: string[];
+  reconfirmed_facts?: Record<string, string[]>;
 };
 export type FactChange = { change_id: string; kind: "new" | "changed" | "head_change" | "unchanged" | "not_confirmed";
-  field: string; subject_label: string; before: Fact[]; after: Fact[]; retirement_ids: string[]; retirement_trigger_ids: string[] };
+  field: string; subject_label: string; group_id: string; group_label: string;
+  before: Fact[]; after: Fact[]; retirement_ids: string[]; retirement_trigger_ids: string[] };
 export type ChangeSet = { run_id: string; revision: number; previous_run_id: string | null; entries: FactChange[];
-  counts: Record<FactChange["kind"], number>; approved_facts: Fact[]; warning: string };
+  counts: Record<FactChange["kind"], number>; approved_facts: Fact[]; recheck_fact_ids?: string[];
+  reconfirmed_facts?: Record<string, string[]>; warning: string };
 export type ResearchHistory = { run_id: string; revision: number; created_at: string; status: string; approved_count: number; candidate_count: number };
 export type PresentationVariant = "compact" | "detailed";
 export type PptxPreviewParagraph = { text: string; font_family: string; font_size_pt: number; color: string | null; bold: boolean; alignment: string };
@@ -32,6 +35,10 @@ export type PptxPreviewShape =
 export type PptxPreviewData = {
   width_inches: number; height_inches: number; images: Record<string, string>;
   slides: { shapes: PptxPreviewShape[] }[];
+};
+export type PartnershipMatch = {
+  product_name: string; proposal: string; rationale: string; discussion_question: string;
+  catalog_url: string; basis_fact_ids: string[]; kind: "sber_product" | "external_course";
 };
 export type Material = { material_id: string; download_url: string; brief_url: string; presentation_variant?: PresentationVariant };
 export type SavedMaterial = { id: string; name: string; format: string; created_at: string; stale: boolean; download_url: string; preview_url: string; brief_url: string };
@@ -43,6 +50,7 @@ export type Job = {
   result: ({ run_id?: string; code?: string } & Partial<Material>) | null;
 };
 export type CardDetail = ApiCard & { run: ResearchRun | null; job: Job | null };
+export type CardActionResult = { message: string; queued?: boolean; needsRecheck?: boolean };
 
 const errors: Record<string, string> = {
   gigachat_configuration_required: "На сервере не настроен доступ к GigaChat. Проверьте backend/.env и перезапустите сервер.",
@@ -54,6 +62,31 @@ const errors: Record<string, string> = {
   "Not Found": "Backend не распознал новый обработчик удаления. Перезапустите backend и повторите.",
   "Method Not Allowed": "Backend не поддерживает удаление отчётов. Перезапустите backend и повторите.",
   presentation_preview_unavailable: "Предпросмотр презентации недоступен.",
+  facts_require_freshness_check: "Истёк срок проверки фактов. Откройте блок «Повторная проверка перед экспортом» в карточке.",
+  fact_already_reconfirmed: "Эти сведения уже подтверждены повторным сбором. Обновите карточку.",
+  run_not_ready_for_generation: "Сбор сведений ещё не завершён. Откройте карточку и проверьте статус задания.",
+  invalid_selected_fact_ids: "Состав принятых сведений изменился. Обновите карточку и повторите экспорт.",
+  partnership_match_requires_selected_accepted_facts: "Основания для предложений изменились. Повторите подбор перед экспортом.",
+  invalid_partnership_response: "Подборка не прошла проверку каталога и фактов. Повторите подбор.",
+  chat_login_required: "Войдите, чтобы открыть диалог.",
+  chat_card_changed: "Карточка обновилась во время ответа. Отправьте вопрос ещё раз.",
+  chat_history_changed: "В диалоге появилось новое сообщение. История обновлена. Отправьте вопрос ещё раз.",
+  invalid_chat_tool_call: "Модель не смогла выбрать данные карточки. Уточните вопрос и повторите.",
+  invalid_chat_reply: "Ответ не прошёл проверку ссылок на факты. Повторите вопрос.",
+  chat_edit_value_required: "Укажите новое значение полностью в сообщении.",
+  chat_edit_target_ambiguous: "Найдено несколько подходящих полей. Укажите владельца и текущее значение.",
+  chat_edit_target_not_found: "Подходящее принятое поле не найдено. Уточните владельца или текущее значение.",
+  chat_edit_invalid_value: "Проверьте формат нового телефона или адреса почты.",
+  chat_edit_unchanged: "Это значение уже есть в карточке.",
+  chat_edit_unknown_owner: "Сначала уточните владельца контакта в карточке.",
+  chat_edit_not_found: "Предложенная правка не найдена.",
+  chat_edit_not_pending: "Эта правка уже обработана.",
+  chat_edit_collection_running: "Дождитесь завершения сбора и повторите запрос на правку.",
+  chat_edit_requires_new_proposal: "Для изменения этого поля предложите новую правку в чате.",
+  chat_collection_url_required: "Укажите один официальный URL в текущем сообщении.",
+  chat_collection_name_required: "Укажите название учреждения в том же сообщении, что и ссылку.",
+  chat_collection_card_ambiguous: "В реестре несколько карточек с этим сайтом. Откройте нужную и запустите сбор из карточки.",
+  public_website_required: "Для сбора укажите публичный официальный сайт учреждения.",
   stale_run_revision: "Данные уже изменились. Обновите карточку и повторите действие.",
   card_job_already_running: "Для этой карточки уже выполняется задание.",
   facts_changed_during_generation: "Во время генерации факты изменились. Сформируйте материалы заново.",
@@ -94,7 +127,7 @@ const errors: Record<string, string> = {
 export function errorText(error: unknown) {
   if (error instanceof TypeError && /fetch|network/i.test(error.message)) return "Не удалось подключиться к серверу. Убедитесь, что backend запущен.";
   return error instanceof Error ? errors[error.message] ?? (/^[a-z0-9_:.-]+$/.test(error.message)
-    ? "Задание остановлено. Проверьте источники и повторите действие." : error.message) : "Не удалось выполнить действие.";
+    ? `Не удалось выполнить действие (код: ${error.message}).` : error.message) : "Не удалось выполнить действие.";
 }
 
 export async function downloadFile(path: string, filename: string) {

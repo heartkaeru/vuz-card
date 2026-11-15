@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from copy import deepcopy
 import logging
 import re
@@ -37,6 +38,7 @@ from .models import (
     ContactHint,
     ContactOwner,
     DocumentFragment,
+    LeadershipPosition,
     SourceDocument,
     TextBlock,
     utc_now,
@@ -116,6 +118,10 @@ DEPARTMENT_MARKERS = (
     "лицей",
 )
 
+LEADERSHIP_SCOPES = {"rucovodstvo", "rucovodstvoZam", "rucovodstvoFil"}
+LOCAL_PHONE_RE = re.compile(r"(?<![\d+])\d{3}[- ]\d{2}[- ]\d{2}(?!\d)")
+DEPUTY_RE = re.compile(r"^зам(?:еститель|\.)\s*(?:директора|руководителя)\b", re.I)
+
 PUBLISHED_META_NAMES = (
     "article:published_time",
     "og:published_time",
@@ -135,6 +141,7 @@ class Block:
     # None: infer from heading; []: structured block has no proven contact owner.
     contact_hints: list[ContactHint] | None = None
     subject_department: str | None = None
+    leadership_position: LeadershipPosition | None = None
 
 
 @dataclass
@@ -150,6 +157,7 @@ class CleanResult:
     canonical_url: str = ""
     published_at: datetime | None = None
     language: str = "ru"
+    shared_emails: set[str] = field(default_factory=set)
 
 
 def _make_soup(html: str) -> BeautifulSoup:
@@ -182,6 +190,8 @@ class HTMLCleaner:
         html: str,
         url: str = "",
         title: str = "",
+        *,
+        section: str = "",
     ) -> CleanResult:
         """Очищает HTML и возвращает текст, блоки и метаданные."""
 
@@ -199,6 +209,11 @@ class HTMLCleaner:
         canonical = self._canonical_url(soup, url)
         published_at = self._published_at(soup)
         language = self._detect_language(soup)
+        shared_emails = {
+            email.casefold()
+            for element in soup.select('header a[href^="mailto:"], footer a[href^="mailto:"], address a[href^="mailto:"]')
+            for email in EMAIL_RE.findall(element["href"])
+        } if section == "leadership" else set()
 
         self._remove_noise(soup)
         main = self._select_main(soup)
@@ -212,7 +227,7 @@ class HTMLCleaner:
                 language=language,
             )
 
-        blocks = self._extract_blocks(main)
+        blocks = self._extract_blocks(main, include_deputies=section == "leadership")
         blocks, truncated = self._limit_blocks(blocks, self.max_chars)
         text = "\n\n".join(block.text for block in blocks)
 
@@ -255,6 +270,7 @@ class HTMLCleaner:
             canonical_url=canonical,
             published_at=published_at,
             language=language,
+            shared_emails=shared_emails,
         )
 
     def to_document(
@@ -267,9 +283,9 @@ class HTMLCleaner:
     ) -> SourceDocument:
         """Очищает HTML и упаковывает результат в ``SourceDocument``."""
 
-        result = self.clean(html, url=url, title=title)
+        result = self.clean(html, url=url, title=title, section=section)
         blocks, truncated = self._limit_blocks(result.blocks, self.max_chars)
-        text, fragments = self._build_fragments(blocks, section=section)
+        text, fragments = self._build_fragments(blocks, section=section, shared_emails=result.shared_emails)
 
         if truncated:
             LOGGER.info(
@@ -416,9 +432,9 @@ class HTMLCleaner:
     # ------------------------------------------------------------------
     # Структурные блоки
     # ------------------------------------------------------------------
-    def _extract_blocks(self, root: Tag) -> list[Block]:
+    def _extract_blocks(self, root: Tag, *, include_deputies: bool) -> list[Block]:
         blocks: list[Block] = []
-        self._walk(root, blocks)
+        self._walk(root, blocks, include_deputies)
 
         cleaned: list[Block] = []
         seen: set[str] = set()
@@ -443,10 +459,10 @@ class HTMLCleaner:
                 continue
             seen.add(key)
             cleaned.append(Block(kind=block.kind, text=text, contact_hints=block.contact_hints,
-                                 subject_department=block.subject_department))
+                                 subject_department=block.subject_department, leadership_position=block.leadership_position))
         return cleaned
 
-    def _walk(self, node: Tag, blocks: list[Block]) -> None:
+    def _walk(self, node: Tag, blocks: list[Block], include_deputies: bool) -> None:
         if not isinstance(node, Tag):
             return
         name = node.name
@@ -454,7 +470,11 @@ class HTMLCleaner:
             return
 
         properties = set(node.get("itemprop", "").split())
-        if properties & {"rucovodstvo", "rucovodstvoZam", "rucovodstvoFil"}:
+        deputy = False
+        if include_deputies and "teachingStaff" in properties:
+            position = node.select_one('[itemprop~="post"]')
+            deputy = position is not None and bool(DEPUTY_RE.match(self._node_text(position)))
+        if properties & LEADERSHIP_SCOPES or deputy:
             selector = '[itemprop~="rucovodstvo"], [itemprop~="rucovodstvoZam"], [itemprop~="rucovodstvoFil"]'
             nested = node.select(selector)
             if nested:
@@ -462,15 +482,16 @@ class HTMLCleaner:
                 for child in own.select(selector):
                     if child.parent is not None:
                         child.decompose()
-                self._walk(own, blocks)
+                self._walk(own, blocks, include_deputies)
                 for child in nested:
                     if not any(parent in nested for parent in child.parents if parent is not node):
-                        self._walk(child, blocks)
+                        self._walk(child, blocks, include_deputies)
                 return
             text = self._node_text(node)
             if text:
-                blocks.append(Block("leadership_profile", text, self._profile_contact_hints(node),
-                                    self._profile_department(node)))
+                position = self._leadership_position(node)
+                blocks.append(Block("leadership_profile", text, self._profile_contact_hints(node, deputy=deputy),
+                                    self._profile_department(node), position))
             return
 
         if name == "tr":
@@ -501,14 +522,14 @@ class HTMLCleaner:
                     blocks.append(Block("table_caption", caption_text))
             for child in node.children:
                 if isinstance(child, Tag):
-                    self._walk(child, blocks)
+                    self._walk(child, blocks, include_deputies)
             return
 
         if name in CONTAINER_TAGS:
             before = len(blocks)
             for child in node.children:
                 if isinstance(child, Tag):
-                    self._walk(child, blocks)
+                    self._walk(child, blocks, include_deputies)
             if len(blocks) == before:
                 # Текст лежит прямо в div/section без абзацев.
                 text = self._node_text(node)
@@ -553,7 +574,7 @@ class HTMLCleaner:
     # Фрагменты и контакты
     # ------------------------------------------------------------------
     def _build_fragments(
-        self, blocks: list[Block], section: str
+        self, blocks: list[Block], section: str, *, shared_emails: set[str]
     ) -> tuple[str, list[DocumentFragment]]:
         fragments: list[DocumentFragment] = []
         parts: list[str] = []
@@ -590,11 +611,34 @@ class HTMLCleaner:
                     heading=heading,
                     contact_hints=hints,
                     subject_department=block.subject_department,
+                    leadership_position=block.leadership_position,
                 )
             )
             parts.append(text)
             offset = end
 
+        def contact_key(hint: ContactHint) -> tuple[str, str]:
+            if hint.field == "contact.email":
+                return hint.field, hint.value.casefold()
+            digits = re.sub(r"\D", "", hint.value)
+            if hint.value.startswith("8") and len(digits) >= 11:
+                digits = "7" + digits[1:]
+            return hint.field, digits
+
+        owners_by_contact = defaultdict(set)
+        for fragment in fragments:
+            for hint in fragment.contact_hints:
+                if hint.owner.kind != "unknown":
+                    owners_by_contact[contact_key(hint)].add(
+                        (hint.owner.kind, hint.owner.label.casefold().replace("ё", "е"))
+                    )
+        shared = {key for key, owners in owners_by_contact.items() if len(owners) > 1}
+        shared.update(("contact.email", email) for email in shared_emails)
+        for fragment in fragments:
+            fragment.contact_hints = [
+                hint for hint in fragment.contact_hints
+                if hint.owner.kind != "person" or contact_key(hint) not in shared
+            ]
         return "\n\n".join(parts), fragments
 
     @staticmethod
@@ -617,9 +661,9 @@ class HTMLCleaner:
             return ContactOwner(kind="department", label=heading)
         return ContactOwner(kind="organization", label="ВУЗ")
 
-    def _profile_contact_hints(self, node: Tag) -> list[ContactHint]:
+    def _profile_contact_hints(self, node: Tag, *, deputy: bool = False) -> list[ContactHint]:
         """Use explicit person/branch microdata, never a nearby person's name."""
-        scoped = {"rucovodstvo", "rucovodstvoZam", "rucovodstvoFil"}
+        scoped = LEADERSHIP_SCOPES | ({"teachingStaff"} if deputy else set())
 
         def belongs(element):
             return next((parent for parent in element.parents
@@ -651,9 +695,19 @@ class HTMLCleaner:
                                or ("факс" in context and "телефон" not in context)):
                 continue
             field_name = "contact.email" if "email" in item.get("itemprop", "").split() else "contact.phone"
-            hints.extend(hint for hint in self._contact_hints(self._node_text(item), owner, None)
+            hints.extend(hint for hint in self._contact_hints(self._node_text(item), owner, None, allow_local_phone=True)
                          if hint.field == field_name)
         return hints
+
+    def _leadership_position(self, node: Tag) -> LeadershipPosition | None:
+        names = {self._node_text(item) for item in node.select('[itemprop~="fio"]')}
+        posts = {self._node_text(item) for item in node.select('[itemprop~="post"]')}
+        if len(names) != 1 or len(posts) != 1:
+            return None
+        name, post = next(iter(names)), next(iter(posts))
+        if looks_like_person_name(name) and contains_position(post):
+            return LeadershipPosition(person_name=name, position=post)
+        return None
 
     def _profile_department(self, node: Tag) -> str | None:
         if "rucovodstvoFil" not in node.get("itemprop", "").split():
@@ -725,6 +779,8 @@ class HTMLCleaner:
         text: str,
         owner: ContactOwner,
         heading_fragment_id: str | None,
+        *,
+        allow_local_phone: bool = False,
     ) -> list[ContactHint]:
         hints: list[ContactHint] = []
         context = [heading_fragment_id] if heading_fragment_id else []
@@ -739,9 +795,12 @@ class HTMLCleaner:
                     context_fragment_ids=context,
                 )
             )
-        for match in PHONE_RE.finditer(text):
+        phones = list(PHONE_RE.finditer(text))
+        if allow_local_phone and not phones:
+            phones = list(LOCAL_PHONE_RE.finditer(text))
+        for match in phones:
             phone = re.sub(r"[\s.(,\-]+$", "", match.group(0)).strip()
-            if not clean_phone(phone):
+            if not clean_phone(phone) and not (allow_local_phone and LOCAL_PHONE_RE.fullmatch(phone)):
                 continue
             extension = re.match(r"\s*[,;]?\s*(?:доб\.?|вн\.?\s*(?:тел\.?)?|добавочный)\s*[:.]?\s*\d{1,4}(?!\d)",
                                  text[match.end():], re.IGNORECASE)
