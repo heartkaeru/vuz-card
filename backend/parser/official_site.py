@@ -7,9 +7,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
-from urllib.parse import urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -88,6 +89,10 @@ class OfficialSiteDiscovery:
         return leader, site_url, rector_url
 
     def find_site(self, university_name: str, short_name: str = "") -> str:
+        wiki_site = self._wikipedia_site(university_name)
+        if wiki_site:
+            return wiki_site
+
         queries = []
         if short_name:
             queries.append(f'"{short_name}" официальный сайт')
@@ -462,6 +467,113 @@ class OfficialSiteDiscovery:
                     paragraphs.append(line)
         return truncate_text(" ".join(dict.fromkeys(paragraphs[:3])), 900)
 
+    def _wikipedia_site(self, university_name: str) -> str:
+        """Официальный сайт из Wikidata (P856) — надёжный fallback к поиску."""
+
+        try:
+            search = self._wiki_api(
+                {
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": university_name,
+                    "srlimit": 5,
+                    "format": "json",
+                }
+            )
+            pages = search.get("query", {}).get("search", [])
+            title = ""
+            for page in pages:
+                candidate = page.get("title", "")
+                lowered = candidate.lower()
+                if any(
+                    word in lowered
+                    for word in ("университет", "институт", "академия", "школа")
+                ):
+                    title = candidate
+                    break
+            if not title and pages:
+                title = pages[0].get("title", "")
+            if not title:
+                return ""
+
+            infobox_site = self._wikipedia_infobox_site(title)
+            if infobox_site:
+                return infobox_site
+
+            props = self._wiki_api(
+                {
+                    "action": "query",
+                    "prop": "pageprops",
+                    "titles": title,
+                    "format": "json",
+                }
+            )
+            page_map = props.get("query", {}).get("pages", {})
+            qid = ""
+            for page in page_map.values():
+                qid = page.get("pageprops", {}).get("wikibase_item", "")
+                if qid:
+                    break
+            if not qid:
+                return ""
+
+            response = self.fetcher.get(
+                f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
+            )
+            payload = json.loads(response.text) if response.text else {}
+            entity = payload.get("entities", {}).get(qid, {})
+            for claim in entity.get("claims", {}).get("P856", []):
+                value = (
+                    claim.get("mainsnak", {})
+                    .get("datavalue", {})
+                    .get("value", "")
+                )
+                if isinstance(value, str) and value.startswith("http"):
+                    parsed = urlparse(value)
+                    site = f"https://{parsed.netloc}/"
+                    probe = self.fetcher.get(site, timeout=12)
+                    if probe.final_url:
+                        final = urlparse(probe.final_url)
+                        return f"{final.scheme}://{final.netloc}/"
+                    if probe.status_code and probe.text:
+                        return site
+                    return ""
+        except (ValueError, KeyError, TypeError) as exc:
+            LOGGER.debug("Wikidata не дал сайт для %s: %s", university_name, exc)
+        return ""
+
+    def _wikipedia_infobox_site(self, title: str) -> str:
+        url = "https://ru.wikipedia.org/wiki/" + quote(title.replace(" ", "_"))
+        response = self.fetcher.get(url)
+        if not response.text:
+            return ""
+        soup = BeautifulSoup(response.text, "lxml")
+        for row in soup.select("table.infobox tr"):
+            text = normalize_whitespace(row.get_text(" ", strip=True)).lower()
+            if "сайт" not in text:
+                continue
+            anchor = row.select_one("a[href^='http']")
+            if not anchor:
+                continue
+            value = anchor.get("href", "")
+            if value.startswith("http"):
+                parsed = urlparse(value)
+                site = f"https://{parsed.netloc}/"
+                probe = self.fetcher.get(site, timeout=12)
+                if probe.final_url:
+                    final = urlparse(probe.final_url)
+                    return f"{final.scheme}://{final.netloc}/"
+                if probe.status_code and probe.text:
+                    return site
+        return ""
+
+    def _wiki_api(self, params: dict[str, object]) -> dict:
+        url = "https://ru.wikipedia.org/w/api.php?" + urlencode(params)
+        response = self.fetcher.get(url)
+        if not response.text:
+            return {}
+        return json.loads(response.text)
+
     def _search(self, query: str) -> list[tuple[str, str]]:
         from urllib.parse import quote
 
@@ -487,7 +599,27 @@ class OfficialSiteDiscovery:
         haystack = f"{title} {host}".lower()
         tokens = [
             token.lower()
-            for token in re.findall(r"[А-ЯЁA-Zа-яёa-z\-]{4,}", name)
-            if len(token) >= 4
+            for token in re.findall(r"[А-ЯЁA-Zа-яёa-z\-]{3,}", name)
         ]
-        return not tokens or any(token in haystack for token in tokens)
+        if tokens:
+            return any(token in haystack for token in tokens)
+        return normalize_whitespace(name).lower() in haystack
+
+def resolve_official_site(
+    university_name: str,
+    short_name: str = "",
+    *,
+    timeout: float = 25.0,
+    enable_playwright: bool = False,
+) -> str:
+    """??????? ????????? ??????: ????? ??????????? ???? ?? ???????? ????."""
+
+    fetcher = StealthFetcher(
+        timeout=timeout, enable_playwright=enable_playwright
+    )
+    try:
+        return OfficialSiteDiscovery(fetcher).find_site(
+            university_name, short_name
+        )
+    finally:
+        fetcher.close()

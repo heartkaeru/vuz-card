@@ -49,6 +49,7 @@ class StealthResponse:
     content_type: str = "text/html"
     engine: str = "curl_cffi"
     error: str = ""
+    final_url: str = ""
 
 
 def _decode(content: bytes, content_type: str) -> str:
@@ -136,7 +137,9 @@ class StealthFetcher:
             if rendered.status_code and rendered.text:
                 return rendered
 
-        return StealthResponse(url, status, text, content_type)
+        return StealthResponse(
+            url, status, text, content_type, final_url=str(response.url)
+        )
 
     def _playwright_get(
         self, url: str, timeout: float, error: str = ""
