@@ -145,7 +145,10 @@ class VuzopediaParser:
 
     def parse(self, url: str, city: str = "") -> AggregatorPassport:
         response = self.fetcher.get(url)
-        soup = BeautifulSoup(response.text or "", "lxml")
+        if not response.text:
+            source = "vuzopedia" if "Vuzopedia" in type(self).__name__ else "postupi"
+            return AggregatorPassport(source=source, url=url)
+        soup = BeautifulSoup(response.text, "lxml")
         name = _text(soup.find("h1"))
         text = _text(soup)
 
@@ -272,7 +275,10 @@ class PostupiParser:
 
     def parse(self, url: str, city: str = "") -> AggregatorPassport:
         response = self.fetcher.get(url)
-        soup = BeautifulSoup(response.text or "", "lxml")
+        if not response.text:
+            source = "vuzopedia" if "Vuzopedia" in type(self).__name__ else "postupi"
+            return AggregatorPassport(source=source, url=url)
+        soup = BeautifulSoup(response.text, "lxml")
         name = _text(soup.find("h1"))
         text = _text(soup)
 

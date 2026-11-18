@@ -2467,7 +2467,7 @@ class UniversityParser:
             return
 
         fetcher = StealthFetcher(
-            timeout=self.settings.timeout,
+            timeout=min(self.settings.timeout, 20.0),
             enable_playwright=self.settings.enable_playwright,
         )
         short_name = (
