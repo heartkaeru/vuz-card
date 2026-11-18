@@ -27,24 +27,33 @@ from bs4.element import Tag
 
 if __package__ in (None, ""):  # запуск как `python backend/parser/main.py`
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from parser import cleaner, config, models, store, utils  # type: ignore
+    from parser import aggregators, cleaner, config, models, news_search, official_site, stealth, store, utils  # type: ignore
 
     # Ниже используются обычные импорты (`from cleaner import ...`), чтобы
     # модуль можно было запускать и как пакет, и как отдельный файл.
+    sys.modules.setdefault("aggregators", aggregators)
     sys.modules.setdefault("cleaner", cleaner)
     sys.modules.setdefault("config", config)
     sys.modules.setdefault("models", models)
+    sys.modules.setdefault("news_search", news_search)
+    sys.modules.setdefault("official_site", official_site)
+    sys.modules.setdefault("stealth", stealth)
     sys.modules.setdefault("store", store)
     sys.modules.setdefault("utils", utils)
 else:
-    from . import cleaner, config, models, store, utils
+    from . import aggregators, cleaner, config, models, news_search, official_site, stealth, store, utils
 
+    sys.modules.setdefault("aggregators", aggregators)
     sys.modules.setdefault("cleaner", cleaner)
     sys.modules.setdefault("config", config)
     sys.modules.setdefault("models", models)
+    sys.modules.setdefault("news_search", news_search)
+    sys.modules.setdefault("official_site", official_site)
+    sys.modules.setdefault("stealth", stealth)
     sys.modules.setdefault("store", store)
     sys.modules.setdefault("utils", utils)
 
+from aggregators import AggregatorService, merge_passports
 from cleaner import HTMLCleaner
 from config import (
     DEFAULT_BATCH_PROFILES,
@@ -61,12 +70,14 @@ from config import (
 )
 from models import (
     Achievement,
+    AggregatorPassport,
     ChangeReport,
     Contact,
     ContactOwner,
     Event,
     Grant,
     Leadership,
+    NewsMention,
     Partnership,
     Project,
     ResearchItem,
@@ -76,6 +87,9 @@ from models import (
     UniversityInfo,
     utc_now,
 )
+from news_search import NewsSearch
+from official_site import OfficialSiteDiscovery
+from stealth import StealthFetcher
 from store import CrawlCache, DocumentStore
 from utils import (
     BlockedError,
@@ -217,6 +231,30 @@ def _cell_link(cell: Tag, base_url: str) -> str:
     text = _cell_text(cell)
     if text.startswith(("http://", "https://", "www.")):
         return canonical_url(text, base_url)
+    return ""
+
+
+def _cell_image(cell: Tag, base_url: str) -> str:
+    """Прямая ссылка на фото из ячейки таблицы/карточки."""
+
+    for image in cell.find_all("img"):
+        src = normalize_whitespace(
+            image.get("data-src")
+            or image.get("data-original")
+            or image.get("src")
+            or ""
+        )
+        if not src or src.lower().startswith("data:"):
+            continue
+        lowered = src.lower()
+        if any(
+            marker in lowered
+            for marker in ("logo", "icon", "sprite", "placeholder", "blank", "spacer")
+        ):
+            continue
+        if lowered.endswith((".svg", ".gif")):
+            continue
+        return canonical_url(src, base_url)
     return ""
 
 
@@ -749,8 +787,15 @@ class SvedenTableParser:
             site = _cell_link(cells[site_index], self.page_url)
         name_link = ""
         name_index = columns.get("name")
+        photo_url = ""
         if name_index is not None and name_index < len(cells):
             name_link = _cell_link(cells[name_index], self.page_url)
+            photo_url = _cell_image(cells[name_index], self.page_url)
+        if not photo_url:
+            for cell in cells:
+                photo_url = _cell_image(cell, self.page_url)
+                if photo_url:
+                    break
 
         return {
             "name": name,
@@ -761,6 +806,7 @@ class SvedenTableParser:
             "phone": phones[0] if phones else "",
             "site": site or name_link,
             "name_link": name_link,
+            "photo_url": photo_url,
         }
 
 
@@ -791,6 +837,9 @@ class UniversityParser:
         self._partnerships: list[Partnership] = []
         self._achievements: list[Achievement] = []
         self._events: list[Event] = []
+        self._passports: list[AggregatorPassport] = []
+        self._passport: AggregatorPassport | None = None
+        self._news_mentions: list[NewsMention] = []
         self._warnings: list[str] = []
         self._errors: list[str] = []
         self._detail_urls: dict[str, str] = {}
@@ -843,6 +892,18 @@ class UniversityParser:
             base_url,
         )
 
+        if self.settings.aggregators_only:
+            LOGGER.info("Режим: только агрегаторы (без обхода сайта вуза)")
+            self._enrich_aggregators(base_url)
+            self._enrich_rector_from_web()
+            self._enrich_news_mentions()
+            card = self._build_card(base_url, name, profile_obj, None)
+            if self._cache is not None:
+                self._cache.prune()
+                self._cache.flush()
+            LOGGER.info("Сбор завершён: %s", card.summary())
+            return card
+
         homepage_doc, homepage_soup = self._get_page(base_url, section="homepage")
         if homepage_doc is None:
             self._errors.append(
@@ -886,6 +947,8 @@ class UniversityParser:
                 self._errors.append(message)
 
         self._enrich_bios()
+        self._enrich_aggregators(base_url)
+        self._enrich_news_mentions()
         card = self._build_card(base_url, name, profile_obj, homepage_doc)
         if self._cache is not None:
             self._cache.prune()
@@ -923,6 +986,9 @@ class UniversityParser:
         self._partnerships.clear()
         self._achievements.clear()
         self._events.clear()
+        self._passports.clear()
+        self._passport = None
+        self._news_mentions.clear()
         self._warnings.clear()
         self._errors.clear()
         self._detail_urls.clear()
@@ -1385,6 +1451,10 @@ class UniversityParser:
                 and position_rank <= 1
                 and _mailbox(email) in GENERIC_MAILBOXES
             )
+            position_rank = _position_rank(position)
+            is_acting = bool(
+                re.search(r"\bи\.?\s*о\.?\b|исполняющ", position, re.IGNORECASE)
+            )
             leader = Leadership(
                 full_name=name,
                 position=position,
@@ -1398,9 +1468,21 @@ class UniversityParser:
                 address=row.get("address") or None,
                 unit=row.get("unit") or None,
                 source_url=doc.url,
-                is_acting=bool(
-                    re.search(r"\bи\.?\s*о\.?\b|исполняющ", position, re.IGNORECASE)
+                photo_url=row.get("photo_url") or None,
+                status=(
+                    ("и.о." if is_acting else "ректор")
+                    if position_rank <= 0
+                    else None
                 ),
+                reception_phone=(
+                    phone if position_rank <= 0 and phone_counts.get(phone, 0) == 1 else None
+                ),
+                reception_email=(
+                    email
+                    if position_rank <= 0 and email_counts.get(email, 0) == 1
+                    else None
+                ),
+                is_acting=is_acting,
             )
             leaders.append(leader)
 
@@ -1459,6 +1541,14 @@ class UniversityParser:
                 leader.office_number = leader.office_number or existing.office_number
                 leader.office = leader.office or existing.office
                 leader.bio = leader.bio or existing.bio
+                leader.photo_url = leader.photo_url or existing.photo_url
+                leader.status = leader.status or existing.status
+                leader.reception_phone = (
+                    leader.reception_phone or existing.reception_phone
+                )
+                leader.reception_email = (
+                    leader.reception_email or existing.reception_email
+                )
                 if not leader.unit and existing.unit:
                     leader.unit = existing.unit
                 merged[key] = leader
@@ -1471,6 +1561,14 @@ class UniversityParser:
                     existing.office_number or leader.office_number
                 )
                 existing.office = existing.office or leader.office
+                existing.photo_url = existing.photo_url or leader.photo_url
+                existing.status = existing.status or leader.status
+                existing.reception_phone = (
+                    existing.reception_phone or leader.reception_phone
+                )
+                existing.reception_email = (
+                    existing.reception_email or leader.reception_email
+                )
                 existing.unit = existing.unit or leader.unit
                 if not existing.source_url:
                     existing.source_url = leader.source_url
@@ -2337,28 +2435,185 @@ class UniversityParser:
         for _, leader in candidates:
             if attempted >= self.settings.max_bios:
                 break
-            if leader.bio:
+            if leader.bio and leader.photo_url:
                 continue
             attempted += 1
 
             bio = ""
+            detail_url = self._detail_urls.get(leader.full_name)
+            if detail_url:
+                bio = self._bio_from_url(detail_url, leader)
+
             # Общие страницы биографий (например, /rector/biografiya)
             # относятся только к первому лицу вуза. Проректорам их
-            # приписывать нельзя.
+            # приписывать нельзя. Они также дают фото ректора.
             if self.profile and _position_rank(leader.position) <= 1:
-                for bio_url in self.profile.bio_urls:
-                    bio = self._bio_from_url(bio_url, leader)
-                    if bio:
-                        break
-
-            if not bio:
-                detail_url = self._detail_urls.get(leader.full_name)
-                if detail_url:
-                    bio = self._bio_from_url(detail_url, leader)
+                if not bio or not leader.photo_url:
+                    for bio_url in self.profile.bio_urls:
+                        candidate = self._bio_from_url(bio_url, leader)
+                        bio = bio or candidate
+                        if bio and leader.photo_url:
+                            break
 
             if bio:
-                leader.bio = bio
-                leader.source_quote = truncate_text(bio, 300)
+                leader.bio = leader.bio or bio
+                leader.source_quote = leader.source_quote or truncate_text(bio, 300)
+
+    def _enrich_aggregators(self, base_url: str) -> None:
+        if not self.settings.use_aggregators:
+            return
+        sources = [
+            source.strip().lower()
+            for source in self.settings.aggregator_sources.split(",")
+            if source.strip()
+        ]
+        if not sources and not self.settings.aggregator_url:
+            return
+
+        fetcher = StealthFetcher(
+            timeout=min(self.settings.timeout, 20.0),
+            enable_playwright=self.settings.enable_playwright,
+        )
+        short_name = (
+            self.profile.aliases[0]
+            if self.profile and self.profile.aliases
+            else ""
+        )
+        city = self.profile.city if self.profile else ""
+        passports: list[AggregatorPassport] = []
+        try:
+            if self.settings.aggregator_url:
+                service = AggregatorService(
+                    fetcher, direct_url=self.settings.aggregator_url
+                )
+                passports.extend(
+                    service.collect(
+                        self._university_name, city=city, short_name=short_name
+                    )
+                )
+            else:
+                for source in sources:
+                    profile_url = (
+                        getattr(self.profile, f"{source}_url", "")
+                        if self.profile
+                        else ""
+                    )
+                    service = AggregatorService(
+                        fetcher,
+                        sources=(source,),
+                        direct_url=profile_url,
+                    )
+                    passports.extend(
+                        service.collect(
+                            self._university_name,
+                            city=city,
+                            short_name=short_name,
+                        )
+                    )
+        except Exception as exc:  # noqa: BLE001 - агрегатор не должен ронять сбор
+            LOGGER.warning("Агрегаторы недоступны: %s", exc)
+            self._warnings.append(f"Агрегаторы: {exc}")
+        finally:
+            fetcher.close()
+
+        self._passports = passports
+        self._passport = merge_passports(passports)
+        if not passports:
+            self._warnings.append(
+                "Не удалось получить паспорт вуза из Вузопедии/Поступи.Онлайн"
+            )
+        else:
+            LOGGER.info(
+                "Паспорт вуза: %s",
+                self._passport.model_dump(exclude_none=True)
+                if self._passport
+                else {},
+            )
+
+    def _enrich_rector_from_web(self) -> None:
+        """Находит сайт/страницу ректора автоматически и добавляет запись."""
+
+        if not self.settings.rector_lookup:
+            return
+        fetcher = StealthFetcher(
+            timeout=min(self.settings.timeout, 25.0),
+            enable_playwright=self.settings.enable_playwright,
+        )
+        short_name = (
+            self.profile.aliases[0]
+            if self.profile and self.profile.aliases
+            else ""
+        )
+        try:
+            leader, site_url, rector_url = OfficialSiteDiscovery(fetcher).discover(
+                self._university_name, short_name=short_name
+            )
+        except Exception as exc:  # noqa: BLE001 - поиск не должен ронять сбор
+            LOGGER.warning("Автопоиск ректора не удался: %s", exc)
+            return
+        finally:
+            fetcher.close()
+
+        if not leader:
+            self._warnings.append(
+                "Не удалось автоматически найти страницу ректора и фото"
+            )
+            return
+
+        self._leadership = [leader]
+        if site_url:
+            host = utils.urlparse(site_url).netloc.lower().split(":")[0]
+            if host.startswith("www."):
+                host = host[4:]
+            self._official_domain = host or self._official_domain
+        for contact_type, value in (
+            ("phone", leader.reception_phone or leader.phone),
+            ("email", leader.reception_email or leader.email),
+        ):
+            if value:
+                self._add_contact(
+                    Contact(
+                        type=contact_type,
+                        value=value,
+                        owner=leader.full_name,
+                        owner_kind="person",
+                        source_url=rector_url,
+                        context="ректорат",
+                    )
+                )
+        LOGGER.info(
+            "Ректор найден автоматически: %s, фото: %s",
+            leader.full_name,
+            leader.photo_url or "нет",
+        )
+
+    def _enrich_news_mentions(self) -> None:
+        if not self.settings.use_news_search:
+            return
+        short_name = ""
+        if self.profile and self.profile.aliases:
+            short_name = self.profile.aliases[0]
+        fetcher = StealthFetcher(
+            timeout=self.settings.timeout,
+            enable_playwright=self.settings.enable_playwright,
+        )
+        try:
+            search = NewsSearch(
+                fetcher,
+                engine=self.settings.search_engine,
+                timeout=self.settings.timeout,
+            )
+            self._news_mentions = search.search(
+                self._university_name,
+                short_name=short_name,
+                max_results=self.settings.max_news,
+            )
+        except Exception as exc:  # noqa: BLE001 - поиск не должен ронять сбор
+            LOGGER.warning("Поиск новостей о Сбере не удался: %s", exc)
+            self._warnings.append(f"Поиск новостей о Сбере: {exc}")
+        finally:
+            fetcher.close()
+        LOGGER.info("Новости о Сбере: %s", len(self._news_mentions))
 
     def collect_institution_documents(self, urls):
         """Explicit official reference sources, sharing normal crawl limits and TLS."""
@@ -2394,12 +2649,114 @@ class UniversityParser:
         return result, errors
 
     def _bio_from_url(self, url: str, leader: Leadership) -> str:
-        doc, _ = self._get_page(url, section="bio")
+        doc, soup = self._get_page(url, section="bio")
         if doc is None:
             return ""
         from .biography import mark_biography_subject
         mark_biography_subject(doc, leader.full_name)
+        if soup is not None:
+            photo = self._find_photo(soup, doc.url, leader.full_name)
+            if photo and not leader.photo_url:
+                leader.photo_url = photo
         return self._extract_bio_text(doc, leader.full_name, leader)
+
+    @staticmethod
+    def _find_photo(
+        soup: BeautifulSoup, base_url: str, full_name: str
+    ) -> str:
+        """Ищет качественное фото человека в HTML страницы."""
+
+        tokens = [
+            token.lower()
+            for token in re.findall(r"[А-ЯЁA-Zа-яёa-z\-]{4,}", full_name)
+        ]
+        candidates: list[tuple[int, str]] = []
+
+        def add(src: str, alt: str, attrs: str, width: str, height: str) -> None:
+            src = normalize_whitespace(src)
+            if not src or src.lower().startswith("data:"):
+                return
+            lowered = f"{src} {alt} {attrs}".lower()
+            if any(
+                marker in lowered
+                for marker in (
+                    "logo",
+                    "icon",
+                    "sprite",
+                    "placeholder",
+                    "blank",
+                    "spacer",
+                    "social",
+                    "favicon",
+                )
+            ):
+                return
+            if src.lower().endswith((".svg", ".gif")):
+                return
+            score = 0
+            if any(token in lowered for token in tokens):
+                score += 6
+            if any(
+                marker in lowered
+                for marker in ("rector", "ректор", "photo", "avatar", "person", "staff")
+            ):
+                score += 4
+            try:
+                if int(width or 0) >= 100 and int(height or 0) >= 100:
+                    score += 2
+            except ValueError:
+                pass
+            if any(
+                marker in lowered
+                for marker in ("900", "1200", "1600", "original", "large")
+            ):
+                score += 2
+            if score:
+                candidates.append((score, canonical_url(src, base_url)))
+
+        for image in soup.find_all("img"):
+            add(
+                str(
+                    image.get("data-src")
+                    or image.get("data-original")
+                    or image.get("src")
+                    or ""
+                ),
+                str(image.get("alt") or ""),
+                f"{image.get('class') or ''} {image.get('id') or ''}",
+                str(image.get("width") or ""),
+                str(image.get("height") or ""),
+            )
+
+        # Фото ректора часто лежит в CSS background-image, а не в <img>.
+        for node in soup.find_all(style=True):
+            for value in re.findall(
+                r"url\(([^)]+)\)", str(node.get("style") or "")
+            ):
+                add(value.strip("'\" "), "", "background", "", "")
+        for style in soup.find_all("style"):
+            for value in re.findall(
+                r"url\(([^)]+)\)", style.get_text(" ", strip=True)
+            ):
+                add(value.strip("'\" "), "", "background", "", "")
+
+        for meta in soup.find_all("meta"):
+            if meta.get("property") in {"og:image", "twitter:image"}:
+                add(
+                    str(meta.get("content") or ""),
+                    str(meta.get("property") or ""),
+                    "meta",
+                    "",
+                    "",
+                )
+        for link in soup.find_all("link"):
+            if "image_src" in (link.get("rel") or []):
+                add(str(link.get("href") or ""), "image_src", "link", "", "")
+
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
 
     @staticmethod
     def _extract_bio_text(
@@ -2524,6 +2881,9 @@ class UniversityParser:
             # Служебный адрес (office@, info@) не должен выдаваться за личный.
             leader.email = None
 
+        leader.reception_phone = leader.reception_phone or leader.office_phone or leader.phone
+        leader.reception_email = leader.reception_email or leader.email
+
         LOGGER.debug(
             "Контакты из биографии %s: телефон=%s, факс=%s, кабинет=%s, email=%s",
             leader.full_name,
@@ -2602,17 +2962,30 @@ class UniversityParser:
             ogrn=ogrn or None,
             address=address or None,
             region=self._extract_region(address) or None,
+            city=(self._passport.city if self._passport else None),
+            status=(self._passport.status if self._passport else None),
+            avg_ege=(self._passport.avg_ege if self._passport else None),
+            budget_places=(
+                self._passport.budget_places if self._passport else None
+            ),
+            paid_places=(self._passport.paid_places if self._passport else None),
+            dormitory=(self._passport.dormitory if self._passport else None),
+            military_department=(
+                self._passport.military_department if self._passport else None
+            ),
+            faculties=(self._passport.faculties if self._passport else []),
+            aggregator_url=(self._passport.url if self._passport else None),
             activity_areas=self._extract_activity_areas(self._about),
             email=org_email or None,
             phone=org_phone or None,
         )
 
-        if not self._leadership:
+        if not self._leadership and not self.settings.aggregators_only:
             self._warnings.append(
                 "Руководство не найдено. Проверьте /sveden/struct/ или селекторы "
                 "в config.py; возможно, контент рендерится JavaScript."
             )
-        if not self._documents:
+        if not self._documents and not self.settings.aggregators_only:
             self._errors.append("Не удалось получить ни одного документа источника")
 
         ordered_contacts = sorted(
@@ -2636,6 +3009,9 @@ class UniversityParser:
             partnerships=self._partnerships[:40],
             achievements=self._achievements[:40],
             events=self._events,
+            passport=self._passport,
+            passports=self._passports,
+            news_mentions=self._news_mentions,
             documents=list(self._documents.values()),
             conflicts=self._collect_conflicts(),
             warnings=dedupe_preserve(self._warnings),
@@ -3023,6 +3399,62 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Не догружать страницы отдельных публикаций.",
     )
     parser.add_argument(
+        "--aggregator",
+        choices=("auto", "vuzopedia", "postupi"),
+        default=None,
+        help="Агрегатор для паспорта вуза (по умолчанию оба).",
+    )
+    parser.add_argument(
+        "--aggregator-url",
+        default=None,
+        help="Прямая ссылка на карточку вуза в агрегаторе.",
+    )
+    parser.add_argument(
+        "--no-aggregators",
+        action="store_true",
+        help="Не запрашивать паспорт из Вузопедии/Поступи.Онлайн.",
+    )
+    parser.add_argument(
+        "--with-official-site",
+        action="store_true",
+        help="Дополнительно обходить официальный сайт вуза (по умолчанию выключено).",
+    )
+    parser.add_argument(
+        "--aggregators-only",
+        action="store_true",
+        help="Только агрегаторы, без официального сайта (по умолчанию).",
+    )
+    parser.add_argument(
+        "--no-news-search",
+        action="store_true",
+        help="Не искать новости о сотрудничестве со Сбером.",
+    )
+    parser.add_argument(
+        "--no-rector-lookup",
+        action="store_true",
+        help="Не искать автоматически страницу ректора и фото.",
+    )
+    parser.add_argument(
+        "--search-engine",
+        choices=(
+            "auto",
+            "yandex",
+            "google",
+            "bing_news",
+            "yahoo",
+            "duckduckgo",
+            "bing",
+        ),
+        default=None,
+        help="Поисковый движок для новостей (по умолчанию auto).",
+    )
+    parser.add_argument(
+        "--max-news",
+        type=int,
+        default=None,
+        help="Сколько публикаций о Сбере сохранять (по умолчанию 5).",
+    )
+    parser.add_argument(
         "--playwright",
         action="store_true",
         help="Разрешить браузерный рендеринг JS-страниц (если установлен Playwright).",
@@ -3066,6 +3498,24 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         settings.use_sqlite = False
     if args.no_item_pages:
         settings.fetch_item_pages = False
+    if args.aggregator and args.aggregator != "auto":
+        settings.aggregator_sources = args.aggregator
+    if args.aggregator_url:
+        settings.aggregator_url = args.aggregator_url
+    if args.no_aggregators:
+        settings.use_aggregators = False
+    if args.with_official_site:
+        settings.aggregators_only = False
+    if args.aggregators_only:
+        settings.aggregators_only = True
+    if args.no_news_search:
+        settings.use_news_search = False
+    if args.no_rector_lookup:
+        settings.rector_lookup = False
+    if args.search_engine:
+        settings.search_engine = args.search_engine
+    if args.max_news is not None:
+        settings.max_news = max(1, args.max_news)
     if args.playwright:
         settings.enable_playwright = True
     return settings
@@ -3160,7 +3610,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"Проекты: {summary['projects']} | Гранты: {summary['grants']} | "
                 f"Наука: {summary['research']} | Партнёры: {summary['partnerships']} | "
                 f"Достижения: {summary['achievements']} | Мероприятия: {summary['events']} | "
-                f"Документы: {summary['documents']}"
+                f"Документы: {summary['documents']} | Паспорт: {summary['passports']} | "
+                f"Новости о Сбере: {summary['news_mentions']}"
             )
             print(f"Предупреждения: {summary['warnings']} | Ошибки: {summary['errors']}")
             print(f"Карточка: {paths['card']}")

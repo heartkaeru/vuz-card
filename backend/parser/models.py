@@ -51,6 +51,15 @@ class UniversityInfo(BaseModel):
     ogrn: Optional[str] = None
     address: Optional[str] = None
     region: Optional[str] = None
+    city: Optional[str] = None
+    status: Optional[str] = None
+    avg_ege: Optional[float] = None
+    budget_places: Optional[int] = None
+    paid_places: Optional[int] = None
+    dormitory: Optional[bool] = None
+    military_department: Optional[bool] = None
+    faculties: list[str] = Field(default_factory=list)
+    aggregator_url: Optional[str] = None
     activity_areas: list[str] = Field(default_factory=list)
     email: Optional[str] = None
     phone: Optional[str] = None
@@ -74,6 +83,10 @@ class Leadership(BaseModel):
     unit: Optional[str] = None
     source_url: str = ""
     source_quote: Optional[str] = None
+    photo_url: Optional[str] = None
+    status: Optional[str] = None
+    reception_phone: Optional[str] = None
+    reception_email: Optional[str] = None
     is_acting: bool = False
 
     @field_validator(
@@ -89,6 +102,10 @@ class Leadership(BaseModel):
         "office_number",
         "address",
         "source_quote",
+        "photo_url",
+        "status",
+        "reception_phone",
+        "reception_email",
         mode="before",
     )
     @classmethod
@@ -240,6 +257,47 @@ class Achievement(BaseModel):
     @field_validator("title", "result", mode="before")
     @classmethod
     def _strip_achievement(cls, value: object) -> object:
+        return _strip_value(value)
+
+
+class AggregatorPassport(BaseModel):
+    """Базовый «паспорт» вуза из агрегатора."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    source: str = ""
+    url: str = ""
+    name: str = ""
+    city: Optional[str] = None
+    status: Optional[str] = None
+    avg_ege: Optional[float] = None
+    budget_places: Optional[int] = None
+    paid_places: Optional[int] = None
+    dormitory: Optional[bool] = None
+    military_department: Optional[bool] = None
+    faculties: list[str] = Field(default_factory=list)
+
+    @field_validator("name", "city", "status", mode="before")
+    @classmethod
+    def _strip_passport(cls, value: object) -> object:
+        return _strip_value(value)
+
+
+class NewsMention(BaseModel):
+    """Публикация о сотрудничестве вуза и Сбера из поисковой выдачи."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    title: str
+    url: str
+    snippet: str = ""
+    date: Optional[str] = None
+    source: str = ""
+    query: str = ""
+
+    @field_validator("title", "snippet", "source", "query", mode="before")
+    @classmethod
+    def _strip_news(cls, value: object) -> object:
         return _strip_value(value)
 
 
@@ -492,6 +550,9 @@ class UniversityData(BaseModel):
     partnerships: list[Partnership] = Field(default_factory=list)
     achievements: list[Achievement] = Field(default_factory=list)
     events: list[Event] = Field(default_factory=list)
+    passport: Optional[AggregatorPassport] = None
+    passports: list[AggregatorPassport] = Field(default_factory=list)
+    news_mentions: list[NewsMention] = Field(default_factory=list)
     documents: list[SourceDocument] = Field(default_factory=list)
     conflicts: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
@@ -512,6 +573,8 @@ class UniversityData(BaseModel):
             "partnerships": len(self.partnerships),
             "achievements": len(self.achievements),
             "events": len(self.events),
+            "passports": len(self.passports),
+            "news_mentions": len(self.news_mentions),
             "documents": len(self.documents),
             "warnings": len(self.warnings),
             "errors": len(self.errors),

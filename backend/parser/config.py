@@ -79,6 +79,14 @@ class Settings:
     fetch_item_pages: bool = True
     max_item_documents: int = 8
     news_window_months: int = 24
+    use_aggregators: bool = True
+    aggregators_only: bool = True
+    aggregator_sources: str = "vuzopedia,postupi"
+    aggregator_url: str = ""
+    use_news_search: bool = True
+    rector_lookup: bool = True
+    search_engine: str = "auto"
+    max_news: int = 5
     use_cache: bool = True
     cache_ttl_hours: int = 24
     use_sqlite: bool = True
@@ -109,6 +117,16 @@ class Settings:
             fetch_item_pages=_env_bool("PARSER_ITEM_PAGES", True),
             max_item_documents=max(0, _env_int("PARSER_MAX_ITEM_DOCS", 8)),
             news_window_months=max(0, _env_int("PARSER_NEWS_MONTHS", 24)),
+            use_aggregators=_env_bool("PARSER_AGGREGATORS", True),
+            aggregators_only=_env_bool("PARSER_AGGREGATORS_ONLY", True),
+            aggregator_sources=os.getenv(
+                "PARSER_AGGREGATOR_SOURCES", "vuzopedia,postupi"
+            ),
+            aggregator_url=os.getenv("PARSER_AGGREGATOR_URL", ""),
+            use_news_search=_env_bool("PARSER_NEWS_SEARCH", True),
+            rector_lookup=_env_bool("PARSER_RECTOR_LOOKUP", True),
+            search_engine=os.getenv("PARSER_SEARCH_ENGINE", "auto"),
+            max_news=max(1, _env_int("PARSER_MAX_NEWS", 5)),
             use_cache=_env_bool("PARSER_CACHE", True),
             cache_ttl_hours=max(1, _env_int("PARSER_CACHE_TTL_HOURS", 24)),
             use_sqlite=_env_bool("PARSER_SQLITE", True),
@@ -150,8 +168,11 @@ class UniversityProfile:
     url: str
     sections: tuple[SectionSpec, ...]
     aliases: tuple[str, ...] = ()
+    city: str = ""
     content_selectors: tuple[str, ...] = ()
     bio_urls: tuple[str, ...] = ()
+    vuzopedia_url: str = ""
+    postupi_url: str = ""
     notes: str = ""
 
 
@@ -186,12 +207,15 @@ UNIVERSITY_PROFILES: dict[str, UniversityProfile] = {
         name="Санкт-Петербургский государственный университет",
         url="https://spbu.ru/",
         aliases=("спбгу", "saint petersburg state university", "spbu.ru"),
+        city="Санкт-Петербург",
         content_selectors=(
             "article.editor-wrap",
             "main.page-main-content",
             "main",
         ),
         bio_urls=("https://spbu.ru/rector/biografiya",),
+        vuzopedia_url="https://vuzopedia.ru/vuz/1239",
+        postupi_url="https://spb.postupi.online/vuz/spbgu/",
         notes=(
             "Структура и руководство берутся из обязательного раздела "
             "/sveden/struct/; биография ректора — отдельная страница."
@@ -238,8 +262,12 @@ UNIVERSITY_PROFILES: dict[str, UniversityProfile] = {
         slug="hse",
         name="Национальный исследовательский университет «Высшая школа экономики»",
         url="https://www.hse.ru/",
-        aliases=("вшэ", "hse", "hse.ru", "высшая школа экономики"),
+        aliases=("ниу вшэ", "вшэ", "hse", "hse.ru", "высшая школа экономики"),
+        city="Москва",
         content_selectors=("div.content", "main", "article"),
+        bio_urls=("https://www.hse.ru/rector/",),
+        vuzopedia_url="https://vuzopedia.ru/vuz/342",
+        postupi_url="https://msk.postupi.online/vuz/niu-vshe/",
         notes=(
             "Контакты и руководство — в /sveden/struct/ и /sveden/common/. "
             "Новости и мероприятия — раздельные страницы."
@@ -287,7 +315,11 @@ UNIVERSITY_PROFILES: dict[str, UniversityProfile] = {
         ),
         url="https://urfu.ru/",
         aliases=("урфу", "urfu", "urfu.ru", "уральский федеральный университет"),
+        city="Екатеринбург",
         content_selectors=("main", "#content", ".content", "article"),
+        bio_urls=("https://urfu.ru/ru/about/rector/",),
+        vuzopedia_url="https://vuzopedia.ru/vuz/1848",
+        postupi_url="https://ekaterinburg.postupi.online/vuz/urfu-im-b-n-elcina/",
         notes=(
             "Руководство и подразделения — /sveden/struct/ (таблицы "
             "«Руководитель подразделения»). Контакты — /ru/contacts/."
@@ -341,7 +373,9 @@ UNIVERSITY_PROFILES: dict[str, UniversityProfile] = {
         name="Российский государственный гуманитарный университет",
         url="https://www.rsuh.ru/",
         aliases=("рггу", "rsuh", "rggu", "rsuh.ru", "рггу.рф"),
+        city="Москва",
         content_selectors=(".page-content", "#content", "main"),
+        vuzopedia_url="https://vuzopedia.ru/vuz/96",
         notes=(
             "Таблицы /sveden/struct/ содержат ФИО, должности, адреса и "
             "контакты руководителей подразделений."
@@ -386,6 +420,9 @@ UNIVERSITY_PROFILES: dict[str, UniversityProfile] = {
         name="Московский государственный университет имени М. В. Ломоносова",
         url="https://www.msu.ru/",
         aliases=("мгу", "msu", "msu.ru", "московский государственный университет"),
+        city="Москва",
+        vuzopedia_url="https://vuzopedia.ru/vuz/1",
+        postupi_url="https://msk.postupi.online/vuz/mgu/",
         notes=(
             "Сайт отдаёт SPA-разметку без SSR-контента. Без Playwright "
             "извлекаются только метаданные; парсер фиксирует предупреждение."
