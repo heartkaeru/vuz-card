@@ -412,6 +412,102 @@ def is_probably_content_link(url: str) -> bool:
     return True
 
 
+def find_photo(soup: object, base_url: str, full_name: str) -> str:
+    """Ищет качественное фото человека в HTML страницы.
+
+    Учитывает ``<img>``, CSS ``background-image``, ``og:image`` и
+    ``link[rel=image_src]``. Возвращает абсолютный URL или пустую строку.
+    """
+
+    tokens = [
+        token.lower()
+        for token in re.findall(r"[А-ЯЁA-Zа-яёa-z\-]{4,}", full_name or "")
+    ]
+    tokens += [slugify(token) for token in tokens]
+    candidates: list[tuple[int, str]] = []
+
+    def add(
+        src: str,
+        alt: str = "",
+        attrs: str = "",
+        width: str = "",
+        height: str = "",
+    ) -> None:
+        src = normalize_whitespace(src)
+        if not src or src.lower().startswith("data:"):
+            return
+        lowered = f"{src} {alt} {attrs}".lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "logo",
+                "icon",
+                "sprite",
+                "placeholder",
+                "blank",
+                "spacer",
+                "social",
+                "favicon",
+            )
+        ):
+            return
+        if src.lower().endswith((".svg", ".gif")):
+            return
+        score = 0
+        if any(token in lowered for token in tokens):
+            score += 6
+        if any(
+            marker in lowered
+            for marker in ("rector", "ректор", "photo", "avatar", "person", "staff")
+        ):
+            score += 4
+        try:
+            if int(width or 0) >= 100 and int(height or 0) >= 100:
+                score += 2
+        except ValueError:
+            pass
+        if any(
+            marker in lowered
+            for marker in ("900", "1200", "1600", "original", "large")
+        ):
+            score += 2
+        if score:
+            candidates.append((score, canonical_url(src, base_url)))
+
+    for image in soup.find_all("img"):  # type: ignore[attr-defined]
+        add(
+            str(
+                image.get("data-src")
+                or image.get("data-original")
+                or image.get("src")
+                or ""
+            ),
+            str(image.get("alt") or ""),
+            f"{image.get('class') or ''} {image.get('id') or ''}",
+            str(image.get("width") or ""),
+            str(image.get("height") or ""),
+        )
+
+    for node in soup.find_all(style=True):  # type: ignore[attr-defined]
+        for value in re.findall(r"url\(([^)]+)\)", str(node.get("style") or "")):
+            add(value.strip("'\" "), "", "background")
+    for style in soup.find_all("style"):  # type: ignore[attr-defined]
+        for value in re.findall(r"url\(([^)]+)\)", style.get_text(" ", strip=True)):
+            add(value.strip("'\" "), "", "background")
+
+    for meta in soup.find_all("meta"):  # type: ignore[attr-defined]
+        if meta.get("property") in {"og:image", "twitter:image"}:
+            add(str(meta.get("content") or ""), str(meta.get("property") or ""), "meta")
+    for link in soup.find_all("link"):  # type: ignore[attr-defined]
+        if "image_src" in (link.get("rel") or []):
+            add(str(link.get("href") or ""), "image_src", "link")
+
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
 def extract_emails(text: str) -> list[str]:
     """Извлекает и нормализует email-адреса."""
 

@@ -66,8 +66,9 @@ python -m parser.main --input-file universities.txt
   Используются Яндекс/Google, при капче — Bing News RSS и другие fallback.
 
 > Важно: Вузопедия и Поступи.Онлайн не содержат блока «Руководство» и фото
-> ректора. Для ректората/фото нужен `--with-official-site` (одна страница
-> ректора) или отдельный источник данных.
+> ректора. Парсер сам находит официальный сайт и страницу ректора через
+> поисковик и типовые адреса (`/rector/`, `/about/rector/`), без ручных ссылок.
+> Отключить автопоиск: `--no-rector-lookup`.
 
 ```bash
 python -m parser.main --profile hse --aggregator auto --max-news 5

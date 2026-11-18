@@ -27,7 +27,7 @@ from bs4.element import Tag
 
 if __package__ in (None, ""):  # запуск как `python backend/parser/main.py`
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from parser import aggregators, cleaner, config, models, news_search, stealth, store, utils  # type: ignore
+    from parser import aggregators, cleaner, config, models, news_search, official_site, stealth, store, utils  # type: ignore
 
     # Ниже используются обычные импорты (`from cleaner import ...`), чтобы
     # модуль можно было запускать и как пакет, и как отдельный файл.
@@ -36,17 +36,19 @@ if __package__ in (None, ""):  # запуск как `python backend/parser/main
     sys.modules.setdefault("config", config)
     sys.modules.setdefault("models", models)
     sys.modules.setdefault("news_search", news_search)
+    sys.modules.setdefault("official_site", official_site)
     sys.modules.setdefault("stealth", stealth)
     sys.modules.setdefault("store", store)
     sys.modules.setdefault("utils", utils)
 else:
-    from . import aggregators, cleaner, config, models, news_search, stealth, store, utils
+    from . import aggregators, cleaner, config, models, news_search, official_site, stealth, store, utils
 
     sys.modules.setdefault("aggregators", aggregators)
     sys.modules.setdefault("cleaner", cleaner)
     sys.modules.setdefault("config", config)
     sys.modules.setdefault("models", models)
     sys.modules.setdefault("news_search", news_search)
+    sys.modules.setdefault("official_site", official_site)
     sys.modules.setdefault("stealth", stealth)
     sys.modules.setdefault("store", store)
     sys.modules.setdefault("utils", utils)
@@ -86,6 +88,7 @@ from models import (
     utc_now,
 )
 from news_search import NewsSearch
+from official_site import OfficialSiteDiscovery
 from stealth import StealthFetcher
 from store import CrawlCache, DocumentStore
 from utils import (
@@ -892,6 +895,7 @@ class UniversityParser:
         if self.settings.aggregators_only:
             LOGGER.info("Режим: только агрегаторы (без обхода сайта вуза)")
             self._enrich_aggregators(base_url)
+            self._enrich_rector_from_web()
             self._enrich_news_mentions()
             card = self._build_card(base_url, name, profile_obj, None)
             if self._cache is not None:
@@ -2526,6 +2530,63 @@ class UniversityParser:
                 else {},
             )
 
+    def _enrich_rector_from_web(self) -> None:
+        """Находит сайт/страницу ректора автоматически и добавляет запись."""
+
+        if not self.settings.rector_lookup:
+            return
+        fetcher = StealthFetcher(
+            timeout=min(self.settings.timeout, 25.0),
+            enable_playwright=self.settings.enable_playwright,
+        )
+        short_name = (
+            self.profile.aliases[0]
+            if self.profile and self.profile.aliases
+            else ""
+        )
+        try:
+            leader, site_url, rector_url = OfficialSiteDiscovery(fetcher).discover(
+                self._university_name, short_name=short_name
+            )
+        except Exception as exc:  # noqa: BLE001 - поиск не должен ронять сбор
+            LOGGER.warning("Автопоиск ректора не удался: %s", exc)
+            return
+        finally:
+            fetcher.close()
+
+        if not leader:
+            self._warnings.append(
+                "Не удалось автоматически найти страницу ректора и фото"
+            )
+            return
+
+        self._leadership = [leader]
+        if site_url:
+            host = utils.urlparse(site_url).netloc.lower().split(":")[0]
+            if host.startswith("www."):
+                host = host[4:]
+            self._official_domain = host or self._official_domain
+        for contact_type, value in (
+            ("phone", leader.reception_phone or leader.phone),
+            ("email", leader.reception_email or leader.email),
+        ):
+            if value:
+                self._add_contact(
+                    Contact(
+                        type=contact_type,
+                        value=value,
+                        owner=leader.full_name,
+                        owner_kind="person",
+                        source_url=rector_url,
+                        context="ректорат",
+                    )
+                )
+        LOGGER.info(
+            "Ректор найден автоматически: %s, фото: %s",
+            leader.full_name,
+            leader.photo_url or "нет",
+        )
+
     def _enrich_news_mentions(self) -> None:
         if not self.settings.use_news_search:
             return
@@ -3369,6 +3430,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Не искать новости о сотрудничестве со Сбером.",
     )
     parser.add_argument(
+        "--no-rector-lookup",
+        action="store_true",
+        help="Не искать автоматически страницу ректора и фото.",
+    )
+    parser.add_argument(
         "--search-engine",
         choices=(
             "auto",
@@ -3444,6 +3510,8 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         settings.aggregators_only = True
     if args.no_news_search:
         settings.use_news_search = False
+    if args.no_rector_lookup:
+        settings.rector_lookup = False
     if args.search_engine:
         settings.search_engine = args.search_engine
     if args.max_news is not None:

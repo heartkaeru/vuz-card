@@ -2,12 +2,16 @@ try:  # запуск из backend/ (pytest)
     from parser.aggregators import PostupiParser, VuzopediaParser
     from parser.main import UniversityParser, _make_soup
     from parser.news_search import NewsSearch
+    from parser.official_site import OfficialSiteDiscovery
     from parser.stealth import StealthResponse
+    from parser.utils import normalize_whitespace
 except ImportError:  # запуск из корня репозитория
     from backend.parser.aggregators import PostupiParser, VuzopediaParser
     from backend.parser.main import UniversityParser, _make_soup
     from backend.parser.news_search import NewsSearch
+    from backend.parser.official_site import OfficialSiteDiscovery
     from backend.parser.stealth import StealthResponse
+    from backend.parser.utils import normalize_whitespace
 
 
 class FakeFetcher:
@@ -121,3 +125,22 @@ def test_rector_photo_from_background() -> None:
     photo = UniversityParser._find_photo(soup, "https://example.ru/", "Иванов Иван")
 
     assert photo == "https://example.ru/rector_900.jpg"
+
+
+def test_rector_name_and_photo_auto() -> None:
+    html = """
+    <html><body>
+      <h1>Ректор</h1>
+      <p>Ректор Илья Николаевич Обабков</p>
+      <img alt="Илья Николаевич Обабков"
+           src="/upload/Obabkov.jpg" width="300" height="400">
+    </body></html>
+    """
+    soup = _make_soup(html)
+    text = normalize_whitespace(soup.get_text(" ", strip=True))
+    name = OfficialSiteDiscovery._find_name(soup, text)
+
+    assert OfficialSiteDiscovery._normalize_name(name) == "Обабков Илья Николаевич"
+    assert OfficialSiteDiscovery._normalize_name("Анисимов Никита Юрьевич") == (
+        "Анисимов Никита Юрьевич"
+    )

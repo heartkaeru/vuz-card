@@ -84,6 +84,7 @@ class Settings:
     aggregator_sources: str = "vuzopedia,postupi"
     aggregator_url: str = ""
     use_news_search: bool = True
+    rector_lookup: bool = True
     search_engine: str = "auto"
     max_news: int = 5
     use_cache: bool = True
@@ -123,6 +124,7 @@ class Settings:
             ),
             aggregator_url=os.getenv("PARSER_AGGREGATOR_URL", ""),
             use_news_search=_env_bool("PARSER_NEWS_SEARCH", True),
+            rector_lookup=_env_bool("PARSER_RECTOR_LOOKUP", True),
             search_engine=os.getenv("PARSER_SEARCH_ENGINE", "auto"),
             max_news=max(1, _env_int("PARSER_MAX_NEWS", 5)),
             use_cache=_env_bool("PARSER_CACHE", True),
@@ -260,7 +262,7 @@ UNIVERSITY_PROFILES: dict[str, UniversityProfile] = {
         slug="hse",
         name="Национальный исследовательский университет «Высшая школа экономики»",
         url="https://www.hse.ru/",
-        aliases=("вшэ", "hse", "hse.ru", "высшая школа экономики"),
+        aliases=("ниу вшэ", "вшэ", "hse", "hse.ru", "высшая школа экономики"),
         city="Москва",
         content_selectors=("div.content", "main", "article"),
         bio_urls=("https://www.hse.ru/rector/",),
