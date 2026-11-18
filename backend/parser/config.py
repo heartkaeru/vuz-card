@@ -80,6 +80,7 @@ class Settings:
     max_item_documents: int = 8
     news_window_months: int = 24
     use_aggregators: bool = True
+    aggregators_only: bool = True
     aggregator_sources: str = "vuzopedia,postupi"
     aggregator_url: str = ""
     use_news_search: bool = True
@@ -116,6 +117,7 @@ class Settings:
             max_item_documents=max(0, _env_int("PARSER_MAX_ITEM_DOCS", 8)),
             news_window_months=max(0, _env_int("PARSER_NEWS_MONTHS", 24)),
             use_aggregators=_env_bool("PARSER_AGGREGATORS", True),
+            aggregators_only=_env_bool("PARSER_AGGREGATORS_ONLY", True),
             aggregator_sources=os.getenv(
                 "PARSER_AGGREGATOR_SOURCES", "vuzopedia,postupi"
             ),

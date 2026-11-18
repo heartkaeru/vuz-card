@@ -889,6 +889,17 @@ class UniversityParser:
             base_url,
         )
 
+        if self.settings.aggregators_only:
+            LOGGER.info("Режим: только агрегаторы (без обхода сайта вуза)")
+            self._enrich_aggregators(base_url)
+            self._enrich_news_mentions()
+            card = self._build_card(base_url, name, profile_obj, None)
+            if self._cache is not None:
+                self._cache.prune()
+                self._cache.flush()
+            LOGGER.info("Сбор завершён: %s", card.summary())
+            return card
+
         homepage_doc, homepage_soup = self._get_page(base_url, section="homepage")
         if homepage_doc is None:
             self._errors.append(
@@ -2908,12 +2919,12 @@ class UniversityParser:
             phone=org_phone or None,
         )
 
-        if not self._leadership:
+        if not self._leadership and not self.settings.aggregators_only:
             self._warnings.append(
                 "Руководство не найдено. Проверьте /sveden/struct/ или селекторы "
                 "в config.py; возможно, контент рендерится JavaScript."
             )
-        if not self._documents:
+        if not self._documents and not self.settings.aggregators_only:
             self._errors.append("Не удалось получить ни одного документа источника")
 
         ordered_contacts = sorted(
@@ -3343,6 +3354,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Не запрашивать паспорт из Вузопедии/Поступи.Онлайн.",
     )
     parser.add_argument(
+        "--with-official-site",
+        action="store_true",
+        help="Дополнительно обходить официальный сайт вуза (по умолчанию выключено).",
+    )
+    parser.add_argument(
+        "--aggregators-only",
+        action="store_true",
+        help="Только агрегаторы, без официального сайта (по умолчанию).",
+    )
+    parser.add_argument(
         "--no-news-search",
         action="store_true",
         help="Не искать новости о сотрудничестве со Сбером.",
@@ -3417,6 +3438,10 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         settings.aggregator_url = args.aggregator_url
     if args.no_aggregators:
         settings.use_aggregators = False
+    if args.with_official_site:
+        settings.aggregators_only = False
+    if args.aggregators_only:
+        settings.aggregators_only = True
     if args.no_news_search:
         settings.use_news_search = False
     if args.search_engine:

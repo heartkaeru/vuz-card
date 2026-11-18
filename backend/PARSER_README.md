@@ -23,6 +23,14 @@ python -m parser.main --profile urfu
 python -m parser.main --all
 ```
 
+По умолчанию работает режим **только агрегаторы**: официальный сайт вуза не
+обходится, паспорт берётся из Вузопедии/Поступи.Онлайн. Полный обход сайта
+включается явно:
+
+```bash
+python -m parser.main --profile hse --with-official-site
+```
+
 Из корня репозитория:
 
 ```bash
@@ -56,6 +64,10 @@ python -m parser.main --input-file universities.txt
 - Новости о сотрудничестве со Сбером ищутся по запросам
   `"<вуз>" Сбербанк сотрудничество` и `"<вуз>" Сбербанк`.
   Используются Яндекс/Google, при капче — Bing News RSS и другие fallback.
+
+> Важно: Вузопедия и Поступи.Онлайн не содержат блока «Руководство» и фото
+> ректора. Для ректората/фото нужен `--with-official-site` (одна страница
+> ректора) или отдельный источник данных.
 
 ```bash
 python -m parser.main --profile hse --aggregator auto --max-news 5
