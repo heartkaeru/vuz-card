@@ -88,7 +88,7 @@ from models import (
     utc_now,
 )
 from news_search import NewsSearch
-from official_site import OfficialSiteDiscovery
+from official_site import OfficialSiteDiscovery, resolve_official_site
 from stealth import StealthFetcher
 from store import CrawlCache, DocumentStore
 from utils import (
@@ -867,13 +867,32 @@ class UniversityParser:
         profile_obj = self._resolve_profile(url, profile)
         self.profile = profile_obj
         base_url = (url or (profile_obj.url if profile_obj else "")).strip()
-        if not base_url:
-            raise ValueError("Не указан URL вуза и не выбран профиль")
+        if not base_url and name:
+            short_name = (
+                profile_obj.aliases[0]
+                if profile_obj and profile_obj.aliases
+                else ""
+            )
+            LOGGER.info("Ищу официальный сайт по названию: %s", name)
+            base_url = resolve_official_site(
+                name,
+                short_name=short_name,
+                timeout=min(self.settings.timeout, 25.0),
+                enable_playwright=self.settings.enable_playwright,
+            )
+            if base_url:
+                LOGGER.info("Официальный сайт найден: %s", base_url)
+        if not base_url and not self.settings.aggregators_only:
+            raise ValueError(
+                "Не удалось определить URL вуза: передайте URL или название"
+            )
 
         self._base_url = base_url
         self._university_name = name or (profile_obj.name if profile_obj else "")
         self._official_domain = (
             utils.urlparse(base_url).netloc.lower().split(":")[0]
+            if base_url
+            else ""
         )
         if self._official_domain.startswith("www."):
             self._official_domain = self._official_domain[4:]
@@ -3587,10 +3606,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             targets.append((args.url, args.name, key))
     elif args.url:
         targets.append((args.url, args.name, None))
+    elif args.name:
+        # Ссылка не нужна: официальный сайт найдётся автоматически.
+        targets.append((None, args.name, None))
     else:
         parser.print_help()
         print(
-            "\nУкажите --profile, --all, --url или --input-file. "
+            "\nУкажите --profile, --all, --url, --name или --input-file. "
             "Список профилей: --list-profiles"
         )
         return 2

@@ -64,3 +64,21 @@ class UniversityUpdate(BaseModel):
     city: Optional[str] = None
     fot_volume: Optional[str] = None
     version: int = Field(..., description="Текущая версия карточки для защиты от перезаписи")
+
+
+class UniversityCreateRequest(BaseModel):
+    """Создание карточки по названию: ссылка на сайт не требуется."""
+
+    name: str = Field(..., min_length=2, description="Название вуза или колледжа")
+    city: Optional[str] = Field(None, description="Город для уточнения поиска")
+    website: Optional[str] = Field(
+        None, description="Необязательно: если ссылка уже известна"
+    )
+
+
+class UniversityResolveResponse(BaseModel):
+    """Результат автоопределения официального сайта."""
+
+    name: str
+    website: str
+    city: Optional[str] = None
