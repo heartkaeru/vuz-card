@@ -7,12 +7,14 @@ from psycopg.conninfo import conninfo_to_dict
 MIGRATION_DIR=Path(__file__).resolve().parents[3]/'supabase'/'migrations'
 # __file__ is backend/database/postgres/db.py: repository is parents[3].
 
-def connect(dsn):
+def connect(dsn, *, application_name='vuz-card-migration', row_factory=None):
     try:
         options=conninfo_to_dict(dsn)
     except psycopg.Error as exc:
         raise ValueError('Invalid PostgreSQL connection string') from exc
-    settings={'connect_timeout':15,'application_name':'vuz-card-migration','prepare_threshold':None}
+    settings={'connect_timeout':15,'application_name':application_name,'prepare_threshold':None}
+    if row_factory is not None:
+        settings['row_factory']=row_factory
     if options.get('host') not in (None,'127.0.0.1','localhost','::1'):
         if options.get('sslmode') in ('disable','allow','prefer'):
             raise ValueError('Remote database connections require sslmode=require or certificate verification')

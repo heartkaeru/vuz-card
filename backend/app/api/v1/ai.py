@@ -53,7 +53,12 @@ def chat_user(credentials: HTTPAuthorizationCredentials | None = Depends(chat_be
 @lru_cache(maxsize=1)
 def get_repository():
     default = Path(__file__).resolve().parents[3] / "output/mvp/registry.sqlite3"
-    return DemoRepository(Path(os.environ.get("VUZ_MVP_DB", str(default))))
+    sqlite_path = Path(os.environ.get("VUZ_MVP_DB", str(default)))
+    if os.environ.get("DATABASE_URL", "").strip():
+        from database.postgres.runtime_store import SupabaseDemoRepository
+
+        return SupabaseDemoRepository(sqlite_path)
+    return DemoRepository(sqlite_path)
 
 
 def get_pipeline():
