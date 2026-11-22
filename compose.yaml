@@ -1,0 +1,56 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - backend/.env
+    environment:
+      VUZ_HOST: 0.0.0.0
+      VUZ_PORT: 8000
+      VUZ_MVP_DB: /var/lib/vuz/registry.sqlite3
+      VUZ_AUTH_DB: /var/lib/vuz/auth.sqlite3
+      PARSER_DB_PATH: /var/lib/vuz/parser.sqlite3
+      PARSER_OUTPUT_DIR: /var/lib/vuz/parser-output
+      PARSER_LOG_DIR: /var/lib/vuz/parser-logs
+      PARSER_CACHE_DIR: /var/lib/vuz/parser-cache
+    volumes:
+      - vuz_data:/var/lib/vuz
+    expose:
+      - "8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VUZ_BACKEND_URL: http://backend:8000
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      VUZ_BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+    expose:
+      - "3000"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    env_file:
+      - deploy/domain.env
+    depends_on:
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  vuz_data:
+  caddy_data:
+  caddy_config:

@@ -136,4 +136,5 @@ vuz-card/
 
 - [Локальный запуск LLM-модуля и приложения](backend/docs/llm/LLM_WORKFLOW.md#локальный-запуск)
 - [Настройка парсера](backend/PARSER_README.md), [авторизация](backend/docs/AUTH.md) и [шаблоны презентаций](backend/templates/README.md)
+- [Развёртывание на VPS](deploy/README.md)
 - [Результаты проверок LLM-модуля и границы выборок](backend/docs/llm/LLM_WORKFLOW.md#результаты-проверок)
