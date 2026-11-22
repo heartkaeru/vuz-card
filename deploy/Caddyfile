@@ -1,4 +1,9 @@
-{$DOMAIN} {
+{$SITE_ADDRESS} {
 	encode zstd gzip
+	tls {
+		issuer acme {
+			profile shortlived
+		}
+	}
 	reverse_proxy frontend:3000
 }

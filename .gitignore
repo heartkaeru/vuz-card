@@ -6,7 +6,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
-deploy/domain.env
+deploy/site.env
 .venv
 env/
 venv/

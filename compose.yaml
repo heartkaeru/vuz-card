@@ -35,10 +35,10 @@ services:
       - "3000"
 
   caddy:
-    image: caddy:2
+    image: caddy:2.11.9-alpine
     restart: unless-stopped
     env_file:
-      - deploy/domain.env
+      - deploy/site.env
     depends_on:
       - frontend
     ports:

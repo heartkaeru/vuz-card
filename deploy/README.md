@@ -1,11 +1,11 @@
 # Развёртывание на VPS
 
-Инструкция рассчитана на один Linux-сервер с Docker Compose, внешний Supabase и домен с HTTPS через Caddy.
+Инструкция рассчитана на один Linux-сервер с Docker Compose и внешний Supabase. Домен необязателен: Caddy может получить короткоживущий сертификат и для публичного IPv4.
 
 ## Что подготовить
 
 1. VPS с публичным IPv4 и SSH-доступом.
-2. Домен. В DNS добавьте A-запись для домена на IPv4 сервера.
+2. Публичный IPv4 сервера. Если есть домен, в DNS добавьте для него A-запись на этот адрес.
 3. Строку PostgreSQL `DATABASE_URL` из Supabase Dashboard → Connect.
 4. Значения GigaChat и `JWT_SECRET_KEY` для backend. Секреты храните только в env-файле на сервере.
 
@@ -18,23 +18,23 @@ cp backend/.env.example backend/.env
 nano backend/.env
 ```
 
-Укажите домен для Caddy:
+Укажите адрес, по которому будет открываться приложение:
 
 ```sh
-cp deploy/domain.env.example deploy/domain.env
-nano deploy/domain.env
+cp deploy/site.env.example deploy/site.env
+nano deploy/site.env
 ```
 
-Файл `deploy/domain.env` должен содержать публичное доменное имя:
+Файл `deploy/site.env` содержит публичный IPv4 или доменное имя:
 
 ```dotenv
-DOMAIN=app.example.com
+SITE_ADDRESS=203.0.113.10
 ```
 
 На сервере ограничьте доступ к файлам с секретами:
 
 ```sh
-chmod 600 backend/.env deploy/domain.env
+chmod 600 backend/.env deploy/site.env
 ```
 
 ## Запуск
@@ -47,7 +47,7 @@ docker compose ps
 docker compose logs --tail=100
 ```
 
-Откройте `https://<ваш-домен>`. Первый запуск Caddy получит TLS-сертификат автоматически, если DNS уже указывает на этот сервер и входящие порты 80 и 443 разрешены.
+Откройте `https://<публичный-ip>` или `https://<домен>`. Caddy использует профиль Let's Encrypt `shortlived` и автоматически обновляет сертификат. Публичный IPv4 должен быть постоянным, а входящие порты 80 и 443 — доступны снаружи. Let’s Encrypt выдаёт такие сертификаты на 160 часов, поэтому автоматическое продление важно. См. [объявление Let’s Encrypt](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability) и [документацию Caddy](https://caddyserver.com/docs/caddyfile/directives/tls#issuers).
 
 Backend, frontend и Caddy запускаются отдельными контейнерами. Backend доступен только внутри Docker-сети. SQLite-файлы находятся в постоянном именованном томе `vuz_data`; Caddy хранит сертификаты в `caddy_data` и настройки в `caddy_config`.
 
