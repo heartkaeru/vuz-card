@@ -52,3 +52,14 @@ docker compose logs --tail=100
 Backend, frontend и Caddy запускаются отдельными контейнерами. Backend доступен только внутри Docker-сети. SQLite-файлы находятся в постоянном именованном томе `vuz_data`; Caddy хранит сертификаты в `caddy_data` и настройки в `caddy_config`.
 
 Не запускайте `docker compose down -v`, если хотите сохранить SQLite-файлы и сертификаты: флаг `-v` удаляет именованные тома. Перед обновлением проекта и периодически сохраняйте резервную копию тома `vuz_data`.
+
+## Временная бесплатная ссылка без домена и выделенного IP
+
+Для демонстрации можно запустить Cloudflare Quick Tunnel. Он создаёт временный HTTPS-адрес `trycloudflare.com`; домен и входящие порты VPS не нужны. Из корня репозитория запустите backend, frontend и туннель:
+
+```sh
+docker compose --profile quick-tunnel up -d --build backend frontend cloudflared
+docker compose logs -f cloudflared
+```
+
+Скопируйте адрес `https://…trycloudflare.com` из логов и откройте его в браузере. Ссылка действует, пока работает этот туннель, и меняется после его пересоздания или перезапуска. Cloudflare не обещает доступность для Quick Tunnels; официально они предназначены для проверки и разработки, а не для постоянного сайта. Ограничение — до 200 одновременных запросов; Server-Sent Events не поддерживаются. [Документация Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/).

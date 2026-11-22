@@ -50,6 +50,15 @@ services:
       - caddy_data:/data
       - caddy_config:/config
 
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles:
+      - quick-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://frontend:3000
+    depends_on:
+      - frontend
+
 volumes:
   vuz_data:
   caddy_data:
