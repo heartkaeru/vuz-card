@@ -12,6 +12,7 @@ requests>=2.31,<3
 beautifulsoup4>=4.12,<5
 lxml>=5.0
 curl_cffi>=0.7,<1
+psycopg[binary]>=3.2,<4
 -r requirements-llm.txt
 
 # Excel registry import
