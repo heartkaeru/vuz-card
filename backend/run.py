@@ -18,6 +18,8 @@ if __name__ == "__main__":
         os.environ["VUZ_MVP_DB"] = str(args.db.resolve())
     from app.api.v1.ai import get_repository
     get_repository().fail_interrupted_jobs()
-    print("VUZ-CRM backend: http://127.0.0.1:8000")
-    print("API documentation: http://127.0.0.1:8000/docs")
-    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=False)
+    host = os.environ.get("VUZ_HOST", "127.0.0.1")
+    port = int(os.environ.get("VUZ_PORT", "8000"))
+    print(f"VUZ-CRM backend: http://{host}:{port}")
+    print(f"API documentation: http://{host}:{port}/docs")
+    uvicorn.run("app.main:app", host=host, port=port, reload=False)
