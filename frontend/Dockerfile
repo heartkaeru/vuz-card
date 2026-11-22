@@ -20,4 +20,4 @@ ENV NODE_ENV=production \
 RUN corepack enable
 COPY --from=build /app ./
 EXPOSE 3000
-CMD ["pnpm", "start", "--", "--hostname", "0.0.0.0"]
+CMD ["pnpm", "exec", "next", "start", "--hostname", "0.0.0.0"]
