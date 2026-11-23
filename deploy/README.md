@@ -43,9 +43,12 @@ chmod 600 backend/.env deploy/site.env
 
 ```sh
 docker compose up -d --build
+docker compose exec backend python -m database.postgres migrate
 docker compose ps
 docker compose logs --tail=100
 ```
+
+`migrate` applies any new versioned Supabase schema changes. It does not remove card data; data is purged only when the authenticated API receives an explicit `DELETE /api/v1/ai/cards/{card_id}` request.
 
 Откройте `https://<публичный-ip>` или `https://<домен>`. Caddy использует профиль Let's Encrypt `shortlived` и автоматически обновляет сертификат. Публичный IPv4 должен быть постоянным, а входящие порты 80 и 443 — доступны снаружи. Let’s Encrypt выдаёт такие сертификаты на 160 часов, поэтому автоматическое продление важно. См. [объявление Let’s Encrypt](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability) и [документацию Caddy](https://caddyserver.com/docs/caddyfile/directives/tls#issuers).
 

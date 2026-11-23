@@ -106,6 +106,25 @@ class SupabaseRegistry:
                 ).fetchone()
                 return self._card(row)
 
+    def delete_card(self, card_id: str, actor: str = "") -> bool:
+        try:
+            parsed_id = str(UUID(card_id))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        try:
+            with self._connect() as db:
+                with db.transaction():
+                    set_actor(db, kind="system", label=f"card-purge:{actor[:120] or 'api'}")
+                    deleted = db.execute(
+                        "SELECT public.vuz_purge_university(%s::uuid)", (parsed_id,),
+                    ).fetchone()[0]
+                    return bool(deleted)
+        except Exception as exc:
+            if (getattr(exc, "sqlstate", None) == "P0001"
+                    and getattr(getattr(exc, "diag", None), "message_primary", None) == "university_has_children"):
+                raise WorkflowError("university_has_children") from None
+            raise RuntimeError("Supabase card deletion failed") from None
+
 
 class SupabaseDemoRepository:
     """Use Supabase for registry cards and retain SQLite for AI workflow state."""
@@ -190,3 +209,13 @@ class SupabaseDemoRepository:
         return self._local.start_card_intake(
             card["name"], card["city"], card["website"], request_key, source_options,
         )
+
+    def delete_card(self, card_id, actor=""):
+        local_exists = self._local.has_card(card_id)
+        if local_exists:
+            self._local.ensure_card_deletable(card_id)
+        registry_deleted = self._registry.delete_card(card_id, actor=actor)
+        local_deleted = self._local.delete_card(card_id, actor=actor) if local_exists else False
+        if not registry_deleted and not local_deleted:
+            raise WorkflowError("card_not_found")
+        return {"deleted": True}

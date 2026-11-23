@@ -281,6 +281,11 @@ def create_card(payload: CardCreate, repository=Depends(get_repository)):
     return repository.create_card(payload.name, payload.city, str(payload.website).rstrip("/"))
 
 
+@router.delete("/cards/{card_id}", status_code=204, summary="Полностью удалить карточку и связанные данные")
+def delete_card(card_id: str, user_id=Depends(chat_user), repository=Depends(get_repository)):
+    """Purge a card and its workflow data; requires an authenticated user."""
+    checked(lambda: repository.delete_card(card_id, actor=user_id))
+    return Response(status_code=204)
 async def resolve_intake_website(name: str, website: str | None) -> str:
     if website:
         candidate = website
