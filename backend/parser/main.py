@@ -1353,13 +1353,21 @@ class UniversityParser:
             return None, None
         if self._cache is not None:
             failure = self._cache.get_failure(canonical)
-            if failure is not None:
+            if failure is not None and not self.settings.enable_playwright:
                 self._warnings.append(
                     f"{section}: пропущено после недавней ошибки "
                     f"({failure.get('error')}): {canonical}"
                 )
                 self._failed_urls.add(canonical)
                 return None, None
+            if failure is not None:
+                # Прошлая ошибка (SSL, 403) может быть обойдена браузером.
+                LOGGER.info(
+                    "%s: игнорирую прошлую ошибку (%s), пробую заново: %s",
+                    section,
+                    failure.get("error"),
+                    canonical,
+                )
 
         html = ""
         final_url = canonical
