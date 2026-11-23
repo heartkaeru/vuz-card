@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 from contextlib import closing
 from uuid import uuid4
 
@@ -11,6 +12,8 @@ from parser.public_http import website_key
 from app.services.llm.card_edits import edited_fact
 from app.services.llm.changes import effective_facts, normalized
 from app.services.llm.workflow_models import WorkflowError
+
+LOGGER = logging.getLogger(__name__)
 
 
 class DemoRepository(LLMRepository):
@@ -41,6 +44,8 @@ class DemoRepository(LLMRepository):
               material_id TEXT PRIMARY KEY REFERENCES llm_material(material_id), saved_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS llm_report_migration (
               key TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS llm_purge_context (
+              card_id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS llm_chat_turn (
               id INTEGER PRIMARY KEY,
               card_id TEXT NOT NULL REFERENCES llm_card(id),
@@ -56,6 +61,28 @@ class DemoRepository(LLMRepository):
               question TEXT NOT NULL,
               answer TEXT NOT NULL CHECK(json_valid(answer)));
             CREATE INDEX IF NOT EXISTS llm_general_chat_history ON llm_general_chat_turn(user_id, id);
+            ''')
+            execute_statements(db, '''
+            DROP TRIGGER IF EXISTS llm_review_no_delete;
+            CREATE TRIGGER llm_review_no_delete BEFORE DELETE ON llm_review
+              WHEN NOT EXISTS (
+                SELECT 1 FROM llm_purge_context p JOIN llm_run r ON r.institution_id=p.card_id
+                WHERE r.run_id=OLD.run_id
+              ) BEGIN SELECT RAISE(ABORT,'LLM review audit is immutable'); END;
+            DROP TRIGGER IF EXISTS llm_input_no_delete;
+            CREATE TRIGGER llm_input_no_delete BEFORE DELETE ON llm_run_input
+              WHEN NOT EXISTS (
+                SELECT 1 FROM llm_purge_context p JOIN llm_run r ON r.institution_id=p.card_id
+                WHERE r.run_id=OLD.run_id
+              ) BEGIN SELECT RAISE(ABORT,'LLM source snapshot is immutable'); END;
+            DROP TRIGGER IF EXISTS llm_material_fact_no_delete;
+            CREATE TRIGGER llm_material_fact_no_delete BEFORE DELETE ON llm_material_fact
+              WHEN NOT EXISTS (
+                SELECT 1 FROM llm_purge_context p
+                JOIN llm_material m ON m.material_id=OLD.material_id
+                JOIN llm_run r ON r.run_id=m.run_id
+                WHERE r.institution_id=p.card_id
+              ) BEGIN SELECT RAISE(ABORT,'Material fact snapshot is immutable'); END;
             ''')
             # Keep reports that existed before explicit saving was introduced.
             if not db.execute("SELECT 1 FROM llm_report_migration WHERE key='legacy_reports' ").fetchone():
@@ -226,6 +253,66 @@ class DemoRepository(LLMRepository):
     def card(self, card_id):
         with closing(connect(self.path)) as db:
             return self._read_card(db, card_id)
+
+    def has_card(self, card_id):
+        with closing(connect(self.path)) as db:
+            return db.execute("SELECT 1 FROM llm_card WHERE id=?", (card_id,)).fetchone() is not None
+
+    def ensure_card_deletable(self, card_id):
+        with closing(connect(self.path)) as db:
+            self._read_card(db, card_id)
+            jobs = db.execute("SELECT payload FROM llm_job WHERE card_id=?", (card_id,)).fetchall()
+            if any(json.loads(row[0]).get("status") in {"queued", "running"} for row in jobs):
+                raise WorkflowError("card_job_already_running")
+
+    def delete_card(self, card_id, actor=""):
+        material_ids = []
+        with closing(connect(self.path)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            card = db.execute("SELECT id FROM llm_card WHERE id=?", (card_id,)).fetchone()
+            if card is None:
+                return False
+            jobs = db.execute("SELECT payload FROM llm_job WHERE card_id=?", (card_id,)).fetchall()
+            if any(json.loads(row[0]).get("status") in {"queued", "running"} for row in jobs):
+                raise WorkflowError("card_job_already_running")
+            material_ids = [row[0] for row in db.execute(
+                "SELECT m.material_id FROM llm_material m JOIN llm_run r ON r.run_id=m.run_id WHERE r.institution_id=?",
+                (card_id,),
+            )]
+            db.execute("INSERT INTO llm_purge_context(card_id) VALUES (?)", (card_id,))
+            db.execute("UPDATE llm_card SET latest_run=NULL WHERE id=?", (card_id,))
+            db.execute("DELETE FROM llm_chat_turn WHERE card_id=?", (card_id,))
+            db.execute("""DELETE FROM llm_general_chat_turn WHERE EXISTS (
+                SELECT 1 FROM json_each(llm_general_chat_turn.answer, '$.cards') AS saved_card
+                WHERE json_extract(saved_card.value, '$.id')=?
+            )""", (card_id,))
+            db.execute("DELETE FROM llm_saved_material WHERE material_id IN (
+                SELECT m.material_id FROM llm_material m JOIN llm_run r ON r.run_id=m.run_id WHERE r.institution_id=?
+            )", (card_id,))
+            db.execute("DELETE FROM llm_material_fact WHERE material_id IN (
+                SELECT m.material_id FROM llm_material m JOIN llm_run r ON r.run_id=m.run_id WHERE r.institution_id=?
+            )", (card_id,))
+            db.execute("DELETE FROM llm_review WHERE run_id IN (
+                SELECT run_id FROM llm_run WHERE institution_id=?
+            )", (card_id,))
+            db.execute("DELETE FROM llm_run_input WHERE run_id IN (
+                SELECT run_id FROM llm_run WHERE institution_id=?
+            )", (card_id,))
+            db.execute("DELETE FROM llm_material WHERE run_id IN (
+                SELECT run_id FROM llm_run WHERE institution_id=?
+            )", (card_id,))
+            db.execute("DELETE FROM llm_job WHERE card_id=?", (card_id,))
+            db.execute("DELETE FROM llm_run WHERE institution_id=?", (card_id,))
+            db.execute("DELETE FROM llm_card WHERE id=?", (card_id,))
+            db.execute("DELETE FROM llm_purge_context WHERE card_id=?", (card_id,))
+        presentation_dir = self.path.parent / "presentations"
+        for material_id in material_ids:
+            for suffix in (".pptx", ".docx"):
+                try:
+                    (presentation_dir / f"{material_id}{suffix}").unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.exception("Could not remove exported material for card %s", card_id)
+        return True
 
     def new_job(self, card_id, request_key, task_type, identity):
         with closing(connect(self.path)) as db, db:

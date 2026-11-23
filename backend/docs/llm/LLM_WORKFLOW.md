@@ -69,6 +69,7 @@ pnpm dev
 
 | Операция | Маршрут после `/api/v1/ai` |
 | --- | --- |
+| Полностью удалить карточку и связанные данные (требуется вход) | `DELETE /cards/{card_id}` |
 | Общий чат и запуск первичного сбора из диалога | `POST /chat/general` |
 | Чат по вузу и подтверждение правки | `POST /cards/{card_id}/chat`, `POST /cards/{card_id}/chat/{turn_id}/confirm` |
 | Актуализация и состояние задания | `POST /cards/{card_id}/refresh`, `GET /jobs/{job_id}` |
