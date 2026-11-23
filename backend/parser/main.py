@@ -187,6 +187,11 @@ SECTION_ORDER = {
     "homepage": 10,
 }
 
+# Ссылки «Форумы ректоров», «Совет ректоров» ведут не к ректорату.
+LEADERSHIP_NOISE_RE = re.compile(
+    r"ректор(?:ов|ам|ами|ах|ы)\b|проректор|rector'?s\b", re.IGNORECASE
+)
+
 POSITION_START_RE = re.compile(
     r"^\s*(?:и\.?\s*о\.?\s*)?(?:"
     r"ректор|президент|проректор|директор|декан|заведующ|руководител|"
@@ -1140,6 +1145,17 @@ class UniversityParser:
             candidates: list[tuple[int, str]] = []
             for absolute, text, haystack in links:
                 score = 0
+                if section_name == "leadership":
+                    if LEADERSHIP_NOISE_RE.search(haystack):
+                        # «Форумы ректоров» и «проректоры» — не раздел ректората.
+                        continue
+                    path = utils.urlparse(absolute).path.lower()
+                    if (
+                        "rector" in path or "rektor" in path
+                    ) and "struct" not in path and "sveden" not in path:
+                        # Одиночная страница ректора не заменяет список руководства:
+                        # ниже подставится стандартная /sveden/struct/.
+                        continue
                 for pattern in patterns:
                     if pattern in haystack:
                         score += len(pattern)
@@ -1288,7 +1304,11 @@ class UniversityParser:
     # Загрузка и очистка
     # ------------------------------------------------------------------
     def _fallback_fetch(self, url: str, section: str) -> FetchResult | None:
-        """Fallback на curl_cffi/Playwright, если requests не смог загрузить."""
+        """Fallback на curl_cffi/Playwright, если requests не смог загрузить.
+
+        Включается через ``--with-official-site`` (CLI) или CRM-коллектор:
+        без браузерного транспорта сайты вроде msu.ru отдают 0 документов.
+        """
 
         if not self.settings.enable_playwright:
             return None
@@ -3558,6 +3578,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Не искать автоматически страницу ректора и фото.",
     )
     parser.add_argument(
+        "--no-playwright",
+        action="store_true",
+        help="Не рендерить страницы в браузере при блокировке или SPA-сайте.",
+    )
+    parser.add_argument(
         "--search-engine",
         choices=(
             "auto",
@@ -3629,6 +3654,11 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         settings.use_aggregators = False
     if args.with_official_site:
         settings.aggregators_only = False
+        # Обход сайта вуза без браузера бесполезен: МГУ и другие SPA-сайты
+        # отдают пустую HTML-оболочку, а requests падает по SSL.
+        settings.enable_playwright = True
+    if args.no_playwright:
+        settings.enable_playwright = False
     if args.aggregators_only:
         settings.aggregators_only = True
     if args.no_news_search:
