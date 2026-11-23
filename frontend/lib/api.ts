@@ -1,4 +1,5 @@
 export type ApiCard = { id: string; name: string; city: string; website: string; version: number; latest_run: string | null };
+export type CardIntake = { card: ApiCard; job: Job };
 export type Fact = {
   fact_id: string; field: string; value: string;
   subject: {
@@ -84,9 +85,12 @@ const errors: Record<string, string> = {
   chat_edit_collection_running: "Дождитесь завершения сбора и повторите запрос на правку.",
   chat_edit_requires_new_proposal: "Для изменения этого поля предложите новую правку в чате.",
   chat_collection_url_required: "Укажите один официальный URL в текущем сообщении.",
-  chat_collection_name_required: "Укажите название учреждения в том же сообщении, что и ссылку.",
+  chat_collection_name_required: "Укажите точное название учреждения в сообщении.",
   chat_collection_card_ambiguous: "В реестре несколько карточек с этим сайтом. Откройте нужную и запустите сбор из карточки.",
   public_website_required: "Для сбора укажите публичный официальный сайт учреждения.",
+  official_site_not_found: "Не удалось найти официальный сайт по этому названию. Уточните название или укажите сайт вручную.",
+  official_site_discovery_failed: "Не удалось выполнить поиск официального сайта. Повторите попытку позже или укажите сайт вручную.",
+  collection_failed: "Сбор завершился ошибкой. Сервер сохранил технический журнал задания; проверьте доступность сайта и настройки ИИ.",
   stale_run_revision: "Данные уже изменились. Обновите карточку и повторите действие.",
   card_job_already_running: "Для этой карточки уже выполняется задание.",
   facts_changed_during_generation: "Во время генерации факты изменились. Сформируйте материалы заново.",
