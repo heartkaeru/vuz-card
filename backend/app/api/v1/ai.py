@@ -129,7 +129,12 @@ def get_collector():
 class CardCreate(StrictModel):
     name: str = Field(min_length=1, max_length=300)
     city: str = Field(default="", max_length=160)
-    website: HttpUrl
+    website: HttpUrl | None = None
+
+    @field_validator("website", mode="before")
+    @classmethod
+    def blank_website(cls, value):
+        return value or None
 
 
 class CardIntakeCreate(StrictModel):
@@ -298,7 +303,13 @@ async def list_cards(repository=Depends(get_repository)):
 
 @router.post("/cards", status_code=201)
 async def create_card(payload: CardCreate, repository=Depends(get_repository)):
-    return await checked_async(lambda: repository.create_card(payload.name, payload.city, str(payload.website).rstrip("/")))
+    # Ссылку можно не передавать: официальный сайт находится по названию.
+    website = await resolve_intake_website(
+        payload.name, str(payload.website) if payload.website else None
+    )
+    return await checked_async(
+        lambda: repository.create_card(payload.name, payload.city, website)
+    )
 
 
 @router.delete("/cards/{card_id}", status_code=204, summary="Полностью удалить карточку и связанные данные")

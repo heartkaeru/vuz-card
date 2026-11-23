@@ -911,7 +911,7 @@ class UniversityParser:
             base_url,
         )
 
-        if self.settings.aggregators_only:
+        if self.settings.aggregators_only and allowed_sections is None:
             LOGGER.info("Режим: только агрегаторы (без обхода сайта вуза)")
             self._enrich_aggregators(base_url)
             self._enrich_rector_from_web()
