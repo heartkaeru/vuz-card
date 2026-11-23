@@ -129,9 +129,6 @@ async def answer_card(provider, card, run, history, question):
                                 "Сверьте их в разделе руководства.", heads[:12])
         position = heads[0]
         return cited_answer(f"По данным карточки: {position.subject.person_name} — {position.value}.", [position])
-    has_facts = bool(run and effective_facts(run))
-    if not has_facts and "://" not in question:
-        return {"text": "В карточке пока нет принятых фактов. Соберите и проверьте сведения в карточке вуза.", "sources": []}
     messages = [{"role": "system", "content": f"{READ_PROMPT}\n{COLLECT_PROMPT}\nВыбранный вуз: {card['name']}"}]
     for turn in history[-CONTEXT_LIMIT:]:
         messages.extend([
