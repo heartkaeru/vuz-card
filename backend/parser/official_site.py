@@ -65,6 +65,9 @@ RECTOR_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 RECTOR_TITLE_RE = re.compile(r"ректор|rector", re.IGNORECASE)
+# «Форумы ректоров», «совет ректоров» — не страница ректора.
+RECTOR_PLURAL_RE = re.compile(r"ректор(?:ов|ам|ами|ах|ы)\b", re.IGNORECASE)
+RECTOR_WHOLE_RE = re.compile(r"\bректор\b", re.IGNORECASE)
 ACTING_RE = re.compile(r"и\.?\s*о\.?\s*ректор|исполняющ[а-яё]*\s+обязанност", re.I)
 
 
@@ -132,6 +135,10 @@ class OfficialSiteDiscovery:
                 haystack = f"{href} {text}".lower()
                 if "проректор" in haystack or "prorector" in haystack:
                     score = 2
+                elif RECTOR_PLURAL_RE.search(haystack):
+                    score = 1
+                elif RECTOR_WHOLE_RE.search(text) or "rector" in href.lower():
+                    score = 20
                 elif RECTOR_TITLE_RE.search(haystack):
                     score = 12
                 elif "руководств" in haystack or "management" in haystack:

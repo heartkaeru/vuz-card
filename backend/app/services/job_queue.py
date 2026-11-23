@@ -23,7 +23,7 @@ async def run_create_pipeline(
         JOBS_STORE[job_id]["progress"] = 15
         JOBS_STORE[job_id]["message"] = "Парсер: поиск официального сайта и ректора..."
 
-        from app.services.parser_service import build_card, to_officials
+        from app.services.parser_service import build_card, pick_rector, to_officials
 
         card = await asyncio.to_thread(build_card, name, city, website)
 
@@ -39,15 +39,7 @@ async def run_create_pipeline(
         uni["city"] = card.university.city or city or uni.get("city", "")
         uni["region"] = card.university.region or uni.get("region", "")
         uni["officials"] = to_officials(card, institution_id=str(university_id))
-        rector = next(
-            (
-                leader.full_name
-                for leader in card.leadership
-                if "ректор" in (leader.position or "").lower()
-                and "проректор" not in (leader.position or "").lower()
-            ),
-            None,
-        )
+        rector = pick_rector(card)
         uni["rector_fio"] = rector or uni.get("rector_fio")
         uni["active_projects"] = [
             project.name for project in card.projects[:20]
@@ -68,6 +60,8 @@ async def run_create_pipeline(
         JOBS_STORE[job_id]["status"] = JobStatusEnum.FAILED
         JOBS_STORE[job_id]["message"] = f"Ошибка создания карточки: {exc}"
         JOBS_STORE[job_id]["completed_at"] = datetime.now().isoformat()
+
+
 async def run_refresh_pipeline(job_id: str, university_id: int):
     """
     Фоновый воркер: пайплайн «Парсер → LLM → Обновление карточки».

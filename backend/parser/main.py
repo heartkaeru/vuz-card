@@ -187,6 +187,15 @@ SECTION_ORDER = {
     "homepage": 10,
 }
 
+POSITION_START_RE = re.compile(
+    r"^\s*(?:и\.?\s*о\.?\s*)?(?:"
+    r"ректор|президент|проректор|директор|декан|заведующ|руководител|"
+    r"начальник|председател|заместител|научный\s+руководител|главный|"
+    r"управляющ|советник|министр|генеральный\s+директор"
+    r")",
+    re.IGNORECASE,
+)
+
 AMOUNT_RE = re.compile(
     r"(\d[\d\s]*(?:[.,]\d+)?\s*(?:млн|млрд|тыс\.?)?\s*"
     r"(?:руб(?:лей|\.)?|₽|rub))",
@@ -652,6 +661,35 @@ def _strip_leading_date(value: str) -> str:
     return DATE_PREFIX_RE.sub("", normalize_whitespace(value)).strip(" :—–-")
 
 
+def _split_block_person(text: str) -> tuple[str, str]:
+    """Из блока «должность | ФИО [| контакты]» выделяет ФИО и должность."""
+
+    text = normalize_whitespace(text)
+    if "|" not in text:
+        names = find_person_names(text)
+        if not names:
+            return "", ""
+        position = text.replace(names[0], " ", 1).strip(" ,;:—–-")
+        return names[0], position
+
+    name = ""
+    position = ""
+    for part in (chunk.strip() for chunk in text.split("|")):
+        if not part:
+            continue
+        if not name:
+            names = find_person_names(part)
+            if names:
+                name = names[0]
+                continue
+        if not position and not re.search(r"[+@]|https?://|\d{3}", part):
+            position = part
+    if not name:
+        names = find_person_names(text)
+        name = names[0] if names else ""
+    return name, position or text
+
+
 # ----------------------------------------------------------------------
 # Разбор стандартных таблиц /sveden/struct/
 # ----------------------------------------------------------------------
@@ -966,6 +1004,7 @@ class UniversityParser:
                 self._errors.append(message)
 
         self._enrich_bios()
+        self._enrich_rector_from_web()
         self._enrich_aggregators(base_url)
         self._enrich_news_mentions()
         card = self._build_card(base_url, name, profile_obj, homepage_doc)
@@ -1652,16 +1691,16 @@ class UniversityParser:
         leaders: list[Leadership] = []
         blocks = doc.blocks
         for index, block in enumerate(blocks):
-            text = block.text
-            if not utils.contains_position(text):
+            text = normalize_whitespace(block.text)
+            if not text or not POSITION_START_RE.match(text):
+                # Абзацы устава и новостей не должны становиться «ректоратом».
                 continue
-            names = find_person_names(text)
-            if names:
-                position = truncate_text(text, 250)
+            name, position = _split_block_person(text)
+            if name:
                 leaders.append(
                     Leadership(
-                        full_name=names[0],
-                        position=position,
+                        full_name=name,
+                        position=truncate_text(position or text, 160),
                         source_url=doc.url,
                     )
                 )
@@ -1678,7 +1717,7 @@ class UniversityParser:
                     leaders.append(
                         Leadership(
                             full_name=names[0],
-                            position=truncate_text(text, 250),
+                            position=truncate_text(text, 160),
                             source_url=doc.url,
                         )
                     )
@@ -2623,7 +2662,28 @@ class UniversityParser:
             )
             return
 
-        self._leadership = [leader]
+        # Не теряем уже собранное руководство: ставим проверенного ректора
+        # первым, а остальные записи сохраняем.
+        key = _name_key(leader.full_name)
+        previous = {_name_key(item.full_name): item for item in self._leadership}
+        existing = previous.get(key)
+        if existing is not None:
+            leader.bio = leader.bio or existing.bio
+            leader.photo_url = leader.photo_url or existing.photo_url
+            leader.unit = leader.unit or existing.unit
+            leader.email = leader.email or existing.email
+            leader.phone = leader.phone or existing.phone
+            leader.office_phone = leader.office_phone or existing.office_phone
+            leader.reception_email = (
+                leader.reception_email or existing.reception_email
+            )
+            leader.reception_phone = (
+                leader.reception_phone or existing.reception_phone
+            )
+        others = [
+            item for item in self._leadership if _name_key(item.full_name) != key
+        ]
+        self._leadership = [leader, *others]
         if site_url:
             host = utils.urlparse(site_url).netloc.lower().split(":")[0]
             if host.startswith("www."):
