@@ -1,6 +1,7 @@
 """Demo 1 UI API backed by the real parser, LLM workflow and SQLite staging."""
 
 import asyncio
+import logging
 import os
 import jwt
 from datetime import datetime, timezone
@@ -18,7 +19,7 @@ from pydantic import Field, HttpUrl, field_validator
 from database.demo1_store import DemoRepository
 from parser.config import SectionSpec, Settings, UniversityProfile
 from parser.main import UniversityParser
-from parser.public_http import public_site_session
+from parser.public_http import public_site_session, public_url
 from parser.utils import HttpClient
 
 from app.services.llm.client import ConfigurationError, GigaChatProvider, GigaChatSettings, LLMError
@@ -32,6 +33,7 @@ from app.services.llm.pipeline import AssistantPipeline, DraftValidationError, f
 from app.services.llm.render import render_markdown
 from app.services.llm.workflow import LLMWorkflow
 from app.services.llm.workflow_models import ReviewBatch, WorkflowError
+from app.services.parser_service import resolve_site
 from app.services.llm.changes import compare_run, effective_facts
 from app.services.meeting_pptx import build_meeting_presentation
 from app.services.dossier_preview import build_dossier_preview
@@ -39,6 +41,7 @@ from app.services.pptx_preview import preview_presentation
 
 router = APIRouter(prefix="/ai", tags=["Демо 1: сбор, проверка и презентация"])
 chat_bearer = HTTPBearer(auto_error=False)
+LOGGER = logging.getLogger(__name__)
 
 
 def chat_user(credentials: HTTPAuthorizationCredentials | None = Depends(chat_bearer)):
@@ -123,6 +126,13 @@ class CardCreate(StrictModel):
     name: str = Field(min_length=1, max_length=300)
     city: str = Field(default="", max_length=160)
     website: HttpUrl
+
+
+class CardIntakeCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=300)
+    city: str = Field(default="", max_length=160)
+    website: HttpUrl | None = None
+    request_key: str = Field(default_factory=lambda: uuid4().hex, min_length=1, max_length=150)
 
 
 class PDFReference(StrictModel):
@@ -219,7 +229,13 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
     except asyncio.CancelledError:
         repository.update_job(job_id, status="failed", message="Сбор прерван", result={"code": "collection_cancelled"})
         raise
+    except (WorkflowError, LLMError) as exc:
+        LOGGER.exception("Collection pipeline failed: card_id=%s job_id=%s", card["id"], job_id)
+        repository.update_job(job_id, status="failed", progress=100,
+                              message="Сбор не завершился. Проверьте сайт и настройки ИИ.",
+                              result={"code": str(exc)})
     except Exception:
+        LOGGER.exception("Collection job failed: card_id=%s job_id=%s", card["id"], job_id)
         repository.update_job(job_id, status="failed", message="Ошибка сбора. Повторите попытку или уточните адрес сайта",
                               result={"code": "collection_failed"})
 
@@ -270,6 +286,43 @@ def delete_card(card_id: str, user_id=Depends(chat_user), repository=Depends(get
     """Purge a card and its workflow data; requires an authenticated user."""
     checked(lambda: repository.delete_card(card_id, actor=user_id))
     return Response(status_code=204)
+async def resolve_intake_website(name: str, website: str | None) -> str:
+    if website:
+        candidate = website
+    else:
+        try:
+            candidate = await asyncio.to_thread(resolve_site, name)
+        except Exception:
+            LOGGER.exception("Official-site discovery failed for institution: %s", name)
+            raise HTTPException(502, "official_site_discovery_failed") from None
+    if not candidate:
+        raise HTTPException(422, "official_site_not_found")
+    try:
+        candidate = str(HttpUrl(candidate)).rstrip("/")
+        public_url(candidate)
+    except ValueError:
+        raise HTTPException(422, "public_website_required") from None
+    return candidate
+
+
+def enqueue_card_intake(name, city, website, request_key, background, repository, pipeline, collector):
+    source_options = {"include_institution": True, "public_site_only": True}
+    card, job, created = checked(lambda: repository.start_card_intake(
+        name, city, website, request_key, source_options,
+    ))
+    if created:
+        background.add_task(collect_job, repository, pipeline, collector, card, job["job_id"],
+                            source_options=source_options)
+    return {"card": card, "job": job}
+
+
+@router.post("/cards/intake", status_code=202)
+async def create_card_intake(payload: CardIntakeCreate, background: BackgroundTasks,
+                             repository=Depends(get_repository), pipeline=Depends(get_pipeline),
+                             collector=Depends(get_collector)):
+    website = await resolve_intake_website(payload.name, str(payload.website) if payload.website else None)
+    return enqueue_card_intake(payload.name, payload.city, website, f"ui:{payload.request_key}",
+                               background, repository, pipeline, collector)
 
 
 @router.get("/cards/{card_id}")
@@ -296,15 +349,11 @@ def chat_history(card_id: str, user_id=Depends(chat_user), repository=Depends(ge
     return [{"id": turn["id"], "question": turn["question"], "answer": turn["answer"]} for turn in turns]
 
 
-def start_chat_collection(args, payload, user_id, background, repository, pipeline, collector):
-    options = {"include_institution": True, "public_site_only": True}
-    card, job, created = checked(lambda: repository.start_card_intake(
-        args["name"], args["city"], args["website"], f"chat:{user_id}:{payload.request_key}", options,
-    ))
-    if created:
-        background.add_task(collect_job, repository, pipeline, collector, card, job["job_id"],
-                            source_options=options)
-    return {"card": card, "job": job}
+async def start_chat_collection(args, payload, user_id, background, repository, pipeline, collector):
+    website = await resolve_intake_website(args["name"], args.get("website"))
+    return enqueue_card_intake(args["name"], args["city"], website,
+                               f"chat:{user_id}:{payload.request_key}",
+                               background, repository, pipeline, collector)
 
 
 @router.get("/chat/general")
@@ -327,7 +376,7 @@ async def general_chat_message(payload: ChatRequest, background: BackgroundTasks
         answer = registry_answer(repository.cards(), answer["registry_query"])
     starts_collection = "collection_request" in answer
     if starts_collection:
-        collection = start_chat_collection(
+        collection = await start_chat_collection(
             answer["collection_request"], payload, user_id, background, repository, pipeline, collector,
         )
         job = collection["job"]
@@ -344,8 +393,6 @@ async def general_chat_message(payload: ChatRequest, background: BackgroundTasks
 async def chat_intake(payload: ChatRequest, background: BackgroundTasks, user_id=Depends(chat_user),
                       repository=Depends(get_repository), pipeline=Depends(get_pipeline),
                       collector=Depends(get_collector)):
-    if "://" not in payload.message:
-        return {"message": "Для первичного сбора укажите название учреждения и ссылку на его официальный сайт."}
     try:
         args = await plan_collection(pipeline.provider, payload.message)
     except LLMError as exc:
@@ -353,8 +400,8 @@ async def chat_intake(payload: ChatRequest, background: BackgroundTasks, user_id
     except WorkflowError as exc:
         raise HTTPException(422, str(exc)) from None
     if args is None:
-        return {"message": "Для первичного сбора укажите название учреждения и ссылку на его официальный сайт."}
-    return {"collection": start_chat_collection(args, payload, user_id, background, repository, pipeline, collector)}
+        return {"message": "Укажите название учреждения и попросите создать карточку. Официальный сайт можно не указывать."}
+    return {"collection": await start_chat_collection(args, payload, user_id, background, repository, pipeline, collector)}
 
 
 @router.post("/cards/{card_id}/chat")
@@ -371,7 +418,7 @@ async def chat_message(card_id: str, payload: ChatRequest, background: Backgroun
     except WorkflowError as exc:
         raise HTTPException(422, str(exc)) from None
     if "collection_request" in answer:
-        return {"collection": start_chat_collection(
+        return {"collection": await start_chat_collection(
             answer["collection_request"], payload, user_id, background, repository, pipeline, collector,
         )}
     return checked(lambda: repository.save_chat_turn(

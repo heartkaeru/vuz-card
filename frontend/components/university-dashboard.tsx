@@ -3,7 +3,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ResearchPanel, type ResearchHandle } from "@/components/research-panel";
 import { PptxPreview } from "@/components/pptx-preview";
-import { api, post, errorText, downloadFile, type ApiCard, type Fact, type PptxPreviewData, type ResearchRun, type SavedMaterial } from "@/lib/api";
+import { api, post, errorText, downloadFile, type ApiCard, type CardIntake, type Fact, type PptxPreviewData, type ResearchRun, type SavedMaterial } from "@/lib/api";
 import { AgentChat } from "@/components/agent-chat";
 import { AgentSphere } from "@/components/agent-sphere";
 import { Icon, type IconName } from "@/components/icon";
@@ -243,8 +243,12 @@ export default function UniversityDashboard() {
     if (!createName.trim()) return;
     setCreating(true);
     try {
-    const card = await post<ApiCard>("/cards", { name: createName, city: createCity, website: createWebsite });
-    const university: University = { ...card, backendId: card.id, tone: "mint", draft: true };
+    const intake = await post<CardIntake>("/cards/intake", {
+      name: createName.trim(), city: createCity.trim(), website: createWebsite.trim() || null,
+      request_key: crypto.randomUUID(),
+    });
+    const card = intake.card;
+    const university: University = { ...card, backendId: card.id, tone: "mint", draft: card.latest_run === null };
     setUniversities((current) => [university, ...current]);
     setSelectedId(university.id);
     setHasChosenUniversity(true);
@@ -253,7 +257,9 @@ export default function UniversityDashboard() {
     setGlobalSearch("");
     setRegionFilter("Все регионы");
     changeView("overview", university.id);
-    notify("Создан черновик карточки. Факты можно добавить после проверки источников.");
+    notify(intake.job.status === "queued" || intake.job.status === "running"
+      ? "Карточка создана. Сбор начался; результат появится в карточке."
+      : intake.job.message);
     } catch (failure) { notify(errorText(failure)); }
     finally { setCreating(false); }
   };
@@ -561,12 +567,12 @@ export default function UniversityDashboard() {
 
       {createOpen && (
         <Modal title="Новая карточка вуза" onClose={() => setCreateOpen(false)}>
-          <p className="modal-copy">Добавьте название, регион и официальный сайт. Сведения о руководстве появятся после сбора и проверки.</p>
+          <p className="modal-copy">Добавьте название и регион. Если оставить сайт пустым, найдем официальный сайт и начнем сбор автоматически.</p>
           <form className="modal-form" onSubmit={handleCreateUniversity}>
             <label>Название вуза<input autoFocus required value={createName} onChange={(event) => setCreateName(event.target.value)} placeholder="Например, университет или колледж" /></label>
             <label>Город или регион<input value={createCity} onChange={(event) => setCreateCity(event.target.value)} placeholder="Например, Казань" /></label>
-            <label>Официальный сайт<input required type="url" value={createWebsite} onChange={(event) => setCreateWebsite(event.target.value)} placeholder="https://university.ru" /></label>
-            <div className="modal-actions"><button className="button button--soft" type="button" onClick={() => setCreateOpen(false)}>Отмена</button><button className="button button--primary" type="submit" disabled={creating}><Icon name="plus" size={16} /> {creating ? "Сохранение…" : "Создать черновик"}</button></div>
+            <label>Официальный сайт (необязательно)<input type="url" value={createWebsite} onChange={(event) => setCreateWebsite(event.target.value)} placeholder="https://university.ru" /></label>
+            <div className="modal-actions"><button className="button button--soft" type="button" onClick={() => setCreateOpen(false)}>Отмена</button><button className="button button--primary" type="submit" disabled={creating}><Icon name="plus" size={16} /> {creating ? createWebsite.trim() ? "Запускаем сбор…" : "Ищем сайт…" : "Создать и собрать"}</button></div>
           </form>
         </Modal>
       )}
