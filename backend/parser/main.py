@@ -1248,6 +1248,39 @@ class UniversityParser:
     # ------------------------------------------------------------------
     # Загрузка и очистка
     # ------------------------------------------------------------------
+    def _fallback_fetch(self, url: str, section: str) -> FetchResult | None:
+        """Fallback на curl_cffi/Playwright, если requests не смог загрузить."""
+
+        if not self.settings.enable_playwright:
+            return None
+        if self.settings.respect_robots:
+            allowed, _ = self.client.robots.can_fetch(url)
+            if not allowed:
+                return None
+        fetcher = StealthFetcher(
+            timeout=min(self.settings.timeout, 30.0),
+            enable_playwright=True,
+        )
+        try:
+            response = fetcher.get(url)
+        finally:
+            fetcher.close()
+        if not response.text:
+            return None
+        LOGGER.info(
+            "%s: requests недоступен, загружено через %s (%s)",
+            section,
+            response.engine,
+            url,
+        )
+        return FetchResult(
+            url=url,
+            final_url=response.final_url or url,
+            status_code=response.status_code or 200,
+            text=response.text,
+            content_type=response.content_type,
+        )
+
     def _get_page(
         self,
         url: str,
@@ -1281,6 +1314,8 @@ class UniversityParser:
             LOGGER.info("CACHE %s", canonical)
         else:
             result = self.client.get(canonical)
+            if result is None:
+                result = self._fallback_fetch(canonical, section)
             if result is None:
                 message = (
                     f"{section}: {self.client.last_error or 'не удалось загрузить'} "
@@ -1427,8 +1462,17 @@ class UniversityParser:
         try:
             with sync_playwright() as runtime:
                 browser = runtime.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.goto(url, timeout=int(self.settings.timeout * 1000))
+                page = browser.new_page(locale="ru-RU")
+                timeout_ms = int(max(self.settings.timeout, 45.0) * 1000)
+                try:
+                    page.goto(
+                        url, timeout=timeout_ms, wait_until="networkidle"
+                    )
+                except Exception:
+                    page.goto(
+                        url, timeout=timeout_ms, wait_until="domcontentloaded"
+                    )
+                page.wait_for_timeout(2000)
                 html = page.content()
                 browser.close()
             LOGGER.info("Playwright отрендерил %s (%s символов)", url, len(html))

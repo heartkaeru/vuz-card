@@ -85,6 +85,8 @@ def get_collector():
         settings.max_total_requests = min(settings.max_total_requests, 30)
         settings.fetch_item_pages = False
         settings.max_bios = min(settings.max_bios, 3)
+        # SvelteKit-сайты (например, МГУ) отдают пустой HTML без браузера.
+        settings.enable_playwright = True
         # A refresh must attempt the live source, not silently refresh cached dates.
         settings.use_cache = False
         client = HttpClient(settings, session=public_site_session()) if public_site_only else None
