@@ -23,6 +23,47 @@ LOGGER = logging.getLogger(__name__)
 VUZOPEDIA_BASE = "https://vuzopedia.ru"
 POSTUPI_BASE = "https://postupi.online"
 
+# Минимальное совпадение названия, при котором паспорт агрегатора принимается.
+NAME_MATCH_THRESHOLD = 45.0
+NAME_SUFFIX_MARKERS = ("имени", "им.", "назван", "в честь")
+
+
+def name_match_score(query: str, title: str) -> float:
+    """Насколько название агрегатора соответствует запросу.
+
+    «Московский государственный университет» должен совпасть с МГУ
+    («... университет имени М.В. Ломоносова»), а не с МГУСиТ
+    («... университет спорта и туризма»).
+    """
+
+    q = normalize_whitespace(query).lower().strip(" .,;:-")
+    t = normalize_whitespace(title).lower().strip(" .,;:-")
+    if not q or not t:
+        return 0.0
+    if q == t:
+        return 100.0
+    if t.startswith(q):
+        remainder = t[len(q):].lstrip(" .,;:-")
+        if remainder.startswith(NAME_SUFFIX_MARKERS):
+            # «имени ...» уточняет название, а не меняет вуз.
+            return 95.0 - min(len(remainder), 40) * 0.05
+        return 60.0 - min(len(remainder), 60) * 0.1
+    q_tokens = q.split()
+    t_tokens = set(t.split())
+    if q_tokens and all(token in t_tokens for token in q_tokens):
+        return 45.0
+    return 30.0 * SequenceMatcher(None, t, q).ratio()
+
+
+def _query_is_specific(query: str) -> bool:
+    return len(normalize_whitespace(query).split()) >= 3
+
+
+def _passport_matches(query: str, title: str) -> bool:
+    if not _query_is_specific(query):
+        return True
+    return name_match_score(query, title) >= NAME_MATCH_THRESHOLD
+
 CITY_BY_SUBDOMAIN = {
     "msk": "Москва",
     "spb": "Санкт-Петербург",
@@ -134,14 +175,15 @@ class VuzopediaParser:
         results = self.search(name)
         if not results:
             return None
-        target = normalize_whitespace(name)
-
-        def score(item: dict[str, str]) -> float:
-            return SequenceMatcher(
-                None, item["title"].lower(), target.lower()
-            ).ratio()
-
-        return max(results, key=score)
+        best = max(results, key=lambda item: name_match_score(name, item["title"]))
+        if not _passport_matches(name, best["title"]):
+            LOGGER.info(
+                "Агрегатор: нет подходящего совпадения для %s (лучшее: %s)",
+                name,
+                best["title"],
+            )
+            return None
+        return best
 
     def parse(self, url: str, city: str = "") -> AggregatorPassport:
         response = self.fetcher.get(url)
@@ -421,14 +463,14 @@ class AggregatorService:
             match = parser.best_match(name)
             if match:
                 passport = parser.parse(match["url"], city=match.get("city", city))
-                if passport.name:
+                if passport.name and _passport_matches(name, passport.name):
                     passports.append(passport)
 
         if "postupi" in self.sources:
             url = self._ddg_site_url(short_name or name, "postupi.online/vuz")
             if url:
                 passport = PostupiParser(self.fetcher).parse(url, city=city)
-                if passport.name:
+                if passport.name and _passport_matches(name, passport.name):
                     passports.append(passport)
 
         return passports
