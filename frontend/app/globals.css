@@ -283,6 +283,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .empty-state p { max-width: 420px; margin: 0 0 22px; color: var(--muted); font-size: 13px; line-height: 1.65; }
 
 .profile-topbar { display: flex; min-height: 38px; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 20px; }
+.profile-topbar__actions { display: flex; min-width: 0; align-items: center; justify-content: flex-end; gap: 10px; }
+.profile-topbar__actions .search-field--compact { width: min(280px, 30vw); flex: 0 1 280px; }
+.profile-delete-button { min-height: 36px; flex: 0 0 auto; padding-inline: 11px; font-size: 10px; }
 .breadcrumbs { display: flex; align-items: center; gap: 9px; color: #87928a; font-size: 11px; }
 .breadcrumbs button { padding: 0; border: 0; background: none; color: #278342; cursor: pointer; }
 .breadcrumbs button:hover { text-decoration: underline; }
@@ -310,6 +313,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .button--primary:hover { background: #168d31; box-shadow: 0 7px 18px rgba(33,160,56,.2); }
 .button--soft { border-color: #c4e4cb; background: #f0faf2; color: #24813e; }
 .button--soft:hover { border-color: #8fcc9d; background: #e5f6e9; }
+.button--danger { border-color: #e8c5c2; background: #fff7f6; color: #a23e37; }
+.button--danger:hover:not(:disabled) { border-color: #d9948e; background: #ffefed; }
+.button--danger:disabled { cursor: wait; opacity: .65; }
 .button--outline { border-color: #b7dfc1; background: white; color: #1c9140; }
 .button--outline:hover { background: #f0faf3; }
 .button--small-primary { min-height: 31px; border-radius: 99px; background: var(--green); color: white; font-size: 11px; }
@@ -630,6 +636,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   .page-caption { margin-top: 20px; }
   .profile-topbar { display: block; margin-bottom: 12px; }
   .profile-topbar .search-field--compact { display: none; }
+  .profile-topbar__actions { justify-content: flex-end; margin-top: 9px; }
+  .profile-delete-button { min-height: 34px; }
   .breadcrumbs { font-size: 10px; }
   .profile-hero { min-height: 0; gap: 18px; padding: 20px 17px; border-radius: 19px; }
   .profile-hero__copy { padding: 0; }

@@ -71,6 +71,8 @@ const errors: Record<string, string> = {
   partnership_match_requires_selected_accepted_facts: "Основания для предложений изменились. Повторите подбор перед экспортом.",
   invalid_partnership_response: "Подборка не прошла проверку каталога и фактов. Повторите подбор.",
   chat_login_required: "Войдите, чтобы открыть диалог.",
+  card_not_found: "Карточка уже недоступна. Обновите список вузов.",
+  university_has_children: "Нельзя удалить карточку: к ней привязаны связанные записи.",
   chat_card_changed: "Карточка обновилась во время ответа. Отправьте вопрос ещё раз.",
   chat_history_changed: "В диалоге появилось новое сообщение. История обновлена. Отправьте вопрос ещё раз.",
   invalid_chat_tool_call: "Модель не смогла выбрать данные карточки. Уточните вопрос и повторите.",
@@ -168,6 +170,7 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
     }
     throw new Error(typeof body.detail === "string" ? body.detail : "Проверьте введённые данные и доступность сервера.");
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 

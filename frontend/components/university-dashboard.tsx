@@ -69,6 +69,9 @@ export default function UniversityDashboard() {
   const [presentationPreview, setPresentationPreview] = useState<PptxPreviewData | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
+  const [cardDeleteTarget, setCardDeleteTarget] = useState<University | null>(null);
+  const [deletingCardId, setDeletingCardId] = useState<string | null>(null);
+  const [cardDeleteError, setCardDeleteError] = useState("");
   const [reportDeleteTarget, setReportDeleteTarget] = useState<string | null>(null);
   const [deletingReportId, setDeletingReportId] = useState<string | null>(null);
   const [reportDeleteError, setReportDeleteError] = useState("");
@@ -200,6 +203,36 @@ export default function UniversityDashboard() {
       setReportDeleteError(errorText(failure));
     } finally {
       setDeletingReportId(null);
+    }
+  };
+
+  const confirmDeleteCard = async () => {
+    const target = cardDeleteTarget;
+    if (!target?.backendId || deletingCardId) return;
+    const backendId = target.backendId;
+    setDeletingCardId(backendId);
+    setCardDeleteError("");
+    try {
+      await api<void>(`/cards/${encodeURIComponent(backendId)}`, { method: "DELETE" });
+      const remaining = universities.filter((item) => item.backendId !== backendId);
+      setUniversities(remaining);
+      setRuns((current) => {
+        const next = { ...current };
+        delete next[target.id];
+        return next;
+      });
+      setSelectedId(remaining[0]?.id ?? "");
+      setHasChosenUniversity(remaining.length > 0);
+      setSection("about");
+      setChatOpen(false);
+      setChatMode("general");
+      setCardDeleteTarget(null);
+      changeView("universities", remaining[0]?.id ?? "");
+      notify(`Карточка «${target.name}» удалена.`);
+    } catch (failure) {
+      setCardDeleteError(errorText(failure));
+    } finally {
+      setDeletingCardId(null);
     }
   };
 
@@ -397,10 +430,16 @@ export default function UniversityDashboard() {
           <section className="page-section profile-page page-enter" key={`profile-${selectedUniversity.id}`} aria-label={`Карточка: ${selectedUniversity.name}`}>
             <div className="profile-topbar">
               <div className="breadcrumbs"><button type="button" onClick={() => navigate("universities")}>ВУЗы</button><span>/</span><span>Карточка организации</span></div>
-              <form className="search-field search-field--compact" onSubmit={handleGlobalSearch}>
-                <Icon name="search" size={18} />
-                <input value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} placeholder="Поиск по вузам" aria-label="Поиск по вузам" />
-              </form>
+              <div className="profile-topbar__actions">
+                <form className="search-field search-field--compact" onSubmit={handleGlobalSearch}>
+                  <Icon name="search" size={18} />
+                  <input value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} placeholder="Поиск по вузам" aria-label="Поиск по вузам" />
+                </form>
+                {selectedUniversity.backendId && <button className="button button--danger profile-delete-button" type="button"
+                  onClick={() => { setCardDeleteError(""); setCardDeleteTarget(selectedUniversity); }}>
+                  <Icon name="trash" size={15} /> Удалить карточку
+                </button>}
+              </div>
             </div>
             <ProfileHero university={selectedUniversity} />
             <div className="profile-tabs" role="tablist" aria-label="Разделы карточки" onMouseLeave={() => setHoveredSection(null)}>
@@ -595,6 +634,20 @@ export default function UniversityDashboard() {
         </Modal>
       )}
 
+      {cardDeleteTarget && <Modal title="Удалить карточку?" dismissible={!deletingCardId}
+        onClose={() => { if (!deletingCardId) setCardDeleteTarget(null); }}>
+        <p className="modal-copy">Карточка «{cardDeleteTarget.name}» и связанные с ней сведения будут удалены без возможности восстановления.</p>
+        {cardDeleteError && <p className="research-error" role="alert">Не удалось удалить карточку. {cardDeleteError}</p>}
+        <div className="modal-actions">
+          <button className="button button--soft" type="button" disabled={Boolean(deletingCardId)}
+            onClick={() => setCardDeleteTarget(null)}>Отмена</button>
+          <button className="button button--danger" type="button" disabled={Boolean(deletingCardId)}
+            onClick={() => { void confirmDeleteCard(); }}>
+            {deletingCardId ? "Удаляем…" : "Удалить безвозвратно"}
+          </button>
+        </div>
+      </Modal>}
+
       {toast && <div className="toast" role="status"><span className="toast__check"><Icon name="check" size={15} /></span>{toast}</div>}
     </div>
   );
@@ -766,11 +819,11 @@ function InfoListCard({ title, icon, items, empty }: { title: string; icon: Icon
   );
 }
 
-function Modal({ children, title, onClose }: { children: ReactNode; title: string; onClose: () => void }) {
+function Modal({ children, title, onClose, dismissible = true }: { children: ReactNode; title: string; onClose: () => void; dismissible?: boolean }) {
   return (
-    <div className="modal-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div className="modal-layer" role="presentation" onMouseDown={(event) => { if (dismissible && event.target === event.currentTarget) onClose(); }}>
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-heading">
-        <header className="modal__header"><div><span className="modal__eyebrow">КАРТОЧКА ВУЗА</span><h2 id="modal-heading">{title}</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Закрыть окно"><Icon name="close" size={19} /></button></header>
+        <header className="modal__header"><div><span className="modal__eyebrow">КАРТОЧКА ВУЗА</span><h2 id="modal-heading">{title}</h2></div><button className="icon-button" type="button" disabled={!dismissible} onClick={onClose} aria-label="Закрыть окно"><Icon name="close" size={19} /></button></header>
         {children}
       </section>
     </div>
