@@ -7,6 +7,7 @@ export type Fact = {
     entity_kind?: "institution" | "project" | "event"; department?: string | null; position?: string | null;
   };
   origin?: "llm" | "subject_projection" | "parser_projection" | "curated_candidate" | "manual_edit";
+  reviewed_by?: string | null; reviewed_at?: string | null;
   contact_owner?: { kind: string; label: string } | null;
   metric_context?: { period: string; scope: string; unit: string; coverage?: string | null } | null;
   verification_status: "pending" | "verified" | "conflict" | "rejected";

@@ -267,7 +267,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .university-card__art--yellow { background: radial-gradient(ellipse at 55% 100%, #f5e8a3 0, #fbf5d8 48%, #fffdf6 100%); }
 .university-card__monogram { position: relative; z-index: 1; display: grid; width: 62px; height: 62px; place-items: center; border: 1px solid rgba(255,255,255,.75); border-radius: 50%; background: rgba(255,255,255,.26); color: rgba(31,104,57,.22); font-size: 16px; font-weight: 600; letter-spacing: .04em; opacity: 0; transform: translateY(8px) scale(.92); transition: opacity .25s ease, transform .35s var(--ease-out); }
 .university-card:hover .university-card__monogram, .university-card:focus-visible .university-card__monogram { opacity: 1; transform: translateY(0) scale(1); }
-.university-card__draft { position: absolute; z-index: 2; top: 13px; right: 13px; padding: 6px 9px; border: 1px solid rgba(180,224,192,.85); border-radius: 99px; background: rgba(255,255,255,.8); color: #197b35; font-size: 10px; font-weight: 600; }
 .university-card__body { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 7px; padding: 16px 16px 14px; }
 .university-card__name { display: -webkit-box; overflow: hidden; color: #111827; font-size: 15px; font-weight: 600; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
 .university-card__city { display: inline-flex; align-items: flex-start; gap: 4px; color: #4b5563; font-size: 12px; line-height: 1.45; }
@@ -620,7 +619,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   .university-card__body { gap: 5px; padding: 12px 11px; }
   .university-card__name { font-size: 12px; }
   .university-card__city { font-size: 10px; }
-  .university-card__draft { top: 8px; right: 8px; font-size: 8px; }
   .page-caption { margin-top: 20px; }
   .profile-topbar { display: block; margin-bottom: 12px; }
   .profile-topbar .search-field--compact { display: none; }
@@ -724,6 +722,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 }
 /* Connected Demo 1 workflow; uses the dashboard's existing typography and controls. */
 .research-panel { margin: 22px 0; padding: 25px; }
+.content-card p.research-website-hint { margin: 10px 0 0; color: #64746c; font-size: 12px; line-height: 1.65; }
+.modal-form__hint { margin: -4px 0 2px; color: #64746c; font-size: 12px; line-height: 1.6; }
 .research-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; }
 .research-action-stack { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; gap: 10px; margin-top: 10px; }
 .research-action-stack .button { width: 100%; min-height: 42px; justify-content: center; text-align: center; }
@@ -857,4 +857,17 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .change-sources { font-size: 12px; }
 .change-sources summary { cursor: pointer; color: #26704c; }
 .research-replacement { grid-column: 1 / -1; padding: 12px; background: #fff6e6; border-radius: 9px; }
+.card-edit-history { margin-top: 0; }
+.card-edit-history__message { padding: 12px 0; }
+.card-edit-history__scroll { overflow-x: auto; }
+.card-edit-history table { width: 100%; min-width: 700px; border-collapse: collapse; text-align: left; }
+.card-edit-history thead { color: #77857c; font-size: 11px; }
+.card-edit-history th, .card-edit-history td { padding: 12px 10px; border-bottom: 1px solid #e4ece7; vertical-align: top; }
+.card-edit-history tbody th { min-width: 135px; color: #344d40; font-size: 12px; font-weight: 600; }
+.card-edit-history tbody td { color: #53645a; font-size: 12px; line-height: 1.55; }
+.card-edit-history tbody tr:last-child th, .card-edit-history tbody tr:last-child td { border-bottom: 0; }
+.card-edit-history__actor { display: inline-flex; border-radius: 99px; padding: 4px 8px; background: #edf6ef; color: #34744d; white-space: nowrap; font-size: 10px; }
+.card-edit-history__actor--ai { background: #eef3fb; color: #42628e; }
+.card-edit-history__actor--system, .card-edit-history__actor--migration { background: #f2f2ef; color: #686b61; }
+.card-edit-history__value { display: block; max-width: 320px; white-space: pre-wrap; overflow-wrap: anywhere; }
 @media(max-width: 800px) { .change-columns { grid-template-columns: 1fr; } }

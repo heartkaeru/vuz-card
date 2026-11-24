@@ -171,6 +171,8 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [recheckConfirmed, setRecheckConfirmed] = useState(false);
   const recheckRef = useRef<HTMLFieldSetElement>(null);
   const busy = saving || matching || job?.status === "queued" || job?.status === "running";
+  const websiteSuggestionCodes = new Set(["no_valid_extraction", "no_source_documents", "empty_source_documents", "collection_failed"]);
+  const suggestWebsite = !website.trim() || job?.status === "failed" && websiteSuggestionCodes.has(job.result?.code ?? "");
   const currentComparison = comparison?.run_id === run?.run_id && comparison?.revision === run?.revision ? comparison : null;
   const accepted = currentComparison?.approved_facts.length
     ?? run?.facts.filter((fact) => fact.verification_status === "verified" && fact.validation_status === "passed" && !fact.issues.length).length
@@ -534,6 +536,9 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         <option value="detailed">Подробная справка — все разделы</option>
       </select></label>
     </div>
+    {suggestWebsite && <p className="research-website-hint" role="status">{!website.trim()
+      ? "Официальный сайт не указан. Если автоматический поиск не нашёл адрес, укажите ссылку при создании карточки."
+      : "По доступным страницам не удалось найти достаточно сведений. Если указан неофициальный адрес, при создании карточки укажите официальный сайт — так поиск сможет найти больше информации."}</p>}
     <fieldset className="research-meeting" disabled={Boolean(busy)}>
       <legend>Контекст встречи</legend>
       <div className="research-controls">

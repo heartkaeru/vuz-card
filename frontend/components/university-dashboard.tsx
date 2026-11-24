@@ -2,6 +2,7 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ResearchPanel, type ResearchHandle } from "@/components/research-panel";
+import { CardEditHistory } from "@/components/card-edit-history";
 import { PptxPreview } from "@/components/pptx-preview";
 import { api, post, errorText, downloadFile, type ApiCard, type CardIntake, type Fact, type PptxPreviewData, type ResearchRun, type SavedMaterial } from "@/lib/api";
 import { AgentChat } from "@/components/agent-chat";
@@ -28,6 +29,7 @@ const tabs: { key: Section; label: string }[] = [
   { key: "projects", label: "Проекты" },
   { key: "events", label: "Мероприятия" },
   { key: "review", label: "Проверка" },
+  { key: "history", label: "История" },
 ];
 
 export default function UniversityDashboard() {
@@ -50,6 +52,7 @@ export default function UniversityDashboard() {
   const [createName, setCreateName] = useState("");
   const [createCity, setCreateCity] = useState("");
   const [createWebsite, setCreateWebsite] = useState("");
+  const [createWebsiteSuggestion, setCreateWebsiteSuggestion] = useState(false);
   const [creating, setCreating] = useState(false);
   const researchRef = useRef<ResearchHandle>(null);
   const [reviewOutlet, setReviewOutlet] = useState<HTMLDivElement | null>(null);
@@ -106,7 +109,7 @@ export default function UniversityDashboard() {
     api<ApiCard[]>("/cards").then((cards) => {
       if (!active) return;
       const persisted: University[] = cards.map((card) => ({ ...card, id: card.id, backendId: card.id,
-        tone: "mint", draft: card.latest_run === null }));
+        tone: "mint" }));
       setUniversities(persisted);
       setSelectedId((current) => persisted.some((item) => item.id === current) ? current : persisted[0]?.id ?? "");
       setCardsError("");
@@ -235,6 +238,7 @@ export default function UniversityDashboard() {
     setCreateName(suggestedName);
     setCreateCity("");
     setCreateWebsite("");
+    setCreateWebsiteSuggestion(false);
     setCreateOpen(true);
   };
 
@@ -248,7 +252,7 @@ export default function UniversityDashboard() {
       request_key: crypto.randomUUID(),
     });
     const card = intake.card;
-    const university: University = { ...card, backendId: card.id, tone: "mint", draft: card.latest_run === null };
+    const university: University = { ...card, backendId: card.id, tone: "mint" };
     setUniversities((current) => [university, ...current]);
     setSelectedId(university.id);
     setHasChosenUniversity(true);
@@ -260,7 +264,11 @@ export default function UniversityDashboard() {
     notify(intake.job.status === "queued" || intake.job.status === "running"
       ? "Карточка создана. Сбор начался; результат появится в карточке."
       : intake.job.message);
-    } catch (failure) { notify(errorText(failure)); }
+    } catch (failure) {
+      if (failure instanceof Error && ["official_site_not_found", "official_site_discovery_failed"].includes(failure.message)) {
+        setCreateWebsiteSuggestion(true);
+      } else notify(errorText(failure));
+    }
     finally { setCreating(false); }
   };
 
@@ -271,7 +279,7 @@ export default function UniversityDashboard() {
   };
 
   const openChatCard = (card: ApiCard) => {
-    const university: University = { ...card, backendId: card.id, tone: "mint", draft: card.latest_run === null };
+    const university: University = { ...card, backendId: card.id, tone: "mint" };
     setUniversities((current) => [university, ...current.filter((item) => item.backendId !== card.id)]);
     openUniversity(university);
     setCardEditVersion((version) => version + 1);
@@ -360,7 +368,6 @@ export default function UniversityDashboard() {
                   >
                     <span className={`university-card__art university-card__art--${university.tone}`}>
                       <span className="university-card__monogram">{initialsFor(university.name)}</span>
-                      {university.draft && <span className="university-card__draft">Черновик</span>}
                     </span>
                     <span className="university-card__body">
                       <span className="university-card__name">{university.name}</span>
@@ -374,7 +381,7 @@ export default function UniversityDashboard() {
               <div className="empty-state empty-state--search">
                 <span className="empty-state__icon"><Icon name="university" size={24} /></span>
                 <h2>{cardsError ? "Не удалось загрузить карточки" : universities.length ? "Такого вуза пока нет в базе" : "Карточек вузов пока нет"}</h2>
-                <p>{cardsError || "Создайте черновик — он сохранится в базе и появится в списке после перезагрузки."}</p>
+                <p>{cardsError || "Создайте карточку — она сохранится в базе и появится в списке после перезагрузки."}</p>
                 <button className="button button--primary" type="button" onClick={() => openCreate(universitySearch)}>
                   <Icon name="plus" size={17} /> Создать карточку
                 </button>
@@ -424,6 +431,7 @@ export default function UniversityDashboard() {
               {section === "contacts" && <ContactsSection university={selectedUniversity} run={selectedRun} />}
               {section === "projects" && <ProjectsSection university={selectedUniversity} run={selectedRun} />}
               {section === "events" && <EventsSection university={selectedUniversity} run={selectedRun} />}
+              {section === "history" && selectedUniversity.backendId && <CardEditHistory cardId={selectedUniversity.backendId} />}
               </>}
             </div>
           </section>
@@ -567,11 +575,15 @@ export default function UniversityDashboard() {
 
       {createOpen && (
         <Modal title="Новая карточка вуза" onClose={() => setCreateOpen(false)}>
-          <p className="modal-copy">Добавьте название и регион. Если оставить сайт пустым, найдем официальный сайт и начнем сбор автоматически.</p>
+          <p className="modal-copy">Название обязательно. Сайт можно не указывать: мы попробуем найти его автоматически. Если адрес не удастся определить, предложим ввести ссылку вручную.</p>
           <form className="modal-form" onSubmit={handleCreateUniversity}>
             <label>Название вуза<input autoFocus required value={createName} onChange={(event) => setCreateName(event.target.value)} placeholder="Например, университет или колледж" /></label>
             <label>Город или регион<input value={createCity} onChange={(event) => setCreateCity(event.target.value)} placeholder="Например, Казань" /></label>
-            <label>Официальный сайт (необязательно)<input type="url" value={createWebsite} onChange={(event) => setCreateWebsite(event.target.value)} placeholder="https://university.ru" /></label>
+            <label>Официальный сайт (необязательно)<input type="url" value={createWebsite} onChange={(event) => {
+              setCreateWebsite(event.target.value);
+              if (event.target.value.trim()) setCreateWebsiteSuggestion(false);
+            }} placeholder="https://university.ru" /></label>
+            {createWebsiteSuggestion && <p className="modal-form__hint" role="status">Автоматически найти официальный сайт не удалось. Если знаете ссылку, добавьте её сюда — мы попробуем найти больше информации.</p>}
             <div className="modal-actions"><button className="button button--soft" type="button" onClick={() => setCreateOpen(false)}>Отмена</button><button className="button button--primary" type="submit" disabled={creating}><Icon name="plus" size={16} /> {creating ? createWebsite.trim() ? "Запускаем сбор…" : "Ищем сайт…" : "Создать и собрать"}</button></div>
           </form>
         </Modal>
