@@ -169,7 +169,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [reviewTab, setReviewTab] = useState<ReviewTab>("candidates");
   const [replacePrevious, setReplacePrevious] = useState(false);
   const [recheckConfirmed, setRecheckConfirmed] = useState(false);
-  const recheckRef = useRef<HTMLFieldSetElement>(null);
+  const recheckRef = useRef<HTMLDetailsElement>(null);
   const busy = saving || matching || job?.status === "queued" || job?.status === "running";
   const websiteSuggestionCodes = new Set(["no_valid_extraction", "no_source_documents", "empty_source_documents", "collection_failed"]);
   const suggestWebsite = !website.trim() || job?.status === "failed" && websiteSuggestionCodes.has(job.result?.code ?? "");
@@ -520,42 +520,46 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   }, [material, previewAfterGeneration, previewAfterGenerationFrom]);
 
   function showRecheck() {
+    if (recheckRef.current) recheckRef.current.open = true;
     recheckRef.current?.scrollIntoView({ block: "center" });
     recheckRef.current?.focus({ preventScroll: true });
   }
   useImperativeHandle(ref, () => ({ generate, refresh, showRecheck, openReportOptions: () => { setError(""); setFormatPickerOpen(true); } }));
 
   return <section className="content-card research-panel" aria-label="Актуализация и проверка фактов">
-    <div className="content-card__heading"><div><h2>Руководство и сведения об учреждении</h2></div></div>
+    <div className="content-card__heading"><div><h2>Сбор и материалы</h2><span>Обновите сведения или подготовьте документ к встрече</span></div></div>
     <div className="research-controls">
       <label>Официальный сайт<input type="url" value={website} disabled={Boolean(card) || Boolean(busy)}
         onChange={(event) => setWebsite(event.target.value)} placeholder="https://university.ru" aria-label="Официальный сайт" /></label>
-      <label>Вариант презентации<select value={presentationVariant} disabled={Boolean(busy)}
-        onChange={(event) => setPresentationVariant(event.target.value as "compact" | "detailed")}>
-        <option value="compact">Краткая карточка — 3 слайда</option>
-        <option value="detailed">Подробная справка — все разделы</option>
-      </select></label>
     </div>
     {suggestWebsite && <p className="research-website-hint" role="status">{!website.trim()
       ? "Официальный сайт не указан. Если автоматический поиск не нашёл адрес, укажите ссылку при создании карточки."
       : "По доступным страницам не удалось найти достаточно сведений. Если указан неофициальный адрес, при создании карточки укажите официальный сайт — так поиск сможет найти больше информации."}</p>}
-    <fieldset className="research-meeting" disabled={Boolean(busy)}>
-      <legend>Контекст встречи</legend>
-      <div className="research-controls">
-        <label>Цель встречи<input value={meetingGoal} onChange={(event) => setMeetingGoal(event.target.value)}
-          maxLength={1000} placeholder="Например: обсудить подготовку ИТ-специалистов" /></label>
-        <label>Дата встречи (необязательно)<input type="date" value={meetingDate} onChange={(event) => setMeetingDate(event.target.value)} /></label>
-      </div>
-    </fieldset>
+    <details className="research-settings">
+      <summary>Настроить материал и встречу</summary>
+      <fieldset className="research-meeting" disabled={Boolean(busy)}>
+        <div className="research-controls">
+          <label>Формат материала<select value={presentationVariant}
+            onChange={(event) => setPresentationVariant(event.target.value as "compact" | "detailed")}>
+            <option value="compact">Краткая карточка — 3 слайда</option>
+            <option value="detailed">Подробная справка — все разделы</option>
+          </select></label>
+          <label>Цель встречи<input value={meetingGoal} onChange={(event) => setMeetingGoal(event.target.value)}
+            maxLength={1000} placeholder="Например: обсудить подготовку ИТ-специалистов" /></label>
+          <label>Дата встречи<input type="date" value={meetingDate} onChange={(event) => setMeetingDate(event.target.value)} /></label>
+        </div>
+      </fieldset>
+    </details>
     <div className="research-action-stack">
-      <button className="button button--primary" type="button" disabled={Boolean(busy) || !website.trim()} onClick={() => { void refresh(); }}>Найти и обновить информацию</button>
+      <button className="button button--primary" type="button" disabled={Boolean(busy) || !website.trim()} onClick={() => { void refresh(); }}>Обновить сведения</button>
       <button className="button button--soft" type="button" disabled={Boolean(busy)}
-        onClick={() => { void openOrGeneratePresentation(); }}>{busy && job?.task_type === "material" ? "Формируем презентацию…" : material?.presentation_variant === presentationVariant ? "Просмотреть и скачать презентацию" : material ? "Сформировать выбранный формат" : "Сформировать и просмотреть презентацию"}</button>
+        onClick={() => { void openOrGeneratePresentation(); }}>{busy && job?.task_type === "material" ? "Готовим материал…" : material?.presentation_variant === presentationVariant ? "Открыть материал" : material ? "Обновить материал" : "Подготовить материал"}</button>
     </div>
-    {factsToRecheck.length > 0 && <fieldset ref={recheckRef} tabIndex={-1} className="research-meeting" disabled={Boolean(busy)}>
-      <legend>Повторная проверка перед экспортом</legend>
-      <p>Сверьте принятые сведения с источниками. Если значение изменилось, обновите карточку перед экспортом.</p>
-      <details><summary>Сведения для сверки ({factsToRecheck.length})</summary>
+    {factsToRecheck.length > 0 && <details ref={recheckRef} tabIndex={-1} className="research-settings research-settings--recheck">
+      <summary>Повторная проверка перед экспортом <span>{factsToRecheck.length}</span></summary>
+      <fieldset className="research-meeting" disabled={Boolean(busy)}>
+        <p>Сверьте принятые сведения с источниками. Если значение изменилось, обновите карточку перед экспортом.</p>
+        <details><summary>Сведения для сверки ({factsToRecheck.length})</summary>
         <ul>{factsToRecheck.map((fact) => <li key={fact.fact_id}>
           <strong>{fact.subject.person_name ?? fact.subject.entity_name ?? fact.contact_owner?.label ?? "Учреждение"}</strong>
           {" · "}{fields[fact.field] ?? fact.field}{" · "}{fact.value}
@@ -572,19 +576,14 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       </div>
       <label className="research-ack"><input type="checkbox" checked={recheckConfirmed}
         onChange={(event) => setRecheckConfirmed(event.target.checked)} /> Я повторно сверил(а) все указанные сведения, значения актуальны</label>
-    </fieldset>}
+      </fieldset>
+    </details>}
     {job && <div className="research-progress" role="status"><span>{job.message}</span><progress value={job.progress} max={100} /></div>}
     {error && <p className="research-error" role="alert">{error}</p>}
     {run && <p className="research-summary">В последнем сборе: {run.facts.length} кандидатов · на проверке: {pending} · в подтверждённой карточке: {accepted} · отклонено: {rejected} · {run.status === "partial" ? "сбор частичный" : run.status === "failed" ? "сбор не выполнен; прежние принятые сведения сохранены" : "результат сохранён"}.
       {!showFacts && <button className="text-button" type="button" onClick={onShowFacts}>Проверить факты</button>}</p>}
-    {run && Object.values(run.results).some((result) => result.run?.provider === "fixture") &&
-      <p className="research-summary">Учебный прогон: сохранённые ответы модели, без обращения к GigaChat.</p>}
-    {run && Object.values(run.results).some((result) => result.run?.provider === "gigachat-recording") &&
-      <p className="research-summary">Сохранённый реальный ответ GigaChat: повторная проверка источника и разметки без нового запроса к модели.</p>}
-    {run && Object.values(run.results).some((result) => result.run?.provider === "prepared-candidates") &&
-      <p className="research-summary">Добавлены кандидаты из сохранённых источников и ответов GigaChat. Часть выдержек уточнена для проверки; новые сведения ещё не приняты сотрудником.</p>}
     {run && (issueCounts.size > 0 || stageErrors.length > 0 || run.parser_errors.length > 0 || (run.parser_warnings?.length ?? 0) > 0 || gaps.length > 0) &&
-      <details className="research-diagnostics"><summary>Качество сбора: ошибки, ограничения и пропуски</summary>
+      <details className="research-diagnostics"><summary>Подробности последнего сбора</summary>
         <p>Автоматическая проверка не подтверждает полноту сведений. Сверьте нужные факты по первоисточникам.</p>
         {issueCounts.size > 0 && <ul>{[...issueCounts].map(([code, count]) => <li key={code}>{issueMessage(code)} Кандидатов: {count}.</li>)}</ul>}
         {stageErrors.length > 0 && <ul>{[...new Set(stageErrors)].map((code) => <li key={code}>{errorText(new Error(code.replace(/^0\.[23]:/, "")))}</li>)}</ul>}
@@ -658,6 +657,9 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
           </div>
         </> : <p className="research-review-empty" role="status">Пока нет принятых сведений.</p>}
       </div> : <div id="research-candidates-panel" role="tabpanel" aria-labelledby="research-candidates-tab">
+      <details className="research-tools">
+        <summary>Быстрые действия со списком</summary>
+        <div className="research-tool-actions">
       <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(run.facts
         .filter((fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length)
         .map((fact) => fact.fact_id))}>Выбрать все факты без ошибок</button>
@@ -667,6 +669,8 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         .map((fact) => fact.fact_id))}>Выбрать сотрудников без привязки к подразделению</button>
       {rejected > 0 && <button className="text-button" type="button" onClick={() => setShowRejected((value) => !value)}>
         {showRejected ? "Скрыть" : "Показать"} автоматически отклонённые факты ({rejected})</button>}
+        </div>
+      </details>
       <div className="research-facts">{visibleFactGroups.map((group) => {
         const eligibleIds = group.facts.filter((fact) => fact.verification_status === "pending"
           && fact.validation_status === "passed" && !fact.issues.length).map((fact) => fact.fact_id);
@@ -692,10 +696,11 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
             </label>
             {fact.subject.department && <p>Подразделение: {fact.subject.department}</p>}
             {fact.metric_context && <p>Период: {fact.metric_context.period} · Состав: {fact.metric_context.scope} · Единица: {fact.metric_context.unit}{fact.metric_context.coverage ? ` · Охват: ${fact.metric_context.coverage}` : ""}</p>}
-            {fact.origin === "parser_projection" && <small>Кандидат из структурированных данных источника; требуется проверка сотрудником.</small>}
-            {fact.origin === "curated_candidate" && <small>Кандидат уточнён по источнику при подготовке предпросмотра; требуется проверка сотрудником.</small>}
-            {fact.issues.length > 0 && <div className="research-error">{fact.issues.map((code) => <p key={code}>{issueMessage(code)}</p>)}Принятие заблокировано до получения корректного кандидата.</div>}
-            <details><summary>Источники и подтверждающий текст ({fact.evidence.length})</summary>{fact.evidence.map((evidence, index) => <div className="research-evidence" key={index}>
+            {fact.issues.length > 0 && <details className="research-fact__validation">
+              <summary>Требует уточнения</summary>
+              <div>{fact.issues.map((code) => <p key={code}>{issueMessage(code)}</p>)}<small>Принятие заблокировано до уточнения сведений.</small></div>
+            </details>}
+            <details className="research-fact__sources"><summary>Источники и цитаты ({fact.evidence.length})</summary>{fact.evidence.map((evidence, index) => <div className="research-evidence" key={index}>
               <a href={evidence.page_number ? `${evidence.url.split("#")[0]}#page=${evidence.page_number}` : evidence.url} target="_blank" rel="noreferrer">{evidence.page_number ? `PDF · страница ${evidence.page_number} · ` : ""}{evidence.url}</a><small>Получено: {new Date(evidence.retrieved_at).toLocaleString("ru-RU")}</small><blockquote>{evidence.quote}</blockquote>
             </div>)}</details>
           </section>)}</div>

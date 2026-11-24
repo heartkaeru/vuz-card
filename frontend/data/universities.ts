@@ -8,7 +8,7 @@ export type University = {
   version?: number;
 };
 
-export type Section = "about" | "contacts" | "projects" | "events" | "review" | "history";
+export type Section = "about" | "collection" | "contacts" | "projects" | "events" | "review" | "history";
 export type View = "overview" | "universities" | "events" | "reports";
 
 export const initialUniversities: University[] = [

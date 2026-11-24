@@ -25,6 +25,7 @@ const navigation: { key: View; label: string; icon: IconName }[] = [
 
 const tabs: { key: Section; label: string }[] = [
   { key: "about", label: "О вузе" },
+  { key: "collection", label: "Сбор" },
   { key: "contacts", label: "Руководство и контакты" },
   { key: "projects", label: "Проекты" },
   { key: "events", label: "Мероприятия" },
@@ -253,6 +254,7 @@ export default function UniversityDashboard() {
     });
     const card = intake.card;
     const university: University = { ...card, backendId: card.id, tone: "mint" };
+    setSection("collection");
     setUniversities((current) => [university, ...current]);
     setSelectedId(university.id);
     setHasChosenUniversity(true);
@@ -401,11 +403,6 @@ export default function UniversityDashboard() {
               </form>
             </div>
             <ProfileHero university={selectedUniversity} />
-            <ResearchPanel key={selectedUniversity.id + "-" + cardEditVersion} ref={researchRef} university={selectedUniversity}
-              showFacts={section === "review"} reviewOutlet={reviewOutlet} onShowFacts={() => setSection("review")}
-              onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
-              onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
-                ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
             <div className="profile-tabs" role="tablist" aria-label="Разделы карточки" onMouseLeave={() => setHoveredSection(null)}>
               {tabs.map((tab) => (
                 <button
@@ -425,7 +422,14 @@ export default function UniversityDashboard() {
               ))}
               <span className="profile-tabs__indicator" aria-hidden="true" style={{ left: tabIndicator.left, width: tabIndicator.width }} />
             </div>
-            <div className="profile-content page-enter" key={`${selectedUniversity.id}-${section}`}>
+            <div className="collection-panel-slot" hidden={section !== "collection"} aria-hidden={section !== "collection"}>
+              <ResearchPanel key={selectedUniversity.id + "-" + cardEditVersion} ref={researchRef} university={selectedUniversity}
+                showFacts={section === "review"} reviewOutlet={reviewOutlet} onShowFacts={() => setSection("review")}
+                onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
+                onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
+                  ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
+            </div>
+            {section !== "collection" && <div className="profile-content page-enter" key={`${selectedUniversity.id}-${section}`}>
               {section === "review" ? <div className="review-outlet" ref={setReviewOutlet} /> : <>
               {section === "about" && <AboutSection university={selectedUniversity} run={selectedRun} onAdd={() => openChat("card")} />}
               {section === "contacts" && <ContactsSection university={selectedUniversity} run={selectedRun} />}
@@ -433,7 +437,7 @@ export default function UniversityDashboard() {
               {section === "events" && <EventsSection university={selectedUniversity} run={selectedRun} />}
               {section === "history" && selectedUniversity.backendId && <CardEditHistory cardId={selectedUniversity.backendId} />}
               </>}
-            </div>
+            </div>}
           </section>
         )}
 
@@ -560,16 +564,19 @@ export default function UniversityDashboard() {
         onOpenCard={(card) => { openChatCard(card); setChatMode("card"); }}
         onEditApplied={() => setCardEditVersion((version) => version + 1)}
         onCollection={(card, job) => {
+          setSection("collection");
           openChatCard(card);
           setChatOpen(false);
           notify(job.status === "queued" ? "Карточка открыта. Задание сбора поставлено в очередь." : job.message);
         }}
         onAction={async (action) => {
           if (!researchRef.current) return { message: "Сначала откройте карточку учреждения из списка вузов." };
+          setSection("collection");
           return action === "refresh" ? { message: await researchRef.current.refresh() } : researchRef.current.generate();
         }}
         onShowRecheck={() => {
           setChatOpen(false);
+          setSection("collection");
           requestAnimationFrame(() => researchRef.current?.showRecheck());
         }} />
 

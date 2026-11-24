@@ -286,21 +286,21 @@ class DemoRepository(LLMRepository):
                 SELECT 1 FROM json_each(llm_general_chat_turn.answer, '$.cards') AS saved_card
                 WHERE json_extract(saved_card.value, '$.id')=?
             )""", (card_id,))
-            db.execute("DELETE FROM llm_saved_material WHERE material_id IN (
+            db.execute("""DELETE FROM llm_saved_material WHERE material_id IN (
                 SELECT m.material_id FROM llm_material m JOIN llm_run r ON r.run_id=m.run_id WHERE r.institution_id=?
-            )", (card_id,))
-            db.execute("DELETE FROM llm_material_fact WHERE material_id IN (
+            )""", (card_id,))
+            db.execute("""DELETE FROM llm_material_fact WHERE material_id IN (
                 SELECT m.material_id FROM llm_material m JOIN llm_run r ON r.run_id=m.run_id WHERE r.institution_id=?
-            )", (card_id,))
-            db.execute("DELETE FROM llm_review WHERE run_id IN (
+            )""", (card_id,))
+            db.execute("""DELETE FROM llm_review WHERE run_id IN (
                 SELECT run_id FROM llm_run WHERE institution_id=?
-            )", (card_id,))
-            db.execute("DELETE FROM llm_run_input WHERE run_id IN (
+            )""", (card_id,))
+            db.execute("""DELETE FROM llm_run_input WHERE run_id IN (
                 SELECT run_id FROM llm_run WHERE institution_id=?
-            )", (card_id,))
-            db.execute("DELETE FROM llm_material WHERE run_id IN (
+            )""", (card_id,))
+            db.execute("""DELETE FROM llm_material WHERE run_id IN (
                 SELECT run_id FROM llm_run WHERE institution_id=?
-            )", (card_id,))
+            )""", (card_id,))
             db.execute("DELETE FROM llm_job WHERE card_id=?", (card_id,))
             db.execute("DELETE FROM llm_run WHERE institution_id=?", (card_id,))
             db.execute("DELETE FROM llm_card WHERE id=?", (card_id,))
