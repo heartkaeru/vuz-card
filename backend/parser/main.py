@@ -1551,7 +1551,73 @@ class UniversityParser:
     # ------------------------------------------------------------------
     # Руководство
     # ------------------------------------------------------------------
+    def _leadership_candidate_count(
+        self, doc: SourceDocument, soup: BeautifulSoup
+    ) -> int:
+        """Сколько персон можно извлечь со страницы руководства."""
+
+        rows = SvedenTableParser(doc.url).parse(soup)
+        count = sum(
+            1
+            for row in rows
+            if _looks_like_table_name(strip_name(row.get("name", "")))
+        )
+        if count < 2:
+            count += len(self._leadership_from_text(doc))
+        return count
+
+    def _better_leadership_source(
+        self, doc: SourceDocument, soup: BeautifulSoup
+    ) -> tuple[SourceDocument, BeautifulSoup]:
+        """Если раздел оказался оглавлением, идём на страницу структуры.
+
+        На части сайтов ссылка «Руководство» ведёт на список органов
+        управления, а ФИО лежат на официальной странице «Структура и органы
+        управления». Признак — слишком мало извлечённых персон.
+        """
+
+        best_count = self._leadership_candidate_count(doc, soup)
+        if best_count >= 5:
+            return doc, soup
+
+        candidates: list[tuple[int, str]] = []
+        for anchor in soup.select("a[href]"):
+            href = anchor.get("href") or ""
+            text = normalize_whitespace(anchor.get_text(" ", strip=True)).lower()
+            lowered = href.lower()
+            if "структура и органы управления" in text:
+                priority = 0
+            elif "sveden/struct" in lowered:
+                priority = 1
+            elif re.search(r"/(?:official/)?struct(?:ure)?/?$", lowered):
+                priority = 2
+            else:
+                continue
+            url = canonical_url(href, doc.url)
+            if not url or url == doc.url or not is_same_domain(url, doc.url):
+                continue
+            candidates.append((priority, url))
+
+        best_doc, best_soup = doc, soup
+        seen: set[str] = set()
+        for _, url in sorted(candidates)[:3]:
+            if url in seen:
+                continue
+            seen.add(url)
+            alt_doc, alt_soup = self._get_page(url, section="leadership")
+            if alt_soup is None:
+                continue
+            count = self._leadership_candidate_count(alt_doc, alt_soup)
+            if count > best_count:
+                best_count = count
+                best_doc, best_soup = alt_doc, alt_soup
+                LOGGER.info("Руководство: использую страницу структуры %s", url)
+                if count >= 5:
+                    break
+        return best_doc, best_soup
+
     def _parse_leadership(self, doc: SourceDocument, soup: BeautifulSoup) -> None:
+        doc, soup = self._better_leadership_source(doc, soup)
         table_parser = SvedenTableParser(doc.url)
         rows = table_parser.parse(soup)
         leaders: list[Leadership] = []
@@ -2665,6 +2731,15 @@ class UniversityParser:
 
         if not self.settings.rector_lookup:
             return
+        for parsed in self._leadership:
+            position = normalize_whitespace(parsed.position or "").lower()
+            if position in {"ректор", "и.о. ректора", "и. о. ректора"} and parsed.photo_url:
+                # Ректор уже найден на официальном сайте — не перекрываем его
+                # результатом поиска, который может попасть на новость.
+                LOGGER.info(
+                    "Ректор уже найден на сайте: %s", parsed.full_name
+                )
+                return
         fetcher = StealthFetcher(
             timeout=min(self.settings.timeout, 25.0),
             enable_playwright=self.settings.enable_playwright,
