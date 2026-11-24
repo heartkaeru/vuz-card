@@ -2,6 +2,7 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ResearchPanel, type ResearchHandle } from "@/components/research-panel";
+import { CardEditHistory } from "@/components/card-edit-history";
 import { PptxPreview } from "@/components/pptx-preview";
 import { api, post, errorText, downloadFile, type ApiCard, type CardIntake, type Fact, type PptxPreviewData, type ResearchRun, type SavedMaterial } from "@/lib/api";
 import { AgentChat } from "@/components/agent-chat";
@@ -24,10 +25,12 @@ const navigation: { key: View; label: string; icon: IconName }[] = [
 
 const tabs: { key: Section; label: string }[] = [
   { key: "about", label: "О вузе" },
+  { key: "collection", label: "Сбор" },
   { key: "contacts", label: "Руководство и контакты" },
   { key: "projects", label: "Проекты" },
   { key: "events", label: "Мероприятия" },
   { key: "review", label: "Проверка" },
+  { key: "history", label: "История" },
 ];
 
 export default function UniversityDashboard() {
@@ -50,6 +53,7 @@ export default function UniversityDashboard() {
   const [createName, setCreateName] = useState("");
   const [createCity, setCreateCity] = useState("");
   const [createWebsite, setCreateWebsite] = useState("");
+  const [createWebsiteSuggestion, setCreateWebsiteSuggestion] = useState(false);
   const [creating, setCreating] = useState(false);
   const researchRef = useRef<ResearchHandle>(null);
   const [reviewOutlet, setReviewOutlet] = useState<HTMLDivElement | null>(null);
@@ -65,6 +69,9 @@ export default function UniversityDashboard() {
   const [presentationPreview, setPresentationPreview] = useState<PptxPreviewData | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
+  const [cardDeleteTarget, setCardDeleteTarget] = useState<University | null>(null);
+  const [deletingCardId, setDeletingCardId] = useState<string | null>(null);
+  const [cardDeleteError, setCardDeleteError] = useState("");
   const [reportDeleteTarget, setReportDeleteTarget] = useState<string | null>(null);
   const [deletingReportId, setDeletingReportId] = useState<string | null>(null);
   const [reportDeleteError, setReportDeleteError] = useState("");
@@ -106,7 +113,7 @@ export default function UniversityDashboard() {
     api<ApiCard[]>("/cards").then((cards) => {
       if (!active) return;
       const persisted: University[] = cards.map((card) => ({ ...card, id: card.id, backendId: card.id,
-        tone: "mint", draft: card.latest_run === null }));
+        tone: "mint" }));
       setUniversities(persisted);
       setSelectedId((current) => persisted.some((item) => item.id === current) ? current : persisted[0]?.id ?? "");
       setCardsError("");
@@ -199,6 +206,36 @@ export default function UniversityDashboard() {
     }
   };
 
+  const confirmDeleteCard = async () => {
+    const target = cardDeleteTarget;
+    if (!target?.backendId || deletingCardId) return;
+    const backendId = target.backendId;
+    setDeletingCardId(backendId);
+    setCardDeleteError("");
+    try {
+      await api<void>(`/cards/${encodeURIComponent(backendId)}`, { method: "DELETE" });
+      const remaining = universities.filter((item) => item.backendId !== backendId);
+      setUniversities(remaining);
+      setRuns((current) => {
+        const next = { ...current };
+        delete next[target.id];
+        return next;
+      });
+      setSelectedId(remaining[0]?.id ?? "");
+      setHasChosenUniversity(remaining.length > 0);
+      setSection("about");
+      setChatOpen(false);
+      setChatMode("general");
+      setCardDeleteTarget(null);
+      changeView("universities", remaining[0]?.id ?? "");
+      notify(`Карточка «${target.name}» удалена.`);
+    } catch (failure) {
+      setCardDeleteError(errorText(failure));
+    } finally {
+      setDeletingCardId(null);
+    }
+  };
+
   const changeView = (nextView: View, nextUniversityId = selectedId) => {
     if (nextView === view) return;
     const params = new URLSearchParams(window.location.search);
@@ -235,6 +272,7 @@ export default function UniversityDashboard() {
     setCreateName(suggestedName);
     setCreateCity("");
     setCreateWebsite("");
+    setCreateWebsiteSuggestion(false);
     setCreateOpen(true);
   };
 
@@ -248,7 +286,8 @@ export default function UniversityDashboard() {
       request_key: crypto.randomUUID(),
     });
     const card = intake.card;
-    const university: University = { ...card, backendId: card.id, tone: "mint", draft: card.latest_run === null };
+    const university: University = { ...card, backendId: card.id, tone: "mint" };
+    setSection("collection");
     setUniversities((current) => [university, ...current]);
     setSelectedId(university.id);
     setHasChosenUniversity(true);
@@ -260,7 +299,11 @@ export default function UniversityDashboard() {
     notify(intake.job.status === "queued" || intake.job.status === "running"
       ? "Карточка создана. Сбор начался; результат появится в карточке."
       : intake.job.message);
-    } catch (failure) { notify(errorText(failure)); }
+    } catch (failure) {
+      if (failure instanceof Error && ["official_site_not_found", "official_site_discovery_failed"].includes(failure.message)) {
+        setCreateWebsiteSuggestion(true);
+      } else notify(errorText(failure));
+    }
     finally { setCreating(false); }
   };
 
@@ -271,7 +314,7 @@ export default function UniversityDashboard() {
   };
 
   const openChatCard = (card: ApiCard) => {
-    const university: University = { ...card, backendId: card.id, tone: "mint", draft: card.latest_run === null };
+    const university: University = { ...card, backendId: card.id, tone: "mint" };
     setUniversities((current) => [university, ...current.filter((item) => item.backendId !== card.id)]);
     openUniversity(university);
     setCardEditVersion((version) => version + 1);
@@ -360,7 +403,6 @@ export default function UniversityDashboard() {
                   >
                     <span className={`university-card__art university-card__art--${university.tone}`}>
                       <span className="university-card__monogram">{initialsFor(university.name)}</span>
-                      {university.draft && <span className="university-card__draft">Черновик</span>}
                     </span>
                     <span className="university-card__body">
                       <span className="university-card__name">{university.name}</span>
@@ -374,7 +416,7 @@ export default function UniversityDashboard() {
               <div className="empty-state empty-state--search">
                 <span className="empty-state__icon"><Icon name="university" size={24} /></span>
                 <h2>{cardsError ? "Не удалось загрузить карточки" : universities.length ? "Такого вуза пока нет в базе" : "Карточек вузов пока нет"}</h2>
-                <p>{cardsError || "Создайте черновик — он сохранится в базе и появится в списке после перезагрузки."}</p>
+                <p>{cardsError || "Создайте карточку — она сохранится в базе и появится в списке после перезагрузки."}</p>
                 <button className="button button--primary" type="button" onClick={() => openCreate(universitySearch)}>
                   <Icon name="plus" size={17} /> Создать карточку
                 </button>
@@ -388,17 +430,18 @@ export default function UniversityDashboard() {
           <section className="page-section profile-page page-enter" key={`profile-${selectedUniversity.id}`} aria-label={`Карточка: ${selectedUniversity.name}`}>
             <div className="profile-topbar">
               <div className="breadcrumbs"><button type="button" onClick={() => navigate("universities")}>ВУЗы</button><span>/</span><span>Карточка организации</span></div>
-              <form className="search-field search-field--compact" onSubmit={handleGlobalSearch}>
-                <Icon name="search" size={18} />
-                <input value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} placeholder="Поиск по вузам" aria-label="Поиск по вузам" />
-              </form>
+              <div className="profile-topbar__actions">
+                <form className="search-field search-field--compact" onSubmit={handleGlobalSearch}>
+                  <Icon name="search" size={18} />
+                  <input value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} placeholder="Поиск по вузам" aria-label="Поиск по вузам" />
+                </form>
+                {selectedUniversity.backendId && <button className="button button--danger profile-delete-button" type="button"
+                  onClick={() => { setCardDeleteError(""); setCardDeleteTarget(selectedUniversity); }}>
+                  <Icon name="trash" size={15} /> Удалить карточку
+                </button>}
+              </div>
             </div>
             <ProfileHero university={selectedUniversity} />
-            <ResearchPanel key={selectedUniversity.id + "-" + cardEditVersion} ref={researchRef} university={selectedUniversity}
-              showFacts={section === "review"} reviewOutlet={reviewOutlet} onShowFacts={() => setSection("review")}
-              onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
-              onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
-                ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
             <div className="profile-tabs" role="tablist" aria-label="Разделы карточки" onMouseLeave={() => setHoveredSection(null)}>
               {tabs.map((tab) => (
                 <button
@@ -418,14 +461,22 @@ export default function UniversityDashboard() {
               ))}
               <span className="profile-tabs__indicator" aria-hidden="true" style={{ left: tabIndicator.left, width: tabIndicator.width }} />
             </div>
-            <div className="profile-content page-enter" key={`${selectedUniversity.id}-${section}`}>
+            <div className="collection-panel-slot" hidden={section !== "collection"} aria-hidden={section !== "collection"}>
+              <ResearchPanel key={selectedUniversity.id + "-" + cardEditVersion} ref={researchRef} university={selectedUniversity}
+                showFacts={section === "review"} reviewOutlet={reviewOutlet} onShowFacts={() => setSection("review")}
+                onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
+                onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
+                  ? { ...item, backendId: card.id, website: card.website, version: card.version } : item))} />
+            </div>
+            {section !== "collection" && <div className="profile-content page-enter" key={`${selectedUniversity.id}-${section}`}>
               {section === "review" ? <div className="review-outlet" ref={setReviewOutlet} /> : <>
               {section === "about" && <AboutSection university={selectedUniversity} run={selectedRun} onAdd={() => openChat("card")} />}
               {section === "contacts" && <ContactsSection university={selectedUniversity} run={selectedRun} />}
               {section === "projects" && <ProjectsSection university={selectedUniversity} run={selectedRun} />}
               {section === "events" && <EventsSection university={selectedUniversity} run={selectedRun} />}
+              {section === "history" && selectedUniversity.backendId && <CardEditHistory cardId={selectedUniversity.backendId} />}
               </>}
-            </div>
+            </div>}
           </section>
         )}
 
@@ -546,36 +597,56 @@ export default function UniversityDashboard() {
       )}
 
       <AgentSphere onClick={() => openChat("general")} hidden={chatOpen} />
-      <AgentChat key={chatMode === "card" ? chatCard?.backendId : "general"} open={chatOpen}
+      <AgentChat open={chatOpen}
         cardId={chatCard?.backendId} mode={chatMode} onModeChange={setChatMode}
         universityName={chatCard?.name ?? "Общий чат"} onClose={onChatClose}
         onOpenCard={(card) => { openChatCard(card); setChatMode("card"); }}
         onEditApplied={() => setCardEditVersion((version) => version + 1)}
-        onCollection={(card, job) => {
+        onCollection={(card) => {
+          setSection("collection");
           openChatCard(card);
-          setChatOpen(false);
-          notify(job.status === "queued" ? "Карточка открыта. Задание сбора поставлено в очередь." : job.message);
+          setChatMode("card");
         }}
         onAction={async (action) => {
           if (!researchRef.current) return { message: "Сначала откройте карточку учреждения из списка вузов." };
-          return action === "refresh" ? { message: await researchRef.current.refresh() } : researchRef.current.generate();
+          setSection("collection");
+          return action === "refresh" ? researchRef.current.refresh() : researchRef.current.generate();
         }}
         onShowRecheck={() => {
           setChatOpen(false);
+          setSection("collection");
           requestAnimationFrame(() => researchRef.current?.showRecheck());
         }} />
 
       {createOpen && (
         <Modal title="Новая карточка вуза" onClose={() => setCreateOpen(false)}>
-          <p className="modal-copy">Добавьте название и регион. Если оставить сайт пустым, найдем официальный сайт и начнем сбор автоматически.</p>
+          <p className="modal-copy">Название обязательно. Сайт можно не указывать: мы попробуем найти его автоматически. Если адрес не удастся определить, предложим ввести ссылку вручную.</p>
           <form className="modal-form" onSubmit={handleCreateUniversity}>
             <label>Название вуза<input autoFocus required value={createName} onChange={(event) => setCreateName(event.target.value)} placeholder="Например, университет или колледж" /></label>
             <label>Город или регион<input value={createCity} onChange={(event) => setCreateCity(event.target.value)} placeholder="Например, Казань" /></label>
-            <label>Официальный сайт (необязательно)<input type="url" value={createWebsite} onChange={(event) => setCreateWebsite(event.target.value)} placeholder="https://university.ru" /></label>
+            <label>Официальный сайт (необязательно)<input type="url" value={createWebsite} onChange={(event) => {
+              setCreateWebsite(event.target.value);
+              if (event.target.value.trim()) setCreateWebsiteSuggestion(false);
+            }} placeholder="https://university.ru" /></label>
+            {createWebsiteSuggestion && <p className="modal-form__hint" role="status">Автоматически найти официальный сайт не удалось. Если знаете ссылку, добавьте её сюда — мы попробуем найти больше информации.</p>}
             <div className="modal-actions"><button className="button button--soft" type="button" onClick={() => setCreateOpen(false)}>Отмена</button><button className="button button--primary" type="submit" disabled={creating}><Icon name="plus" size={16} /> {creating ? createWebsite.trim() ? "Запускаем сбор…" : "Ищем сайт…" : "Создать и собрать"}</button></div>
           </form>
         </Modal>
       )}
+
+      {cardDeleteTarget && <Modal title="Удалить карточку?" dismissible={!deletingCardId}
+        onClose={() => { if (!deletingCardId) setCardDeleteTarget(null); }}>
+        <p className="modal-copy">Карточка «{cardDeleteTarget.name}» и связанные с ней сведения будут удалены без возможности восстановления.</p>
+        {cardDeleteError && <p className="research-error" role="alert">Не удалось удалить карточку. {cardDeleteError}</p>}
+        <div className="modal-actions">
+          <button className="button button--soft" type="button" disabled={Boolean(deletingCardId)}
+            onClick={() => setCardDeleteTarget(null)}>Отмена</button>
+          <button className="button button--danger" type="button" disabled={Boolean(deletingCardId)}
+            onClick={() => { void confirmDeleteCard(); }}>
+            {deletingCardId ? "Удаляем…" : "Удалить безвозвратно"}
+          </button>
+        </div>
+      </Modal>}
 
       {toast && <div className="toast" role="status"><span className="toast__check"><Icon name="check" size={15} /></span>{toast}</div>}
     </div>
@@ -748,11 +819,11 @@ function InfoListCard({ title, icon, items, empty }: { title: string; icon: Icon
   );
 }
 
-function Modal({ children, title, onClose }: { children: ReactNode; title: string; onClose: () => void }) {
+function Modal({ children, title, onClose, dismissible = true }: { children: ReactNode; title: string; onClose: () => void; dismissible?: boolean }) {
   return (
-    <div className="modal-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div className="modal-layer" role="presentation" onMouseDown={(event) => { if (dismissible && event.target === event.currentTarget) onClose(); }}>
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-heading">
-        <header className="modal__header"><div><span className="modal__eyebrow">КАРТОЧКА ВУЗА</span><h2 id="modal-heading">{title}</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Закрыть окно"><Icon name="close" size={19} /></button></header>
+        <header className="modal__header"><div><span className="modal__eyebrow">КАРТОЧКА ВУЗА</span><h2 id="modal-heading">{title}</h2></div><button className="icon-button" type="button" disabled={!dismissible} onClick={onClose} aria-label="Закрыть окно"><Icon name="close" size={19} /></button></header>
         {children}
       </section>
     </div>
