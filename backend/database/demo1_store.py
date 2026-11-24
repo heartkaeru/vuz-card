@@ -9,6 +9,7 @@ from uuid import uuid4
 from .llm_store import LLMRepository, stamp
 from .schema import connect, execute_statements
 from parser.public_http import website_key
+from app.services.llm.card_chat import refresh_reply
 from app.services.llm.card_edits import edited_fact
 from app.services.llm.changes import effective_facts, normalized
 from app.services.llm.workflow_models import WorkflowError
@@ -130,7 +131,7 @@ class DemoRepository(LLMRepository):
             raise WorkflowError("card_not_found")
         return dict(card)
 
-    def save_chat_turn(self, card_id, user_id, run_id, revision, last_id, question, answer):
+    def save_chat_turn(self, card_id, user_id, run_id, revision, last_id, question, answer, *, refresh=None):
         with closing(connect(self.path)) as db, db:
             db.execute("BEGIN IMMEDIATE")
             card = self._read_card(db, card_id)
@@ -142,12 +143,19 @@ class DemoRepository(LLMRepository):
             ).fetchone()[0]
             if previous_id != last_id:
                 raise WorkflowError("chat_history_changed")
+            if refresh is not None:
+                request_key, identity = refresh
+                if card["version"] != identity["version"]:
+                    raise WorkflowError("stale_card_version")
+                job, created = self._new_job(db, card_id, request_key, "collect", identity)
+                answer = refresh_reply(job)
             cursor = db.execute(
                 """INSERT INTO llm_chat_turn (card_id, user_id, run_id, revision, question, answer)
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (card_id, user_id, run_id, revision, question, json.dumps(answer, ensure_ascii=False)),
             )
-            return {"id": cursor.lastrowid, "question": question, "answer": answer}
+            turn = {"id": cursor.lastrowid, "question": question, "answer": answer}
+            return (turn, job, created) if refresh is not None else turn
 
     def confirm_chat_edit(self, card_id, user_id, turn_id):
         with closing(connect(self.path)) as db:

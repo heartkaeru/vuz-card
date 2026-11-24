@@ -35,8 +35,9 @@ def documents_for(card, mode):
         result.sort(key=lambda d: 0 if d.section == "leadership" else
                     1 if d.category == "leadership" else 2 if d.category == "contacts" else 3)
     else:
-        # Explicit report pages take priority over auto-discovered general pages.
-        result.sort(key=lambda d: 0 if d.file_sha256 else 1)
+        # Reserve the extraction budget for reports and profile pages before homepage text.
+        result.sort(key=lambda d: 0 if d.file_sha256 else
+                    1 if d.section in {"about", "organization"} else 3 if d.section == "homepage" else 2)
     return result
 
 
