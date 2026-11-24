@@ -510,9 +510,17 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .chat-message--user { align-self: flex-end; border-bottom-right-radius: 5px; background: #e9f8ed; color: #263d2d; }
 .chat-message--assistant { align-self: flex-start; border: 1px solid #e1ece4; border-bottom-left-radius: 5px; background: #fafcfb; color: #55635a; }
 .chat-message--typing { display: flex; align-items: center; gap: 4px; min-height: 33px; }
-.chat-message--typing span { width: 5px; height: 5px; border-radius: 50%; background: #69af7b; animation: typing 1s ease-in-out infinite; }
-.chat-message--typing span:nth-child(2) { animation-delay: .12s; }
-.chat-message--typing span:nth-child(3) { animation-delay: .24s; }
+.chat-message--typing > span:not(.chat-message__typing-label) { width: 5px; height: 5px; flex: 0 0 5px; border-radius: 50%; background: #69af7b; animation: typing 1s ease-in-out infinite; }
+.chat-message--typing > span:nth-child(2) { animation-delay: .12s; }
+.chat-message--typing > span:nth-child(3) { animation-delay: .24s; }
+.chat-message__typing-label { margin-left: 5px; color: #718078; font-size: 11px; }
+.chat-message--status { max-width: 100%; align-self: stretch; border-radius: 12px; }
+.chat-message--status--success { border-color: #cde8d3; background: #f2faf4; color: #246b39; }
+.chat-message--status--warning { border-color: #f0dfbd; background: #fffbf2; color: #84602b; }
+.chat-message--status--error { border-color: #efd1cf; background: #fff7f6; color: #943c35; }
+.chat-message--status .button { margin-top: 9px; }
+.chat-message__action-status { font-weight: 600; }
+.chat-message__action-status--success { color: #287341 !important; }
 .agent-chat__footer { flex: 0 0 auto; padding: 0 23px 14px; }
 .agent-chat__quick-actions { display: flex; gap: 8px; margin-bottom: 13px; }
 .agent-chat__quick-actions button { min-height: 34px; padding: 0 11px; border: 1px solid #d1edd6; border-radius: 18px; background: #f8fcf9; color: var(--green); cursor: pointer; font-size: 11px; transition: background .2s ease, border-color .2s ease, transform .2s var(--ease-out); }

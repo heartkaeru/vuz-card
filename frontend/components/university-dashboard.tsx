@@ -558,21 +558,20 @@ export default function UniversityDashboard() {
       )}
 
       <AgentSphere onClick={() => openChat("general")} hidden={chatOpen} />
-      <AgentChat key={chatMode === "card" ? chatCard?.backendId : "general"} open={chatOpen}
+      <AgentChat open={chatOpen}
         cardId={chatCard?.backendId} mode={chatMode} onModeChange={setChatMode}
         universityName={chatCard?.name ?? "Общий чат"} onClose={onChatClose}
         onOpenCard={(card) => { openChatCard(card); setChatMode("card"); }}
         onEditApplied={() => setCardEditVersion((version) => version + 1)}
-        onCollection={(card, job) => {
+        onCollection={(card) => {
           setSection("collection");
           openChatCard(card);
-          setChatOpen(false);
-          notify(job.status === "queued" ? "Карточка открыта. Задание сбора поставлено в очередь." : job.message);
+          setChatMode("card");
         }}
         onAction={async (action) => {
           if (!researchRef.current) return { message: "Сначала откройте карточку учреждения из списка вузов." };
           setSection("collection");
-          return action === "refresh" ? { message: await researchRef.current.refresh() } : researchRef.current.generate();
+          return action === "refresh" ? researchRef.current.refresh() : researchRef.current.generate();
         }}
         onShowRecheck={() => {
           setChatOpen(false);

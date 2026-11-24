@@ -9,7 +9,7 @@ import { type University } from "@/data/universities";
 import { ResearchChanges } from "@/components/research-changes";
 import { buildPersonAliases, personIdentityKey } from "@/lib/person-identity";
 
-export type ResearchHandle = { generate: () => Promise<CardActionResult>; refresh: () => Promise<string>; openReportOptions: () => void; showRecheck: () => void };
+export type ResearchHandle = { generate: () => Promise<CardActionResult>; refresh: () => Promise<CardActionResult>; openReportOptions: () => void; showRecheck: () => void };
 type Props = {
   university: University; showFacts: boolean; reviewOutlet: HTMLDivElement | null; onShowFacts: () => void;
   onConnected: (card: ApiCard) => void; onRunChange: (run: ResearchRun | null) => void;
@@ -287,7 +287,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     return () => { active = false; window.clearInterval(timer); };
   }, [job?.job_id, job?.status]);
 
-  async function refresh() {
+  async function refresh(): Promise<CardActionResult> {
     setSaving(true); setError(""); setMaterial(null);
     try {
       const pages = pdfUrl.trim() ? parsePdfPages(pdfPages) : null;
@@ -305,8 +305,8 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         pdf_sources: pdfUrl.trim() ? [{url: pdfUrl.trim(), pages}] : [],
       });
       setRun(null); onRunChange(null); setJob(next); showCandidates();
-      return "Задание сбора создано. Состояние и результаты появятся в карточке руководства.";
-    } catch (failure) { const message = errorText(failure); setError(message); return message; }
+      return { message: "Задание сбора создано. Состояние и результаты появятся в карточке руководства.", queued: true };
+    } catch (failure) { const message = errorText(failure); setError(message); return { message }; }
     finally { setSaving(false); }
   }
 
