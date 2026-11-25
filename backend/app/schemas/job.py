@@ -13,7 +13,7 @@ class JobStatusEnum(str, Enum):
 class JobResponse(BaseModel):
     """Информация о статусе фоновой задачи (парсер, ИИ или сборка презентации)"""
     job_id: str = Field(..., description="Уникальный идентификатор задачи")
-    university_id: int = Field(..., description="ID ВУЗа, к которому относится задача")
+    university_id: str = Field(..., description="UUID ВУЗа, к которому относится задача")
     task_type: str = Field(..., description="Тип задачи: refresh_officials или generate_presentation")
     status: JobStatusEnum = Field(..., description="Текущее состояние выполнения")
     progress: int = Field(default=0, ge=0, le=100, description="Прогресс выполнения от 0 до 100%")

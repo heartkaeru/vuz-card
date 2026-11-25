@@ -13,6 +13,8 @@ beautifulsoup4>=4.12,<5
 lxml>=5.0
 curl_cffi>=0.7,<1
 psycopg[binary]>=3.2,<4
+SQLAlchemy>=2.0,<3
+asyncpg>=0.29,<1
 -r requirements-llm.txt
 
 # Excel registry import

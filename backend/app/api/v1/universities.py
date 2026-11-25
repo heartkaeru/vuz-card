@@ -1,22 +1,66 @@
-import uuid
-from datetime import datetime
-from typing import List, Optional
+"""Supabase-backed CRUD API for universities, officials, and metrics."""
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+import asyncio
+import logging
+from typing import List
+from uuid import UUID
 
-from app.schemas.job import JobResponse, JobStatusEnum
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+
 from app.schemas.university import (
+    MetricCreate,
+    MetricUpdate,
+    Official,
+    OfficialCreate,
+    OfficialUpdate,
     UniversityBase,
     UniversityCreateRequest,
     UniversityDetail,
+    UniversityMetric,
     UniversityResolveResponse,
     UniversityUpdate,
 )
-from app.data.mock_universities import MOCK_UNIVERSITIES_DB
-from app.services.job_queue import JOBS_STORE, run_create_pipeline
 from app.services.parser_service import resolve_site
+from database.postgres.api_repository import (
+    RepositoryConflict,
+    RepositoryNotFound,
+    SupabaseUniversityRepository,
+)
 
+LOGGER = logging.getLogger(__name__)
 router = APIRouter(prefix="/universities", tags=["Карточки ВУЗов"])
+
+
+def get_repository():
+    try:
+        return SupabaseUniversityRepository()
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="supabase_configuration_required") from None
+
+
+def _actor(request: Request):
+    claims = getattr(request.state, "auth_claims", {})
+    subject = str(claims.get("sub", "authenticated-user"))
+    return {"actor_type": "human", "actor_label": f"api-user:{subject}"}
+
+
+async def _run(operation):
+    try:
+        return await operation
+    except RepositoryNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except RepositoryConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except HTTPException:
+        raise
+    except Exception as exc:
+        sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+        if sqlstate == "23505":
+            raise HTTPException(status_code=409, detail="university_record_conflict") from None
+        if sqlstate in {"23503", "23514", "22P02"}:
+            raise HTTPException(status_code=422, detail="invalid_university_data") from None
+        LOGGER.error("Supabase university API operation failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="supabase_operation_failed") from None
 
 
 @router.post(
@@ -24,157 +68,168 @@ router = APIRouter(prefix="/universities", tags=["Карточки ВУЗов"])
     response_model=UniversityResolveResponse,
     summary="Найти официальный сайт по названию вуза",
 )
-def resolve_university_site(payload: UniversityCreateRequest):
+async def resolve_university_site(payload: UniversityCreateRequest):
     """Ищет официальный сайт автоматически — ссылку вводить не нужно."""
-
-    website = payload.website or resolve_site(payload.name)
+    try:
+        website = payload.website or await asyncio.to_thread(resolve_site, payload.name)
+    except Exception:
+        LOGGER.exception("Official-site discovery failed for %s", payload.name)
+        raise HTTPException(status_code=502, detail="official_site_discovery_failed") from None
     if not website:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                "Не удалось автоматически определить официальный сайт. "
-                "Уточните название или передайте website."
-            ),
-        )
-    return UniversityResolveResponse(
-        name=payload.name,
-        website=website,
-        city=payload.city,
-    )
+        raise HTTPException(status_code=422, detail="official_site_not_found")
+    return UniversityResolveResponse(name=payload.name, website=website, city=payload.city)
 
 
-@router.post(
-    "",
-    response_model=JobResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Создать карточку вуза по названию (без ссылки)",
-)
-async def create_university(
-    payload: UniversityCreateRequest,
-    background_tasks: BackgroundTasks,
-):
-    """Создаёт черновик карточки и запускает парсер в фоне.
-
-    Пользователь вводит только название (и, при желании, город).
-    Официальный сайт, ректорат, фото ректора и контакты парсер находит сам.
-    """
-
-    website = payload.website or resolve_site(payload.name)
+@router.post("", response_model=UniversityDetail, status_code=status.HTTP_201_CREATED,
+             summary="Создать карточку в Supabase")
+async def create_university(payload: UniversityCreateRequest, request: Request,
+                            repository: SupabaseUniversityRepository = Depends(get_repository)):
+    try:
+        website = payload.website or await asyncio.to_thread(resolve_site, payload.name)
+    except Exception:
+        LOGGER.exception("Official-site discovery failed for %s", payload.name)
+        raise HTTPException(status_code=502, detail="official_site_discovery_failed") from None
     if not website:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Не удалось найти официальный сайт по названию вуза",
-        )
-
-    university_id = max(MOCK_UNIVERSITIES_DB, default=0) + 1
-    now = datetime.now().isoformat()
-    MOCK_UNIVERSITIES_DB[university_id] = {
-        "id": university_id,
-        "name": payload.name,
-        "short_name": payload.name[:80],
-        "inn": "",
-        "website": website,
-        "region": "",
-        "city": payload.city or "",
-        "rector_fio": None,
-        "version": 1,
-        "updated_at": now,
-        "fot_volume": None,
-        "contracts_count": 0,
-        "active_projects": [],
-        "officials": [],
+        raise HTTPException(status_code=422, detail="official_site_not_found")
+    values = {
+        "name": payload.name.strip(),
+        "short_name": payload.short_name.strip() if payload.short_name else payload.name.strip(),
+        "region": payload.region,
+        "city": payload.city,
+        "website": str(website).rstrip("/"),
+        "inn": payload.inn,
+        "profile": payload.profile,
+        "institution_type": payload.institution_type,
+        "verification_status": "needs_review",
     }
-
-    job_id = f"job_{uuid.uuid4().hex[:8]}"
-    JOBS_STORE[job_id] = {
-        "job_id": job_id,
-        "university_id": university_id,
-        "task_type": "create_card",
-        "status": JobStatusEnum.IN_PROGRESS,
-        "progress": 5,
-        "message": "Карточка создана. Парсер ищет сайт и ректора...",
-        "created_at": now,
-        "completed_at": None,
-        "result": {"website": website},
-    }
-    background_tasks.add_task(
-        run_create_pipeline,
-        job_id,
-        university_id,
-        payload.name,
-        payload.city or "",
-        website,
-    )
-    return JOBS_STORE[job_id]
+    item = await _run(repository.create_university(values, **_actor(request)))
+    return await _run(repository.get_university(item["id"]))
 
 
-@router.get("", response_model=List[UniversityBase], summary="Получить реестр ВУЗов")
-def get_universities(
-    search: Optional[str] = Query(None, description="Поиск по названию или краткому имени"),
-    region: Optional[str] = Query(None, description="Фильтр по региону")
-):
-    """
-    Возвращает список всех университетов для экрана реестра (с поддержкой поиска и фильтрации).
-    """
-    results = list(MOCK_UNIVERSITIES_DB.values())
-    
-    if search:
-        search_lower = search.lower()
-        results = [
-            u for u in results 
-            if search_lower in u["name"].lower() or search_lower in u["short_name"].lower()
-        ]
-        
-    if region:
-        region_lower = region.lower()
-        results = [u for u in results if region_lower in u["region"].lower()]
-        
-    return results
+@router.get("", response_model=List[UniversityBase], summary="Получить реестр вузов из Supabase")
+async def get_universities(search: str | None = Query(None), region: str | None = Query(None),
+                           repository: SupabaseUniversityRepository = Depends(get_repository)):
+    return await _run(repository.list_universities(search=search, region=region))
 
 
-@router.get("/{university_id}", response_model=UniversityDetail, summary="Получить детальную карточку ВУЗа")
-def get_university_detail(university_id: int):
-    """
-    Возвращает полную карточку университета со списком руководства,
-    контактами, статусами проверки («было / стало») и ключевыми проектами.
-    """
-    if university_id not in MOCK_UNIVERSITIES_DB:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"ВУЗ с id={university_id} не найден"
-        )
-    return MOCK_UNIVERSITIES_DB[university_id]
+@router.get("/{university_id}", response_model=UniversityDetail, summary="Получить карточку вуза")
+async def get_university_detail(university_id: UUID,
+                                repository: SupabaseUniversityRepository = Depends(get_repository)):
+    item = await _run(repository.get_university(str(university_id)))
+    if item is None:
+        raise HTTPException(status_code=404, detail="university_not_found")
+    return item
 
 
-@router.patch("/{university_id}", response_model=UniversityDetail, summary="Обновить данные карточки вручную")
-def update_university(university_id: int, payload: UniversityUpdate):
-    """
-    Позволяет сотруднику вручную скорректировать карточку ВУЗа.
-    Реализует версионирование (защиту от параллельной перезаписи данных).
-    """
-    if university_id not in MOCK_UNIVERSITIES_DB:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"ВУЗ с id={university_id} не найден"
-        )
-        
-    current_data = MOCK_UNIVERSITIES_DB[university_id]
-    
-    # Проверка версии карточки (оптимистичная блокировка)
-    if payload.version != current_data["version"]:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Карточка была изменена другим пользователем или фоновым процессом. Обновите страницу."
-        )
-        
-    # Применение изменений
-    update_dict = payload.model_dump(exclude_unset=True, exclude={"version"})
-    for key, value in update_dict.items():
-        if value is not None:
-            current_data[key] = value
-            
-    # Увеличиваем версию и время
-    current_data["version"] += 1
-    current_data["updated_at"] = "2026-10-27T17:00:00"
-    
-    return current_data
+@router.patch("/{university_id}", response_model=UniversityDetail, summary="Обновить карточку вручную")
+async def update_university(university_id: UUID, payload: UniversityUpdate, request: Request,
+                            repository: SupabaseUniversityRepository = Depends(get_repository)):
+    values = payload.model_dump(exclude_unset=True, exclude={"version"})
+    if values.get("website") is not None:
+        values["website"] = str(values["website"])
+    await _run(repository.update_university(str(university_id), values, payload.version, **_actor(request)))
+    return await _run(repository.get_university(str(university_id)))
+
+
+@router.delete("/{university_id}", status_code=status.HTTP_204_NO_CONTENT,
+               summary="Удалить карточку и связанные данные")
+async def delete_university(university_id: UUID, request: Request,
+                            repository: SupabaseUniversityRepository = Depends(get_repository)):
+    from app.api.v1.ai import get_repository as get_ai_repository
+    from app.services.llm.workflow_models import WorkflowError
+
+    try:
+        await get_ai_repository().delete_card(str(university_id), actor=_actor(request)["actor_label"])
+    except WorkflowError as exc:
+        code = str(exc)
+        raise HTTPException(status_code=409 if code in {"university_has_children", "card_job_already_running"} else 404,
+                            detail=code) from None
+    except Exception as exc:
+        LOGGER.error("Supabase university delete failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="supabase_operation_failed") from None
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{university_id}/officials", response_model=list[Official], summary="Список руководства")
+async def list_officials(university_id: UUID,
+                         repository: SupabaseUniversityRepository = Depends(get_repository)):
+    return await _run(repository.list_officials(str(university_id)))
+
+
+@router.post("/{university_id}/officials", response_model=Official, status_code=status.HTTP_201_CREATED,
+             summary="Добавить руководителя")
+async def create_official(university_id: UUID, payload: OfficialCreate, request: Request,
+                          repository: SupabaseUniversityRepository = Depends(get_repository)):
+    return await _run(repository.create_official(
+        str(university_id), payload.model_dump(mode="python"), **_actor(request)))
+
+
+@router.get("/{university_id}/officials/{official_id}", response_model=Official,
+            summary="Получить руководителя")
+async def get_official(university_id: UUID, official_id: UUID,
+                       repository: SupabaseUniversityRepository = Depends(get_repository)):
+    officials = await _run(repository.list_officials(str(university_id)))
+    item = next((official for official in officials if official["id"] == str(official_id)), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="official_not_found")
+    return item
+
+
+@router.patch("/{university_id}/officials/{official_id}", response_model=Official,
+              summary="Обновить руководителя")
+async def update_official(university_id: UUID, official_id: UUID, payload: OfficialUpdate, request: Request,
+                          repository: SupabaseUniversityRepository = Depends(get_repository)):
+    values = payload.model_dump(exclude_unset=True, mode="python")
+    item = await _run(repository.update_official(str(university_id), str(official_id), values, **_actor(request)))
+    return item
+
+
+@router.delete("/{university_id}/officials/{official_id}", status_code=status.HTTP_204_NO_CONTENT,
+               summary="Удалить руководителя")
+async def delete_official(university_id: UUID, official_id: UUID, request: Request,
+                          repository: SupabaseUniversityRepository = Depends(get_repository)):
+    await _run(repository.delete_official(str(university_id), str(official_id), **_actor(request)))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{university_id}/metrics", response_model=list[UniversityMetric], summary="Список показателей")
+async def list_metrics(university_id: UUID,
+                       repository: SupabaseUniversityRepository = Depends(get_repository)):
+    return await _run(repository.list_metrics(str(university_id)))
+
+
+@router.post("/{university_id}/metrics", response_model=UniversityMetric, status_code=status.HTTP_201_CREATED,
+             summary="Добавить показатель")
+async def create_metric(university_id: UUID, payload: MetricCreate, request: Request,
+                        repository: SupabaseUniversityRepository = Depends(get_repository)):
+    return await _run(repository.create_metric(
+        str(university_id), payload.model_dump(mode="python"), **_actor(request)))
+
+
+@router.get("/{university_id}/metrics/{metric_id}", response_model=UniversityMetric,
+            summary="Получить показатель")
+async def get_metric(university_id: UUID, metric_id: UUID,
+                     repository: SupabaseUniversityRepository = Depends(get_repository)):
+    metrics = await _run(repository.list_metrics(str(university_id)))
+    item = next((metric for metric in metrics if metric["id"] == str(metric_id)), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="metric_not_found")
+    return item
+
+
+@router.patch("/{university_id}/metrics/{metric_id}", response_model=UniversityMetric,
+              summary="Обновить показатель")
+async def update_metric(university_id: UUID, metric_id: UUID, payload: MetricUpdate, request: Request,
+                        repository: SupabaseUniversityRepository = Depends(get_repository)):
+    values = payload.model_dump(exclude_unset=True, mode="python")
+    metrics = await _run(repository.update_metric(
+        str(university_id), str(metric_id), values, **_actor(request)))
+    return next(metric for metric in metrics if metric["id"] == str(metric_id))
+
+
+@router.delete("/{university_id}/metrics/{metric_id}", status_code=status.HTTP_204_NO_CONTENT,
+               summary="Удалить показатель")
+async def delete_metric(university_id: UUID, metric_id: UUID, request: Request,
+                        repository: SupabaseUniversityRepository = Depends(get_repository)):
+    await _run(repository.delete_metric(str(university_id), str(metric_id), **_actor(request)))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

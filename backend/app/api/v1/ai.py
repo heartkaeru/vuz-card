@@ -1,6 +1,8 @@
 """Demo 1 UI API backed by the real parser, LLM workflow and SQLite staging."""
 
 import asyncio
+import inspect
+import logging
 import os
 import jwt
 from datetime import datetime, timezone
@@ -36,9 +38,11 @@ from app.services.llm.changes import compare_run, effective_facts
 from app.services.meeting_pptx import build_meeting_presentation
 from app.services.dossier_preview import build_dossier_preview
 from app.services.pptx_preview import preview_presentation
+from database.postgres.api_repository import SupabaseUniversityRepository
 
 router = APIRouter(prefix="/ai", tags=["Демо 1: сбор, проверка и презентация"])
 chat_bearer = HTTPBearer(auto_error=False)
+LOGGER = logging.getLogger(__name__)
 
 
 def chat_user(credentials: HTTPAuthorizationCredentials | None = Depends(chat_bearer)):
@@ -192,6 +196,22 @@ def checked(operation):
         raise HTTPException(404 if code.endswith("not_found") else 409, code) from None
 
 
+async def checked_async(operation):
+    try:
+        result = operation()
+        return await result if inspect.isawaitable(result) else result
+    except WorkflowError as exc:
+        code = str(exc)
+        raise HTTPException(404 if code.endswith("not_found") else 409, code) from None
+
+
+async def resolve_registry_card_id(repository, workflow_card_id: str) -> str:
+    resolver = getattr(repository, "resolve_registry_id", None)
+    if resolver is None:
+        return workflow_card_id
+    return await checked_async(lambda: resolver(workflow_card_id))
+
+
 async def collect_job(repository, pipeline, collector, card, job_id, leadership_url=None, source_options=None):
     try:
         repository.update_job(job_id, status="running", progress=15, message="Сбор официальных страниц руководства")
@@ -256,25 +276,25 @@ async def material_job(repository, pipeline, run_id, payload, job_id):
 
 
 @router.get("/cards")
-def list_cards(repository=Depends(get_repository)):
-    return repository.cards()
+async def list_cards(repository=Depends(get_repository)):
+    return await checked_async(lambda: repository.cards())
 
 
 @router.post("/cards", status_code=201)
-def create_card(payload: CardCreate, repository=Depends(get_repository)):
-    return repository.create_card(payload.name, payload.city, str(payload.website).rstrip("/"))
+async def create_card(payload: CardCreate, repository=Depends(get_repository)):
+    return await checked_async(lambda: repository.create_card(payload.name, payload.city, str(payload.website).rstrip("/")))
 
 
 @router.delete("/cards/{card_id}", status_code=204, summary="Полностью удалить карточку и связанные данные")
-def delete_card(card_id: str, user_id=Depends(chat_user), repository=Depends(get_repository)):
+async def delete_card(card_id: str, user_id=Depends(chat_user), repository=Depends(get_repository)):
     """Purge a card and its workflow data; requires an authenticated user."""
-    checked(lambda: repository.delete_card(card_id, actor=user_id))
+    await checked_async(lambda: repository.delete_card(card_id, actor=user_id))
     return Response(status_code=204)
 
 
 @router.get("/cards/{card_id}")
-def get_card(card_id: str, repository=Depends(get_repository)):
-    card = checked(lambda: repository.card(card_id))
+async def get_card(card_id: str, repository=Depends(get_repository)):
+    card = await checked_async(lambda: repository.card(card_id))
     run = repository.get(card["latest_run"]) if card["latest_run"] else None
     return {**card, "job": repository.card_job(card_id),
             "run": run.model_dump(mode="json") if run else None,
@@ -282,8 +302,8 @@ def get_card(card_id: str, repository=Depends(get_repository)):
 
 
 @router.get("/cards/{card_id}/history")
-def history(card_id: str, repository=Depends(get_repository)):
-    checked(lambda: repository.card(card_id))
+async def history(card_id: str, repository=Depends(get_repository)):
+    await checked_async(lambda: repository.card(card_id))
     return [{"run_id": run.run_id, "revision": run.revision, "status": run.status,
              "created_at": run.created_at, "previous_run_id": run.previous_run_id,
              "approved_count": len(effective_facts(run)), "candidate_count": len(run.facts)}
@@ -296,9 +316,9 @@ def chat_history(card_id: str, user_id=Depends(chat_user), repository=Depends(ge
     return [{"id": turn["id"], "question": turn["question"], "answer": turn["answer"]} for turn in turns]
 
 
-def start_chat_collection(args, payload, user_id, background, repository, pipeline, collector):
+async def start_chat_collection(args, payload, user_id, background, repository, pipeline, collector):
     options = {"include_institution": True, "public_site_only": True}
-    card, job, created = checked(lambda: repository.start_card_intake(
+    card, job, created = await checked_async(lambda: repository.start_card_intake(
         args["name"], args["city"], args["website"], f"chat:{user_id}:{payload.request_key}", options,
     ))
     if created:
@@ -324,10 +344,10 @@ async def general_chat_message(payload: ChatRequest, background: BackgroundTasks
     except WorkflowError as exc:
         raise HTTPException(422, str(exc)) from None
     if "registry_query" in answer:
-        answer = registry_answer(repository.cards(), answer["registry_query"])
+        answer = registry_answer(await checked_async(lambda: repository.cards()), answer["registry_query"])
     starts_collection = "collection_request" in answer
     if starts_collection:
-        collection = start_chat_collection(
+        collection = await start_chat_collection(
             answer["collection_request"], payload, user_id, background, repository, pipeline, collector,
         )
         job = collection["job"]
@@ -354,7 +374,7 @@ async def chat_intake(payload: ChatRequest, background: BackgroundTasks, user_id
         raise HTTPException(422, str(exc)) from None
     if args is None:
         return {"message": "Для первичного сбора укажите название учреждения и ссылку на его официальный сайт."}
-    return {"collection": start_chat_collection(args, payload, user_id, background, repository, pipeline, collector)}
+    return {"collection": await start_chat_collection(args, payload, user_id, background, repository, pipeline, collector)}
 
 
 @router.post("/cards/{card_id}/chat")
@@ -371,7 +391,7 @@ async def chat_message(card_id: str, payload: ChatRequest, background: Backgroun
     except WorkflowError as exc:
         raise HTTPException(422, str(exc)) from None
     if "collection_request" in answer:
-        return {"collection": start_chat_collection(
+        return {"collection": await start_chat_collection(
             answer["collection_request"], payload, user_id, background, repository, pipeline, collector,
         )}
     return checked(lambda: repository.save_chat_turn(
@@ -380,16 +400,29 @@ async def chat_message(card_id: str, payload: ChatRequest, background: Backgroun
 
 
 @router.post("/cards/{card_id}/chat/{turn_id}/confirm")
-def confirm_chat_edit(card_id: str, turn_id: int, user_id=Depends(chat_user),
-                      repository=Depends(get_repository)):
+async def confirm_chat_edit(card_id: str, turn_id: int, user_id=Depends(chat_user),
+                            repository=Depends(get_repository)):
     checked(lambda: repository.confirm_chat_edit(card_id, user_id, turn_id))
+    if os.environ.get("DATABASE_URL", "").strip():
+        card = await checked_async(lambda: repository.card(card_id))
+        run = repository.get(card["latest_run"]) if card.get("latest_run") else None
+        fact = next((item for item in reversed(run.facts)
+                     if item.origin == "manual_edit" and item.reviewed_by == user_id), None) if run else None
+        if fact:
+            try:
+                await SupabaseUniversityRepository().apply_ai_review(
+                    await resolve_registry_card_id(repository, card_id), [fact.model_dump(mode="json")],
+                    actor_label=f"chat-user:{user_id}", actor_type="human")
+            except Exception as exc:
+                LOGGER.error("Supabase chat edit sync failed (%s)", type(exc).__name__)
+                raise HTTPException(status_code=503, detail="supabase_edit_sync_failed") from None
     return {"status": "applied"}
 
 
 @router.post("/cards/{card_id}/refresh", status_code=202)
-def refresh(card_id: str, payload: RefreshRequest, background: BackgroundTasks,
+async def refresh(card_id: str, payload: RefreshRequest, background: BackgroundTasks,
             repository=Depends(get_repository), pipeline=Depends(get_pipeline), collector=Depends(get_collector)):
-    card = checked(lambda: repository.card(card_id))
+    card = await checked_async(lambda: repository.card(card_id))
     if card["version"] != payload.version:
         raise HTTPException(409, "stale_card_version")
     for source_url in [payload.leadership_url, payload.biography_url, *payload.institution_urls, *[source.url for source in payload.pdf_sources]]:
@@ -456,9 +489,23 @@ async def preview(run_id: str, expected_revision: int, presentation_variant: Lit
 
 
 @router.post("/runs/{run_id}/reviews")
-def review(run_id: str, payload: ReviewRequest, repository=Depends(get_repository)):
-    return checked(lambda: LLMWorkflow(repository).review(run_id, ReviewBatch(
-        expected_revision=payload.expected_revision, decisions=payload.decisions, retirements=payload.retirements), actor=payload.reviewer))
+async def review(run_id: str, payload: ReviewRequest, repository=Depends(get_repository)):
+    result = checked(lambda: LLMWorkflow(repository).review(run_id, ReviewBatch(
+        expected_revision=payload.expected_revision, decisions=payload.decisions,
+        retirements=payload.retirements), actor=payload.reviewer))
+    accepted_ids = {decision.fact_id for decision in payload.decisions if decision.decision == "accept"}
+    if accepted_ids and os.environ.get("DATABASE_URL", "").strip():
+        accepted_facts = [fact.model_dump(mode="json") for fact in effective_facts(result)
+                          if fact.fact_id in accepted_ids]
+        if accepted_facts:
+            try:
+                await SupabaseUniversityRepository().apply_ai_review(
+                    await resolve_registry_card_id(repository, result.institution.id), accepted_facts,
+                    actor_label=f"ai-review:{run_id}:{payload.reviewer}")
+            except Exception as exc:
+                LOGGER.error("Supabase AI review sync failed (%s)", type(exc).__name__)
+                raise HTTPException(status_code=503, detail="supabase_ai_sync_failed") from None
+    return result
 
 
 @router.post("/runs/{run_id}/partnership-matches")
