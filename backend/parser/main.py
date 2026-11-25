@@ -1596,6 +1596,16 @@ class UniversityParser:
             count += len(self._leadership_from_text(doc))
         return count
 
+    @staticmethod
+    def _base_domain_url(url: str) -> str:
+        """Стандартная страница структуры на основном домене вуза."""
+
+        host = utils.urlparse(url).netloc.lower()
+        parts = host.split(".")
+        if len(parts) > 2 and parts[0] not in {"www", "m"}:
+            host = ".".join(parts[-2:])
+        return f"https://{host}/sveden/struct/"
+
     def _better_leadership_source(
         self, doc: SourceDocument, soup: BeautifulSoup
     ) -> tuple[SourceDocument, BeautifulSoup]:
@@ -1628,9 +1638,14 @@ class UniversityParser:
                 continue
             candidates.append((priority, url))
 
+        # Ссылка «Руководство» может вести на поддомен (rector.kpfu.ru),
+        # где есть только ректор. Официальный список — на /sveden/struct/
+        # основного домена.
+        candidates.append((3, self._base_domain_url(doc.url)))
+
         best_doc, best_soup = doc, soup
         seen: set[str] = set()
-        for _, url in sorted(candidates)[:3]:
+        for _, url in sorted(candidates)[:4]:
             if url in seen:
                 continue
             seen.add(url)
