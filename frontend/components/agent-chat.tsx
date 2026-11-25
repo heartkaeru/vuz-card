@@ -9,6 +9,7 @@ type Turn = {
   answer: {
     text: string; sources: { fact_id: string; value: string; quote: string; url: string | null }[];
     cards?: ApiCard[];
+    job_id?: string;
     edit?: { field: string; owner: string; before: string; after: string; status: "pending" | "applied" };
   };
 };
@@ -32,6 +33,43 @@ type AgentChatProps = {
   onAction?: (action: "refresh" | "presentation") => Promise<CardActionResult>;
   onShowRecheck?: () => void;
 };
+
+function CollectionProgress({ jobId, initialText }: { jobId: string; initialText: string }) {
+  const [job, setJob] = useState<Job | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let timer: number | undefined;
+
+    async function poll() {
+      try {
+        const next = await api<Job>(`/jobs/${encodeURIComponent(jobId)}`, { signal: controller.signal });
+        if (controller.signal.aborted) return;
+        setJob(next);
+        setUnavailable(false);
+        if (next.status === "queued" || next.status === "running") {
+          timer = window.setTimeout(poll, 1500);
+        }
+      } catch {
+        if (controller.signal.aborted) return;
+        setUnavailable(true);
+        timer = window.setTimeout(poll, 3000);
+      }
+    }
+
+    void poll();
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [jobId]);
+
+  const text = unavailable ? "Статус сбора временно недоступен. Проверяю ещё раз…"
+    : job?.status === "running" ? `Сбор выполняется · ${job.progress}%. ${job.message}`
+      : job?.status === "completed" || job?.status === "failed" ? job.message : initialText;
+  return <p role="status">{text}</p>;
+}
 
 export function AgentChat({ open, universityName, cardId, mode, onModeChange, onOpenCard, onClose, onAction,
   onEditApplied, onCollection, onShowRecheck }: AgentChatProps) {
@@ -85,6 +123,8 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
   }, [turns, typing, actionNotices, path]);
 
   const visibleNotices = actionNotices.filter((notice) => notice.path === path);
+  const latestRefresh = inCard && lastHistoryPath.current === path
+    ? [...turns].reverse().find((turn) => turn.answer.job_id) : undefined;
 
   function addActionNotice(notice: Omit<ActionNotice, "id">) {
     setActionNotices((current) => [...current.slice(-19), { ...notice, id: ++noticeId.current }]);
@@ -219,7 +259,10 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
                 return <div className="agent-chat__turn" key={turn.id}>
                   <div className="chat-message chat-message--user"><p>{turn.question}</p></div>
                   <div className="chat-message chat-message--assistant">
-                    {collectionStatus
+                    {open && latestRefresh?.answer.job_id && turn.id === latestRefresh.id
+                      ? <CollectionProgress key={latestRefresh.answer.job_id} jobId={latestRefresh.answer.job_id}
+                          initialText={turn.answer.text} />
+                      : collectionStatus
                       ? <p className="chat-message__action-status chat-message__action-status--success" role="status">{collectionStatus}</p>
                       : <p>{turn.answer.text}</p>}
                     {turn.answer.cards && turn.answer.cards.length > 0 && <ul className="chat-message__cards">

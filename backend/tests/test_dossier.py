@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from pptx import Presentation
 
 from app.services.llm.client import FixtureProvider
-from app.services.llm.context_models import ContextExtractionRequest
+from app.services.llm.context_models import ContextExtractionRequest, ContextField
 from app.services.llm.fragment_models import FragmentExtractionRequest
 from app.services.llm.models import DraftResult, GenerationRequest
 from app.services.llm.pipeline import AssistantPipeline, DraftValidationError
@@ -123,6 +123,56 @@ def test_qualified_metric_remains_candidate_and_preserves_population():
     fact = metric_extract(METRIC).facts[0]
     assert fact.validation_status == "passed" and fact.verification_status == "pending"
     assert fact.metric_context.scope == METRIC["scope"]
+
+
+def test_reference_selection_preserves_source_text_when_students_are_also_requested():
+    request = metric_request()
+    request.fields = [ContextField.PROFILE, ContextField.STUDENTS]
+    subject = {"entity_kind": "institution", "entity_name": "Учебный университет", "entity_fragment_id": "current"}
+    items = [
+        {"subject": subject, "field": "institution.profile", "value": "Пересказ модели",
+         "value_fragment_id": "current", "fragment_ids": ["current"]},
+        {"subject": subject, "field": "institution.students", "value_fragment_id": "current",
+         "fragment_ids": ["current"], "metric_context": METRIC},
+    ]
+
+    class Selector(FixtureProvider):
+        async def complete(self, system, payload, schema):
+            definition = schema["$defs"]["ContextFactProposal"]
+            assert "value_fragment_id" in definition["required"]
+            return await super().complete(system, payload, schema)
+
+    result = asyncio.run(AssistantPipeline(Selector([{"facts": items, "gaps": []}])).extract_facts(request))
+    profile, count = result.facts
+    assert profile.validation_status == "passed" and profile.verification_status == "pending"
+    assert profile.value == profile.evidence[0].quote and "Пересказ" not in profile.value
+    assert count.verification_status == "rejected" and "student_metric_number_required" in count.issues
+
+
+@pytest.mark.parametrize("text,passed", [
+    ("Дата создания образовательной организации | 1\nсентября\n1987 г.", True),
+    ("В 1930 году был создан Сибирский финансово-экономический институт.", True),
+    ("Университет был основан в 1930 году.", True),
+    ("В 1967 г. в институте было создано заочное отделение.", False),
+    ("Дата создания филиала | 21 января 1988 г.", False),
+])
+def test_founding_date_requires_creation_of_the_institution(text, passed):
+    doc = HTMLCleaner().to_document(f"<main><h1>Учебный университет</h1><p>{text}</p></main>",
+                                    url="https://university.example/about", section="about")
+    assert mark_institution_context(doc, "Учебный университет")
+    title, value = doc.fragments
+    request = ContextExtractionRequest(
+        institution=INSTITUTION, documents=[to_llm_document(doc, include_contact_hints=False)],
+    )
+    item = {"subject": {"entity_kind": "institution", "entity_name": "Учебный университет",
+                        "entity_fragment_id": title.fragment_id},
+            "field": "institution.founded", "value_fragment_id": value.fragment_id,
+            "fragment_ids": [value.fragment_id]}
+    result = asyncio.run(AssistantPipeline(FixtureProvider([{"facts": [item], "gaps": []}])).extract_facts(request))
+    fact, = result.facts
+    assert (fact.validation_status == "passed") is passed
+    if not passed:
+        assert "institution_founding_context_required" in fact.issues
 
 
 @pytest.mark.parametrize("metric,refs,issue", [

@@ -18,10 +18,20 @@ class CollectCard(StrictModel):
     website: str | None = Field(default=None, min_length=1, max_length=2048)
 
 
+def collect_tool_schema():
+    schema = CollectCard.model_json_schema()
+    # GigaChat expects a concrete property type. A missing website is still valid.
+    website = schema["properties"]["website"]
+    schema["properties"]["website"] = next(
+        variant for variant in website["anyOf"] if variant["type"] == "string"
+    )
+    return schema
+
+
 COLLECT_TOOL = {
     "name": "collect_card",
     "description": "Создаёт черновик и запускает сбор по официальному сайту; если адрес не указан, сервер найдёт его по названию.",
-    "parameters": CollectCard.model_json_schema(),
+    "parameters": collect_tool_schema(),
 }
 COLLECT_PROMPT = """Для явной просьбы создать карточку или собрать сведения о новом вузе вызови collect_card.
 Название, сайт и город бери из последнего сообщения. Если город не указан, оставь его пустым.

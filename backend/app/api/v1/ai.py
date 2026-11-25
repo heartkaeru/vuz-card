@@ -76,6 +76,8 @@ def get_collector():
     def collect(website, name, leadership_url=None, *, biography_url=None, institution_urls=(), pdf_sources=(),
                 include_institution=False, public_site_only=False):
         settings = Settings.from_env()
+        # The LLM needs source documents from the official site, including on refresh.
+        settings.aggregators_only = False
         settings.max_retries = 1
         settings.timeout = min(settings.timeout, 20)
         settings.max_total_requests = min(settings.max_total_requests, 30)
@@ -421,8 +423,27 @@ async def chat_message(card_id: str, payload: ChatRequest, background: Backgroun
         return {"collection": await start_chat_collection(
             answer["collection_request"], payload, user_id, background, repository, pipeline, collector,
         )}
+    last_id = turns[-1]["id"] if turns else None
+    if "refresh_request" in answer:
+        try:
+            public_url(card["website"])
+        except ValueError:
+            answer = {"text": "Для сбора нужен официальный сайт вуза. Укажите публичный адрес в карточке.",
+                      "sources": []}
+        else:
+            source_options = {"include_institution": True, "public_site_only": True}
+            identity = {"version": card["version"], **source_options}
+            key = f"chat-refresh:{user_id}:{payload.request_key}"
+            turn, job, created = checked(lambda: repository.save_chat_turn(
+                card_id, user_id, run_id, revision, last_id, payload.message, answer,
+                refresh=(key, identity),
+            ))
+            if created:
+                background.add_task(collect_job, repository, pipeline, collector, card, job["job_id"],
+                                    source_options=source_options)
+            return turn
     return checked(lambda: repository.save_chat_turn(
-        card_id, user_id, run_id, revision, turns[-1]["id"] if turns else None, payload.message, answer,
+        card_id, user_id, run_id, revision, last_id, payload.message, answer,
     ))
 
 
