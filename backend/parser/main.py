@@ -318,6 +318,17 @@ def _looks_like_table_name(value: str) -> bool:
     return True
 
 
+def _is_rector_position(position: str) -> bool:
+    """Должность ректора, в том числе с уточнением: «Ректор НГУ, ...»."""
+
+    lowered = normalize_whitespace(position or "").lower()
+    if "проректор" in lowered:
+        return False
+    return lowered.startswith(
+        ("ректор", "и.о. ректор", "и. о. ректор", "и.о.ректор")
+    )
+
+
 def _position_rank(position: str) -> int:
     lowered = (position or "").lower()
     # Явные проверки с границами слов: «ректор» не должен совпадать
@@ -2836,8 +2847,7 @@ class UniversityParser:
             (
                 item
                 for item in self._leadership
-                if normalize_whitespace(item.position or "").lower()
-                in {"ректор", "и.о. ректора", "и. о. ректора"}
+                if _is_rector_position(item.position or "")
             ),
             None,
         )

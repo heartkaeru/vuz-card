@@ -77,7 +77,9 @@ def pick_rector(card: Any) -> str | None:
 
     for leader in card.leadership:
         position = (leader.position or "").strip().lower()
-        if "ректор" not in position or "проректор" in position:
+        if "проректор" in position:
+            continue
+        if not position.startswith(("ректор", "и.о. ректор", "и. о. ректор", "и.о.ректор")):
             continue
         if not FIO_RE.match((leader.full_name or "").strip()):
             continue
