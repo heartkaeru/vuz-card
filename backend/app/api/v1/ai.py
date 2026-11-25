@@ -233,6 +233,10 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
     try:
         repository.update_job(job_id, status="running", progress=15, message="Сбор официальных страниц руководства")
         parsed = await asyncio.to_thread(collector, card["website"], card["name"], leadership_url, **(source_options or {}))
+        no_documents = not parsed.documents
+        documents_note = ""
+        if no_documents:
+            documents_note = (parsed.errors or parsed.warnings or ["нет документов"])[0]
         repository.update_job(job_id, progress=55, message="Страницы получены. Извлечение фактов из текстов")
         workflow = LLMWorkflow(repository, pipeline)
         research, _ = workflow.create(Institution(id=card["id"], name=card["name"], card_version=card["version"]),
@@ -243,6 +247,15 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
             "institution.education_areas", "institution.education_levels", "institution.students", "institution.structure"])
         if research.status == "failed" or not research.facts:
             stage_errors = [error.code for result in research.results.values() for error in result.errors]
+            if no_documents:
+                repository.update_job(
+                    job_id,
+                    status="failed",
+                    progress=100,
+                    message=f"Парсер не получил ни одного документа: {documents_note}",
+                    result={"run_id": research.run_id, "code": "no_source_documents"},
+                )
+                return
             repository.update_job(job_id, status="failed", progress=100, message="Не удалось извлечь проверяемые факты",
                                   result={"run_id": research.run_id, "code": stage_errors[0] if stage_errors else "no_valid_extraction"})
         else:
