@@ -885,6 +885,7 @@ class UniversityParser:
         self._documents: dict[str, SourceDocument] = {}
         self._leadership: list[Leadership] = []
         self._rector_profile_url: str = ""
+        self._broken_hosts: set[str] = set()
         self._contacts: list[Contact] = []
         self._contact_index: dict[tuple[str, str], Contact] = {}
         self._projects: list[Project] = []
@@ -1231,7 +1232,15 @@ class UniversityParser:
             if sitemap_url in visited:
                 continue
             visited.add(sitemap_url)
-            result = self.client.get(sitemap_url)
+            host = utils.urlparse(sitemap_url).netloc.lower()
+            if host in self._broken_hosts and self.settings.enable_playwright:
+                result = self._fallback_fetch(sitemap_url, "sitemap")
+            else:
+                result = self.client.get(sitemap_url)
+                if result is None and self.settings.enable_playwright:
+                    if "SSL" in (self.client.last_error or ""):
+                        self._broken_hosts.add(host)
+                    result = self._fallback_fetch(sitemap_url, "sitemap")
             if result is None:
                 continue
             locations = re.findall(
@@ -1393,9 +1402,17 @@ class UniversityParser:
             content_type = str(cached.get("content_type") or "text/html")
             LOGGER.info("CACHE %s", canonical)
         else:
-            result = self.client.get(canonical)
-            if result is None:
+            host = utils.urlparse(canonical).netloc.lower()
+            if host in self._broken_hosts and self.settings.enable_playwright:
+                # Хост уже не отдался обычному HTTP-клиенту: не тратим
+                # таймаут на каждую страницу, сразу идём через браузер.
                 result = self._fallback_fetch(canonical, section)
+            else:
+                result = self.client.get(canonical)
+                if result is None:
+                    if "SSL" in (self.client.last_error or ""):
+                        self._broken_hosts.add(host)
+                    result = self._fallback_fetch(canonical, section)
             if result is None:
                 message = (
                     f"{section}: {self.client.last_error or 'не удалось загрузить'} "
