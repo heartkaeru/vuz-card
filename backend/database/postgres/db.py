@@ -7,6 +7,16 @@ from psycopg.conninfo import conninfo_to_dict
 MIGRATION_DIR=Path(__file__).resolve().parents[3]/'supabase'/'migrations'
 # __file__ is backend/database/postgres/db.py: repository is parents[3].
 
+def migration_checksums(data):
+    normalized=data.replace(b'\r\n',b'\n').replace(b'\r',b'\n')
+    crlf=normalized.replace(b'\n',b'\r\n')
+    canonical=hashlib.sha256(normalized).hexdigest()
+    return canonical, {
+        canonical,
+        hashlib.sha256(data).hexdigest(),
+        hashlib.sha256(crlf).hexdigest(),
+    }
+
 def connect(dsn, *, application_name='vuz-card-migration', row_factory=None):
     try:
         options=conninfo_to_dict(dsn)
@@ -32,10 +42,10 @@ def migrate(conn, directory=MIGRATION_DIR):
         conn.execute("REVOKE ALL ON public.vuz_schema_migrations FROM PUBLIC")
         for path in sorted(Path(directory).glob('*.sql')):
             data=path.read_bytes()
-            checksum=hashlib.sha256(data).hexdigest()
+            checksum,checksums=migration_checksums(data)
             prior=conn.execute('SELECT sha256 FROM public.vuz_schema_migrations WHERE name=%s',(path.name,)).fetchone()
             if prior:
-                if prior[0]!=checksum:
+                if prior[0] not in checksums:
                     raise ValueError('Applied migration checksum changed: '+path.name)
                 continue
             conn.execute(data.decode('utf-8-sig'),prepare=False)
