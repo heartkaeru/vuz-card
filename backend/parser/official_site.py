@@ -85,6 +85,55 @@ NAME_STOPWORDS = {
     "директор",
 }
 
+_MORPH_TRIED = False
+_MORPH_ANALYZER = None
+
+
+def _morph_analyzer():
+    """Ленивая инициализация pymorphy3 (необязательная зависимость)."""
+
+    global _MORPH_TRIED, _MORPH_ANALYZER
+    if not _MORPH_TRIED:
+        _MORPH_TRIED = True
+        try:
+            import pymorphy3
+
+            _MORPH_ANALYZER = pymorphy3.MorphAnalyzer()
+        except Exception:  # noqa: BLE001 - морфология не критична
+            _MORPH_ANALYZER = None
+    return _MORPH_ANALYZER
+
+
+def _is_patronymic(word: str) -> bool:
+    morph = _morph_analyzer()
+    if morph is None:
+        return bool(re.search(r"(?:вич|вна|чна)$", word.lower()))
+    return any("Patr" in parsed.tag.grammemes for parsed in morph.parse(word))
+
+
+def _nominative(word: str) -> str:
+    """Возвращает ФИО-токен в именительном падеже, если это безопасно."""
+
+    morph = _morph_analyzer()
+    if morph is None or len(word) < 4:
+        return word
+    parses = [
+        parsed
+        for parsed in morph.parse(word)
+        if {"Surn", "Name", "Patr"} & parsed.tag.grammemes
+    ]
+    if not parses:
+        return word
+    if any("nomn" in parsed.tag.grammemes for parsed in parses):
+        return word
+    for parsed in parses:
+        if "anim" not in parsed.tag.grammemes:
+            continue
+        inflected = parsed.inflect({"nomn", "sing"})
+        if inflected is not None and inflected.word:
+            return inflected.word.capitalize()
+    return word
+
 
 class OfficialSiteDiscovery:
     """Находит сайт и страницу ректора без ручных ссылок."""
@@ -405,11 +454,11 @@ class OfficialSiteDiscovery:
     @staticmethod
     def _normalize_name(name: str) -> str:
         parts = name.split()
-        if len(parts) == 3 and re.search(
-            r"(?:вич|вна|чна)$", parts[1].lower()
-        ):
-            return f"{parts[2]} {parts[0]} {parts[1]}"
-        return name
+        if len(parts) == 3 and _is_patronymic(parts[1]):
+            parts = [parts[2], parts[0], parts[1]]
+        return " ".join(
+            _nominative(part) if len(part) > 2 else part for part in parts
+        )
 
     @staticmethod
     def _find_name(soup: BeautifulSoup, text: str) -> str:

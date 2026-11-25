@@ -194,9 +194,9 @@ LEADERSHIP_NOISE_RE = re.compile(
 
 POSITION_START_RE = re.compile(
     r"^\s*(?:и\.?\s*о\.?\s*)?(?:"
-    r"ректор|президент|проректор|директор|декан|заведующ|руководител|"
+    r"первый|ректор|президент|проректор|директор|декан|заведующ|руководител|"
     r"начальник|председател|заместител|научный\s+руководител|главный|"
-    r"управляющ|советник|министр|генеральный\s+директор"
+    r"управляющ|советник|министр|генеральный"
     r")",
     re.IGNORECASE,
 )
@@ -675,7 +675,7 @@ def _split_block_person(text: str) -> tuple[str, str]:
         if not names:
             return "", ""
         position = text.replace(names[0], " ", 1).strip(" ,;:—–-")
-        return names[0], position
+        return names[0], _clean_position(position)
 
     name = ""
     position = ""
@@ -692,7 +692,19 @@ def _split_block_person(text: str) -> tuple[str, str]:
     if not name:
         names = find_person_names(text)
         name = names[0] if names else ""
-    return name, position or text
+    return name, _clean_position(position or text)
+
+
+def _clean_position(position: str) -> str:
+    """Убирает из должности хвосты абзаца и пояснения в скобках."""
+
+    value = normalize_whitespace(position).split("|")[0].strip()
+    # Должность — короткая фраза; всё после точки с запятой или длинного
+    # пояснения относится к тексту страницы, а не к названию должности.
+    value = re.split(r";|\.\s", value)[0].strip()
+    if len(value) > 90:
+        value = re.split(r",\s", value)[0].strip() or value[:90].strip()
+    return value.strip(" ,;:—–-")
 
 
 # ----------------------------------------------------------------------
@@ -872,6 +884,7 @@ class UniversityParser:
         self._failed_urls: set[str] = set()
         self._documents: dict[str, SourceDocument] = {}
         self._leadership: list[Leadership] = []
+        self._rector_profile_url: str = ""
         self._contacts: list[Contact] = []
         self._contact_index: dict[tuple[str, str], Contact] = {}
         self._projects: list[Project] = []
@@ -1616,8 +1629,28 @@ class UniversityParser:
                     break
         return best_doc, best_soup
 
+    def _remember_rector_link(
+        self, soup: BeautifulSoup, page_url: str
+    ) -> None:
+        """Запоминает ссылку «Ректор» — из неё можно взять фото."""
+
+        if self._rector_profile_url:
+            return
+        for anchor in soup.select("a[href]"):
+            text = normalize_whitespace(anchor.get_text(" ", strip=True))
+            if not re.fullmatch(
+                r"\s*(?:и\.?\s*о\.?\s*)?ректор\s*", text, re.IGNORECASE
+            ):
+                continue
+            url = canonical_url(anchor.get("href", ""), page_url)
+            if url and is_same_domain(url, page_url):
+                self._rector_profile_url = url
+                return
+
     def _parse_leadership(self, doc: SourceDocument, soup: BeautifulSoup) -> None:
+        self._remember_rector_link(soup, doc.url)
         doc, soup = self._better_leadership_source(doc, soup)
+        self._remember_rector_link(soup, doc.url)
         table_parser = SvedenTableParser(doc.url)
         rows = table_parser.parse(soup)
         leaders: list[Leadership] = []
@@ -1632,7 +1665,7 @@ class UniversityParser:
 
         for row in rows:
             name = strip_name(row.get("name", ""))
-            position = normalize_whitespace(row.get("position", ""))
+            position = _clean_position(row.get("position", ""))
             if not _looks_like_table_name(name):
                 continue
             if not position and not row.get("email") and not row.get("phone"):
@@ -1806,6 +1839,10 @@ class UniversityParser:
             if index + 1 < len(blocks):
                 neighbours.append(blocks[index + 1].text)
             for neighbour in neighbours:
+                neighbour_text = normalize_whitespace(neighbour)
+                if POSITION_START_RE.match(neighbour_text):
+                    # Соседняя строка — уже другой руководитель, не склеиваем.
+                    continue
                 names = find_person_names(neighbour)
                 if names:
                     leaders.append(
@@ -2726,20 +2763,64 @@ class UniversityParser:
                 else {},
             )
 
+    def _enrich_rector_photo(self, rector: Leadership) -> None:
+        """Достаёт фото ректора со страницы профиля, найденной на сайте."""
+
+        fetcher = StealthFetcher(
+            timeout=min(self.settings.timeout, 25.0),
+            enable_playwright=self.settings.enable_playwright,
+        )
+        try:
+            profile = OfficialSiteDiscovery(fetcher).extract_rector(
+                self._rector_profile_url
+            )
+        except Exception as exc:  # noqa: BLE001 - фото не критично
+            LOGGER.warning("Не удалось прочитать профиль ректора: %s", exc)
+            profile = None
+        finally:
+            fetcher.close()
+        if profile is None:
+            return
+        if _name_key(profile.full_name) != _name_key(rector.full_name):
+            LOGGER.info(
+                "Профиль %s не совпал с ректором %s",
+                profile.full_name,
+                rector.full_name,
+            )
+            return
+        rector.photo_url = rector.photo_url or profile.photo_url
+        rector.bio = rector.bio or profile.bio
+        rector.reception_phone = rector.reception_phone or profile.reception_phone
+        rector.reception_email = rector.reception_email or profile.reception_email
+        if rector.photo_url:
+            LOGGER.info("Фото ректора найдено в профиле: %s", rector.full_name)
+
     def _enrich_rector_from_web(self) -> None:
         """Находит сайт/страницу ректора автоматически и добавляет запись."""
 
         if not self.settings.rector_lookup:
             return
-        for parsed in self._leadership:
-            position = normalize_whitespace(parsed.position or "").lower()
-            if position in {"ректор", "и.о. ректора", "и. о. ректора"} and parsed.photo_url:
+        parsed_rector = next(
+            (
+                item
+                for item in self._leadership
+                if normalize_whitespace(item.position or "").lower()
+                in {"ректор", "и.о. ректора", "и. о. ректора"}
+            ),
+            None,
+        )
+        if parsed_rector is not None:
+            if parsed_rector.photo_url:
                 # Ректор уже найден на официальном сайте — не перекрываем его
                 # результатом поиска, который может попасть на новость.
                 LOGGER.info(
-                    "Ректор уже найден на сайте: %s", parsed.full_name
+                    "Ректор уже найден на сайте: %s", parsed_rector.full_name
                 )
                 return
+            if self._rector_profile_url:
+                self._enrich_rector_photo(parsed_rector)
+                if parsed_rector.photo_url:
+                    return
         fetcher = StealthFetcher(
             timeout=min(self.settings.timeout, 25.0),
             enable_playwright=self.settings.enable_playwright,

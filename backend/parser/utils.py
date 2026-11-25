@@ -503,9 +503,55 @@ def find_photo(soup: object, base_url: str, full_name: str) -> str:
             add(str(link.get("href") or ""), "image_src", "link")
 
     if not candidates:
+        fallback = _content_image(soup, base_url)
+        if fallback:
+            return fallback
         return ""
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1]
+
+
+CONTENT_IMAGE_SKIP = (
+    "logo",
+    "icon",
+    "sprite",
+    "placeholder",
+    "blank",
+    "spacer",
+    "social",
+    "favicon",
+    "default_images",
+    "counter",
+    "banner",
+)
+
+
+def _content_image(soup: object, base_url: str) -> str:
+    """Главная картинка контента: портрет без alt на странице ректора."""
+
+    containers = soup.select(  # type: ignore[attr-defined]
+        "main, article, [class*=content], [class*=article], [class*=body]"
+    ) or [soup]
+    for container in containers:
+        for image in container.find_all("img"):  # type: ignore[attr-defined]
+            src = str(
+                image.get("data-src")
+                or image.get("data-original")
+                or image.get("src")
+                or ""
+            ).strip()
+            if not src:
+                continue
+            lowered = src.lower()
+            if any(marker in lowered for marker in CONTENT_IMAGE_SKIP):
+                continue
+            if not lowered.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                continue
+            alt = str(image.get("alt") or "").lower()
+            if "программа" in alt or "проект" in alt or "новост" in alt:
+                continue
+            return canonical_url(src, base_url)
+    return ""
 
 
 def extract_emails(text: str) -> list[str]:
