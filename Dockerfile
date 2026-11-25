@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 RUN curl -kfsSL https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt -w "\n" >> "$(python -m certifi)"
 
 COPY backend /app/backend
+COPY supabase /app/supabase
 
 WORKDIR /app/backend
 EXPOSE 8000
