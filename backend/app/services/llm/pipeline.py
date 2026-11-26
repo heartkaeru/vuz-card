@@ -71,6 +71,28 @@ def chunks(text: str, size: int, overlap: int):
         start = end - overlap
 
 
+async def complete_validated(provider, model, prompt, payload, schema, attempts: int = 2):
+    """Запрашивает JSON и повторяет попытку, если модель вернула мусор.
+
+    GigaChat периодически отдаёт обрезанный или невалидный JSON; повтор почти
+    всегда проходит, а без него целый чанк теряется.
+    """
+
+    last_exc: Exception | None = None
+    validation_exc: Exception | None = None
+    for _ in range(max(1, attempts)):
+        try:
+            raw = await provider.complete(prompt, payload, schema)
+            return model.model_validate_json(raw)
+        except ValidationError as exc:
+            validation_exc = validation_exc or exc
+            last_exc = exc
+        except LLMError as exc:
+            last_exc = validation_exc or exc
+    assert last_exc is not None
+    raise last_exc
+
+
 class AssistantPipeline:
     def __init__(self, provider: JSONProvider, *, chunk_size: int = 12000,
                  overlap: int = 1000, max_chunks: int = 50, review_window_days: int = REVIEW_WINDOW_DAYS):
@@ -114,8 +136,13 @@ class AssistantPipeline:
                                  "chunk_id": chunk_id, "text": text},
                 }
                 try:
-                    raw = await self.provider.complete(prompt, payload, ExtractionOutput.model_json_schema())
-                    output = ExtractionOutput.model_validate_json(raw)
+                    output = await complete_validated(
+                        self.provider,
+                        ExtractionOutput,
+                        prompt,
+                        payload,
+                        ExtractionOutput.model_json_schema(),
+                    )
                 except (ValidationError, LLMError) as exc:
                     errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                                 code=str(exc) if isinstance(exc, LLMError)

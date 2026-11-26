@@ -42,7 +42,7 @@ def batches(fragments, size):
 
 
 async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
-    from .pipeline import PROMPTS
+    from .pipeline import PROMPTS, complete_validated
 
     # Recheck offsets and scopes even if a caller mutated an existing Pydantic object.
     request = FragmentExtractionRequest.model_validate(request.model_dump(mode="python"))
@@ -88,8 +88,13 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
                 } for f in batch],
             }
             try:
-                raw = await pipeline.provider.complete(prompt, payload, schema)
-                output = FragmentExtractionOutput.model_validate_json(raw)
+                output = await complete_validated(
+                    pipeline.provider,
+                    FragmentExtractionOutput,
+                    prompt,
+                    payload,
+                    schema,
+                )
             except (ValidationError, LLMError) as exc:
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                             code=str(exc) if isinstance(exc, LLMError)

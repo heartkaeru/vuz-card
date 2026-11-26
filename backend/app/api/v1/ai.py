@@ -68,8 +68,10 @@ def get_repository():
 
 def get_pipeline():
     try:
-        return AssistantPipeline(GigaChatProvider(GigaChatSettings.from_env()), chunk_size=4000,
-                                 overlap=400, max_chunks=6)
+        # Меньшие чанки: GigaChat обрезает длинный JSON и теряет факты
+        # (проверено на МГУ: 0 фактов при 4000 символов, 19 при 2000).
+        return AssistantPipeline(GigaChatProvider(GigaChatSettings.from_env()), chunk_size=2000,
+                                 overlap=200, max_chunks=16)
     except ConfigurationError:
         raise HTTPException(503, "gigachat_configuration_required") from None
 
