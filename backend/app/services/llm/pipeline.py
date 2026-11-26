@@ -105,7 +105,9 @@ async def complete_validated(provider, model, prompt, payload, schema, attempts:
             except ValidationError:
                 # Модель иногда вставляет неэкранированные кавычки в значения
                 # и путает закрывающие скобки: [ "id" } вместо [ "id" ].
-                repaired = _balance_brackets(_escape_inner_quotes(cleaned))
+                repaired = _balance_brackets(
+                    _fix_unclosed_keys(_escape_inner_quotes(cleaned))
+                )
                 try:
                     return model.model_validate_json(repaired)
                 except ValidationError:
@@ -123,6 +125,16 @@ async def complete_validated(provider, model, prompt, payload, schema, attempts:
                 break
     assert last_exc is not None
     raise last_exc
+
+
+def _fix_unclosed_keys(text: str) -> str:
+    """Чинит ключ без закрывающей кавычки: "value_fragment_id: null"."""
+
+    return re.sub(
+        r'"([A-Za-z_][A-Za-z0-9_]*):\s*(null|true|false|-?\d+(?:\.\d+)?)"',
+        r'"\1": \2',
+        text,
+    )
 
 
 def _balance_brackets(text: str) -> str:
