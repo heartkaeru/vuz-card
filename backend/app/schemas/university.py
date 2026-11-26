@@ -47,6 +47,9 @@ class UniversityBase(BaseModel):
     website: str = Field(..., description="Официальный сайт")
     region: str = Field(..., description="Субъект РФ")
     city: str = Field(..., description="Город")
+    profile: Optional[str] = Field(None, description="Профиль учреждения")
+    institution_type: Literal["university", "spo", "mixed", "unknown"] = "unknown"
+    photo_url: Optional[str] = None
     rector_fio: Optional[str] = Field(None, description="ФИО действующего ректора")
     version: int = Field(default=1, description="Версия карточки для оптимистичной блокировки")
     updated_at: str = Field(..., description="Дата последнего обновления данных")

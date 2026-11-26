@@ -42,11 +42,11 @@ def _async_engine(dsn: str | None = None) -> AsyncEngine:
     query = dict(url.query)
     sslmode = query.pop("sslmode", None)
     if url.drivername in {"postgres", "postgresql"}:
-        url = url.set(drivername="postgresql+asyncpg", query={})
+        url = url.set(drivername="postgresql+asyncpg", query=query)
     elif url.drivername != "postgresql+asyncpg":
         raise RuntimeError("DATABASE_URL must use PostgreSQL")
     else:
-        url = url.set(query={})
+        url = url.set(query=query)
     connect_args = {"prepared_statement_cache_size": 0}
     if sslmode and sslmode != "disable":
         connect_args["ssl"] = "require" if sslmode in {"require", "allow", "prefer"} else True
@@ -103,6 +103,7 @@ class SupabaseUniversityRepository:
             SELECT u.id::text AS id, u.name, COALESCE(u.short_name,u.name) AS short_name,
                    COALESCE(le.inn,u.reported_inn,'') AS inn, COALESCE(u.website,'') AS website,
                    COALESCE(u.region,'') AS region, COALESCE(u.city,'') AS city,
+                   u.profile,u.institution_type,u.photo_url,
                    (SELECT o.full_name FROM public.vuz_officials o
                     WHERE o.university_id=u.id AND o.position ILIKE '%ректор%'
                       AND o.position NOT ILIKE '%проректор%' AND o.appointment_status='current'
@@ -129,6 +130,7 @@ class SupabaseUniversityRepository:
                 SELECT u.id::text AS id, u.name, COALESCE(u.short_name,u.name) AS short_name,
                        COALESCE(le.inn,u.reported_inn,'') AS inn, COALESCE(u.website,'') AS website,
                        COALESCE(u.region,'') AS region, COALESCE(u.city,'') AS city,
+                       u.profile,u.institution_type,u.photo_url,
                        (SELECT o.full_name FROM public.vuz_officials o WHERE o.university_id=u.id
                         AND o.position ILIKE '%ректор%' AND o.position NOT ILIKE '%проректор%'
                         AND o.appointment_status='current' ORDER BY o.verification_status='verified' DESC LIMIT 1) AS rector_fio,
@@ -468,12 +470,34 @@ class SupabaseUniversityRepository:
 
             applied = 0
             people: dict[str, dict] = {}
+            normalized_fields = {
+                "institution.profile", "institution.type", "institution.students",
+                "appointment.position", "appointment.department", "appointment.responsibilities",
+                "appointment.status", "contact.email", "contact.phone",
+            }
             for fact in facts:
                 field = str(fact.get("field", ""))
                 value = str(fact.get("value", "")).strip()
                 evidence = fact.get("evidence") or []
                 source_url = evidence[0].get("url") if evidence else None
                 subject = fact.get("subject") or {}
+                if field not in normalized_fields and field and value:
+                    fact_source = await _source_id(
+                        conn, actor_type, actor_label,
+                        {"fact_id": fact.get("fact_id"), "field": field, "value": value}, source_url,
+                    )
+                    await conn.execute(text("""
+                        INSERT INTO public.vuz_legacy_fields
+                          (id,university_id,source_id,source_key,field_name,value,reason)
+                        VALUES (CAST(:id AS uuid),CAST(:uid AS uuid),CAST(:source_id AS uuid),
+                                :source_key,:field,CAST(:value AS jsonb),:reason)
+                        ON CONFLICT(source_id,source_key,field_name) DO UPDATE
+                          SET value=EXCLUDED.value,reason=EXCLUDED.reason
+                    """), {"id": uuid4(), "uid": _uuid(university_id), "source_id": fact_source,
+                            "source_key": str(fact.get("fact_id") or uuid4()), "field": field,
+                            "value": json.dumps(value, ensure_ascii=False),
+                            "reason": f"Approved fact; actor={actor_label[:160]}"})
+                    applied += 1
                 if field == "institution.profile" and value:
                     await conn.execute(text("UPDATE public.vuz_universities SET profile=:value WHERE id=CAST(:id AS uuid)"),
                                        {"id": _uuid(university_id), "value": value})

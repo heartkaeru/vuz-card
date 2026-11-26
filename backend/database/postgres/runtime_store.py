@@ -3,6 +3,7 @@
 import os
 from contextlib import closing
 from pathlib import Path
+from uuid import UUID
 
 from app.services.llm.workflow_models import WorkflowError
 from database.postgres.api_repository import (
@@ -159,7 +160,14 @@ class SupabaseDemoRepository:
         local_exists = self._local.has_card(card_id)
         if local_exists:
             self._local.ensure_card_deletable(card_id)
-        registry_deleted = await self._registry.delete_card(card_id, actor=actor)
+        registry_card_id = await self.resolve_registry_id(card_id)
+        try:
+            UUID(registry_card_id)
+            valid_registry_id = True
+        except (ValueError, TypeError, AttributeError):
+            valid_registry_id = False
+        registry_deleted = (await self._registry.delete_card(registry_card_id, actor=actor)
+                            if valid_registry_id else False)
         local_deleted = self._local.delete_card(card_id, actor=actor) if local_exists else False
         if not registry_deleted and not local_deleted:
             raise WorkflowError("card_not_found")
