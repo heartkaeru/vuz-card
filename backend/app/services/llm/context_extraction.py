@@ -73,7 +73,7 @@ def batches(document, size):
 
 
 async def extract_context(pipeline, request: ContextExtractionRequest):
-    from .pipeline import PROMPTS
+    from .pipeline import PROMPTS, complete_validated
 
     request = ContextExtractionRequest.model_validate_json(request.model_dump_json())
     prompt = (PROMPTS / "extract_context.txt").read_text(encoding="utf-8")
@@ -128,8 +128,13 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                 definition["properties"]["value_fragment_id"] = {"type": "string", "enum": list(fragments)}
                 definition["required"].append("value_fragment_id")
             try:
-                raw = await pipeline.provider.complete(prompt, payload, schema)
-                output = ContextExtractionOutput.model_validate_json(raw)
+                output = await complete_validated(
+                    pipeline.provider,
+                    ContextExtractionOutput,
+                    prompt,
+                    payload,
+                    schema,
+                )
             except (LLMError, ValidationError) as exc:
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                             code=str(exc) if isinstance(exc, LLMError)

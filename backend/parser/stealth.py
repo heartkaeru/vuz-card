@@ -52,6 +52,21 @@ class StealthResponse:
     final_url: str = ""
 
 
+SCRIPT_STYLE_RE = re.compile(
+    r"<(script|style|noscript)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL
+)
+TAG_RE = re.compile(r"<[^>]+>")
+SPACE_RE = re.compile(r"\s+")
+
+
+def visible_text_length(html: str) -> int:
+    """Приблизительная длина видимого текста (без скриптов, стилей и тегов)."""
+
+    text = SCRIPT_STYLE_RE.sub(" ", html or "")
+    text = TAG_RE.sub(" ", text)
+    return len(SPACE_RE.sub(" ", text).strip())
+
+
 def _decode(content: bytes, content_type: str) -> str:
     # charset_normalizer точнее угадывает windows-1251/UTF-8, когда сервер
     # присылает неверный Content-Type.
@@ -137,6 +152,20 @@ class StealthFetcher:
             if rendered.status_code and rendered.text:
                 return rendered
 
+        if (
+            self.enable_playwright
+            and status < 400
+            and visible_text_length(text) < 400
+        ):
+            # SPA-сайты (например, МГУ на SvelteKit) отдают пустую оболочку:
+            # весь контент дорисовывается в браузере.
+            LOGGER.info("%s: пустая HTML-оболочка, рендерю через Playwright", url)
+            rendered = self._playwright_get(url, timeout)
+            if rendered.status_code and visible_text_length(
+                rendered.text
+            ) > visible_text_length(text):
+                return rendered
+
         return StealthResponse(
             url, status, text, content_type, final_url=str(response.url)
         )
@@ -166,7 +195,18 @@ class StealthFetcher:
                 )
                 context.add_init_script(STEALTH_SCRIPT)
                 page = context.new_page()
-                page.goto(url, timeout=int(timeout * 1000), wait_until="domcontentloaded")
+                try:
+                    page.goto(
+                        url,
+                        timeout=int(timeout * 1000),
+                        wait_until="networkidle",
+                    )
+                except Exception:
+                    page.goto(
+                        url,
+                        timeout=int(timeout * 1000),
+                        wait_until="domcontentloaded",
+                    )
                 page.wait_for_timeout(1500)
                 html = page.content()
                 browser.close()

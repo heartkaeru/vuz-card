@@ -31,7 +31,7 @@ class GigaChatSettings:
     credentials: str = field(repr=False)
     model: str
     scope: str
-    base_url: str = "https://api.giga.chat/v1"
+    base_url: str = "https://gigachat.devices.sberbank.ru/api/v1"
     timeout: float = 60
     max_retries: int = 2
     max_output_tokens: int = 4096
@@ -52,7 +52,7 @@ class GigaChatSettings:
                 credentials=os.getenv("GIGACHAT_CREDENTIALS", ""),
                 model=os.getenv("GIGACHAT_MODEL", ""),
                 scope=os.getenv("GIGACHAT_SCOPE", ""),
-                base_url=os.getenv("GIGACHAT_BASE_URL", "https://api.giga.chat/v1"),
+                base_url=os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru/api/v1"),
                 timeout=float(os.getenv("GIGACHAT_TIMEOUT", "60")),
                 max_retries=int(os.getenv("GIGACHAT_MAX_RETRIES", "2")),
                 max_output_tokens=int(os.getenv("GIGACHAT_MAX_OUTPUT_TOKENS", "4096")),

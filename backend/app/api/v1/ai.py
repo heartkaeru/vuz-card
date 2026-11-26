@@ -68,8 +68,11 @@ def get_repository():
 
 def get_pipeline():
     try:
-        return AssistantPipeline(GigaChatProvider(GigaChatSettings.from_env()), chunk_size=4000,
-                                 overlap=400, max_chunks=6)
+        # 2000 для контекстных полей (GigaChat обрезает длинный JSON), 4000 для
+        # фрагментов руководства (там крупные фрагменты и меньше фактов).
+        return AssistantPipeline(GigaChatProvider(GigaChatSettings.from_env()), chunk_size=2000,
+                                 overlap=200, max_chunks=32, max_fragment_size=4000,
+                                 fragment_chunk_size=4000)
     except ConfigurationError:
         raise HTTPException(503, "gigachat_configuration_required") from None
 
@@ -85,6 +88,8 @@ def get_collector():
         settings.max_total_requests = min(settings.max_total_requests, 30)
         settings.fetch_item_pages = False
         settings.max_bios = min(settings.max_bios, 3)
+        # SvelteKit-сайты (например, МГУ) отдают пустой HTML без браузера.
+        settings.enable_playwright = True
         # A refresh must attempt the live source, not silently refresh cached dates.
         settings.use_cache = False
         client = HttpClient(settings, session=public_site_session()) if public_site_only else None
@@ -129,7 +134,12 @@ def get_collector():
 class CardCreate(StrictModel):
     name: str = Field(min_length=1, max_length=300)
     city: str = Field(default="", max_length=160)
-    website: HttpUrl
+    website: HttpUrl | None = None
+
+    @field_validator("website", mode="before")
+    @classmethod
+    def blank_website(cls, value):
+        return value or None
 
 
 class CardIntakeCreate(StrictModel):
@@ -226,6 +236,10 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
     try:
         repository.update_job(job_id, status="running", progress=15, message="Сбор официальных страниц руководства")
         parsed = await asyncio.to_thread(collector, card["website"], card["name"], leadership_url, **(source_options or {}))
+        no_documents = not parsed.documents
+        documents_note = ""
+        if no_documents:
+            documents_note = (parsed.errors or parsed.warnings or ["нет документов"])[0]
         repository.update_job(job_id, progress=55, message="Страницы получены. Извлечение фактов из текстов")
         workflow = LLMWorkflow(repository, pipeline)
         research, _ = workflow.create(Institution(id=card["id"], name=card["name"], card_version=card["version"]),
@@ -236,6 +250,15 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
             "institution.education_areas", "institution.education_levels", "institution.students", "institution.structure"])
         if research.status == "failed" or not research.facts:
             stage_errors = [error.code for result in research.results.values() for error in result.errors]
+            if no_documents:
+                repository.update_job(
+                    job_id,
+                    status="failed",
+                    progress=100,
+                    message=f"Парсер не получил ни одного документа: {documents_note}",
+                    result={"run_id": research.run_id, "code": "no_source_documents"},
+                )
+                return
             repository.update_job(job_id, status="failed", progress=100, message="Не удалось извлечь проверяемые факты",
                                   result={"run_id": research.run_id, "code": stage_errors[0] if stage_errors else "no_valid_extraction"})
         else:
@@ -298,7 +321,13 @@ async def list_cards(repository=Depends(get_repository)):
 
 @router.post("/cards", status_code=201)
 async def create_card(payload: CardCreate, repository=Depends(get_repository)):
-    return await checked_async(lambda: repository.create_card(payload.name, payload.city, str(payload.website).rstrip("/")))
+    # Ссылку можно не передавать: официальный сайт находится по названию.
+    website = await resolve_intake_website(
+        payload.name, str(payload.website) if payload.website else None
+    )
+    return await checked_async(
+        lambda: repository.create_card(payload.name, payload.city, website)
+    )
 
 
 @router.delete("/cards/{card_id}", status_code=204, summary="Полностью удалить карточку и связанные данные")

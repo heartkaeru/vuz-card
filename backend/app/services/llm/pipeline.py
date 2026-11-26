@@ -1,6 +1,7 @@
 """Extraction produces review candidates; drafting accepts only reviewed facts."""
 
 import hashlib
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -71,16 +72,231 @@ def chunks(text: str, size: int, overlap: int):
         start = end - overlap
 
 
+REPAIR_PROMPT = (
+    "Ты исправляешь повреждённый JSON. Верни ТОЛЬКО исправленный JSON-объект "
+    "по той же схеме, без markdown и пояснений. Не добавляй новых фактов: "
+    "сохрани все элементы, которые уже есть, и корректно закрой массивы."
+)
+
+
+async def complete_validated(provider, model, prompt, payload, schema, attempts: int = 3):
+    """Запрашивает JSON и чинит ответ, если модель сломала формат.
+
+    GigaChat периодически путает скобки и кавычки. Сначала пробуем локальные
+    исправления, затем просим модель переписать свой же JSON, затем спасаем
+    корректные факты из начала ответа.
+    """
+
+    last_exc: Exception | None = None
+    validation_exc: Exception | None = None
+    previous_raw = ""
+    for attempt in range(max(1, attempts)):
+        try:
+            if attempt == 0 or not previous_raw:
+                raw = await provider.complete(prompt, payload, schema)
+            else:
+                raw = await provider.complete(
+                    REPAIR_PROMPT, {"broken_json": previous_raw}, schema
+                )
+            previous_raw = raw
+            cleaned = _strip_code_fence(raw)
+            try:
+                return model.model_validate_json(cleaned)
+            except ValidationError:
+                # Модель иногда вставляет неэкранированные кавычки в значения
+                # и путает закрывающие скобки: [ "id" } вместо [ "id" ].
+                repaired = _balance_brackets(
+                    _fix_unclosed_keys(_escape_inner_quotes(cleaned))
+                )
+                try:
+                    return model.model_validate_json(repaired)
+                except ValidationError:
+                    salvaged = _salvage_payload(repaired, model)
+                    if salvaged is not None:
+                        return model.model_validate(salvaged)
+                    raise
+        except ValidationError as exc:
+            validation_exc = validation_exc or exc
+            last_exc = exc
+        except LLMError as exc:
+            last_exc = validation_exc or exc
+            if attempt >= 1 and validation_exc is None:
+                # Транспортные/оборванные ответы второй раз обычно не лечатся.
+                break
+    assert last_exc is not None
+    raise last_exc
+
+
+def _fix_unclosed_keys(text: str) -> str:
+    """Чинит ключ без закрывающей кавычки: "value_fragment_id: null"."""
+
+    return re.sub(
+        r'"([A-Za-z_][A-Za-z0-9_]*):\s*(null|true|false|-?\d+(?:\.\d+)?)"',
+        r'"\1": \2',
+        text,
+    )
+
+
+def _balance_brackets(text: str) -> str:
+    """Исправляет перепутанные закрывающие скобки и незакрытые контейнеры."""
+
+    out: list[str] = []
+    stack: list[str] = []
+    in_string = False
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if char == "\\" and index + 1 < length:
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+        elif char in "[{":
+            stack.append(char)
+            out.append(char)
+        elif char in "]}":
+            wanted = "{" if char == "}" else "["
+            if stack and stack[-1] != wanted:
+                out.append("}" if stack[-1] == "{" else "]")
+                stack.pop()
+            else:
+                out.append(char)
+                if stack:
+                    stack.pop()
+        else:
+            out.append(char)
+        index += 1
+    if in_string:
+        out.append('"')
+    for opener in reversed(stack):
+        out.append("]" if opener == "[" else "}")
+    return "".join(out)
+
+
+def _salvage_payload(text: str, model):
+    """Собирает валидные факты из ответа, у которого испорчен хвост."""
+
+    facts = _scan_complete_objects(text)
+    if not facts:
+        return None
+    fields = getattr(model, "model_fields", {})
+    payload: dict[str, object] = {}
+    if "facts" in fields:
+        payload["facts"] = facts
+    if "gaps" in fields:
+        payload["gaps"] = []
+    return payload or None
+
+
+def _scan_complete_objects(text: str) -> list[dict]:
+    """Читает объекты массива facts до первого невалидного."""
+
+    match = re.search(r'"facts"\s*:\s*\[', text)
+    if not match:
+        return []
+    index = match.end()
+    depth = 0
+    start: int | None = None
+    collected: list[dict] = []
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == '"':
+            index += 1
+            while index < length and text[index] != '"':
+                if text[index] == "\\":
+                    index += 1
+                index += 1
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                chunk = _escape_inner_quotes(text[start : index + 1])
+                chunk = _balance_brackets(chunk)
+                try:
+                    collected.append(json.loads(chunk))
+                except ValueError:
+                    return collected
+                start = None
+        index += 1
+    return collected
+
+
+def _escape_inner_quotes(text: str) -> str:
+    """Экранирует кавычки внутри строковых значений JSON."""
+
+    out: list[str] = []
+    in_string = False
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if not in_string:
+            out.append(char)
+            if char == '"':
+                in_string = True
+            index += 1
+            continue
+        if char == "\\" and index + 1 < length:
+            out.append(char)
+            out.append(text[index + 1])
+            index += 2
+            continue
+        if char == '"':
+            lookahead = index + 1
+            while lookahead < length and text[lookahead] in " \t\r\n":
+                lookahead += 1
+            if lookahead >= length or text[lookahead] in ",}]:":
+                out.append(char)
+                in_string = False
+            else:
+                out.append('\\"')
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _strip_code_fence(raw: str) -> str:
+    """Убирает ```json ... ``` и текст вокруг JSON-объекта."""
+
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start : end + 1]
+    return text
+
+
 class AssistantPipeline:
     def __init__(self, provider: JSONProvider, *, chunk_size: int = 12000,
-                 overlap: int = 1000, max_chunks: int = 50, review_window_days: int = REVIEW_WINDOW_DAYS):
+                 overlap: int = 1000, max_chunks: int = 50, review_window_days: int = REVIEW_WINDOW_DAYS,
+                 max_fragment_size: int = 4000, fragment_chunk_size: int | None = None):
         if (chunk_size < 100 or not 0 <= overlap < chunk_size // 2
-                or max_chunks < 1 or review_window_days < 1):
+                or max_chunks < 1 or review_window_days < 1
+                or max_fragment_size < 100):
             raise ValueError("Invalid chunk limits")
         self.provider = provider
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.max_chunks = max_chunks
+        self.max_fragment_size = max_fragment_size
+        self.fragment_chunk_size = fragment_chunk_size or chunk_size
         self.review_window_days = review_window_days
 
     def run_info(self, prompt_version: str) -> RunInfo:
@@ -90,6 +306,35 @@ class AssistantPipeline:
     async def extract_facts(self, request: ExtractionRequest | ContextExtractionRequest) -> ExtractionResult:
         if request.schema_version == "0.3":
             from .context_extraction import extract_context
+
+            fields = getattr(request, "fields", None)
+            if fields and len(fields) > 3:
+                # Один запрос на 8 полей GigaChat обрывает; режем на группы.
+                results = []
+                for start in range(0, len(fields), 3):
+                    group = fields[start : start + 3]
+                    allowed = {field.value for field in group}
+                    part = request.model_copy(update={"fields": group})
+                    result = await extract_context(self, part)
+                    result = result.model_copy(
+                        update={
+                            "facts": [
+                                fact for fact in result.facts
+                                if fact.field.value in allowed
+                            ]
+                        }
+                    )
+                    results.append(result)
+                return results[0].model_copy(
+                    update={
+                        "facts": [fact for result in results for fact in result.facts],
+                        "gaps": list(dict.fromkeys(
+                            gap for result in results for gap in result.gaps
+                        )),
+                        "errors": [error for result in results for error in result.errors],
+                        "complete": all(result.complete for result in results),
+                    }
+                )
             return await extract_context(self, request)
         if request.schema_version == "0.2":
             from .fragment_extraction import extract_with_fragments
@@ -114,8 +359,13 @@ class AssistantPipeline:
                                  "chunk_id": chunk_id, "text": text},
                 }
                 try:
-                    raw = await self.provider.complete(prompt, payload, ExtractionOutput.model_json_schema())
-                    output = ExtractionOutput.model_validate_json(raw)
+                    output = await complete_validated(
+                        self.provider,
+                        ExtractionOutput,
+                        prompt,
+                        payload,
+                        ExtractionOutput.model_json_schema(),
+                    )
                 except (ValidationError, LLMError) as exc:
                     errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                                 code=str(exc) if isinstance(exc, LLMError)

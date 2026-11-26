@@ -42,7 +42,7 @@ def batches(fragments, size):
 
 
 async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
-    from .pipeline import PROMPTS
+    from .pipeline import PROMPTS, complete_validated
 
     # Recheck offsets and scopes even if a caller mutated an existing Pydantic object.
     request = FragmentExtractionRequest.model_validate(request.model_dump(mode="python"))
@@ -55,12 +55,12 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
         by_id = {f.fragment_id: f for f in document.fragments}
         eligible = []
         for fragment in sorted(document.fragments, key=lambda f: f.start):
-            if fragment.end - fragment.start > pipeline.chunk_size:
+            if fragment.end - fragment.start > pipeline.max_fragment_size:
                 errors.append(PipelineError(source_id=document.source_id,
                                             chunk_id=fragment.fragment_id, code="fragment_too_large"))
             else:
                 eligible.append(fragment)
-        for batch in batches(eligible, pipeline.chunk_size):
+        for batch in batches(eligible, pipeline.fragment_chunk_size):
             chunk_id = f"{document.source_id}:{batch[0].start}-{batch[-1].end}"
             if processed >= pipeline.max_chunks:
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
@@ -88,8 +88,13 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
                 } for f in batch],
             }
             try:
-                raw = await pipeline.provider.complete(prompt, payload, schema)
-                output = FragmentExtractionOutput.model_validate_json(raw)
+                output = await complete_validated(
+                    pipeline.provider,
+                    FragmentExtractionOutput,
+                    prompt,
+                    payload,
+                    schema,
+                )
             except (ValidationError, LLMError) as exc:
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                             code=str(exc) if isinstance(exc, LLMError)

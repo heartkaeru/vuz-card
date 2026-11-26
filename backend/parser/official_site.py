@@ -64,8 +64,75 @@ RECTOR_LINK_RE = re.compile(
     r"ректор|rector|руководств|management|administration|администрац",
     re.IGNORECASE,
 )
-RECTOR_TITLE_RE = re.compile(r"ректор|rector", re.IGNORECASE)
+RECTOR_TITLE_RE = re.compile(r"(?<!ди)ректор|rector", re.IGNORECASE)
+# «Форумы ректоров», «совет ректоров» — не страница ректора.
+RECTOR_PLURAL_RE = re.compile(r"ректор(?:ов|ам|ами|ах|ы)\b", re.IGNORECASE)
+RECTOR_WHOLE_RE = re.compile(r"\bректор\b", re.IGNORECASE)
 ACTING_RE = re.compile(r"и\.?\s*о\.?\s*ректор|исполняющ[а-яё]*\s+обязанност", re.I)
+# Слова интерфейса, которые не могут быть частью ФИО.
+NAME_STOPWORDS = {
+    "поиск",
+    "русский",
+    "английский",
+    "english",
+    "версия",
+    "меню",
+    "главная",
+    "новости",
+    "контакты",
+    "ректор",
+    "проректор",
+    "директор",
+}
+
+_MORPH_TRIED = False
+_MORPH_ANALYZER = None
+
+
+def _morph_analyzer():
+    """Ленивая инициализация pymorphy3 (необязательная зависимость)."""
+
+    global _MORPH_TRIED, _MORPH_ANALYZER
+    if not _MORPH_TRIED:
+        _MORPH_TRIED = True
+        try:
+            import pymorphy3
+
+            _MORPH_ANALYZER = pymorphy3.MorphAnalyzer()
+        except Exception:  # noqa: BLE001 - морфология не критична
+            _MORPH_ANALYZER = None
+    return _MORPH_ANALYZER
+
+
+def _is_patronymic(word: str) -> bool:
+    morph = _morph_analyzer()
+    if morph is None:
+        return bool(re.search(r"(?:вич|вна|чна)$", word.lower()))
+    return any("Patr" in parsed.tag.grammemes for parsed in morph.parse(word))
+
+
+def _nominative(word: str) -> str:
+    """Возвращает ФИО-токен в именительном падеже, если это безопасно."""
+
+    morph = _morph_analyzer()
+    if morph is None or len(word) < 4:
+        return word
+    parses = [
+        parsed
+        for parsed in morph.parse(word)
+        if {"Surn", "Name", "Patr"} & parsed.tag.grammemes
+    ]
+    if not parses:
+        return word
+    if any("nomn" in parsed.tag.grammemes for parsed in parses):
+        return word
+    for parsed in parses:
+        if "anim" not in parsed.tag.grammemes:
+            continue
+        inflected = parsed.inflect({"nomn", "sing"})
+        if inflected is not None and inflected.word:
+            return inflected.word.capitalize()
+    return word
 
 
 class OfficialSiteDiscovery:
@@ -122,31 +189,105 @@ class OfficialSiteDiscovery:
         if probed:
             return probed
 
-        response = self.fetcher.get(site_url)
-        if response.text:
-            soup = BeautifulSoup(response.text, "lxml")
-            candidates: list[tuple[int, str]] = []
+        homepage = self._fetch_soup(site_url)
+        found = self._scan_page_for_rector(homepage, site_url, 12)
+        if found:
+            return found
+
+        # Ссылку «Ректор» часто держат на официальной странице структуры.
+        for page_url in self._structure_pages(homepage, site_url):
+            if page_url == site_url:
+                continue
+            structure = self._fetch_soup(page_url)
+            found = self._scan_page_for_rector(structure, site_url, 0)
+            if found:
+                return found
+
+        found = self._scan_page_for_rector(homepage, site_url, 0)
+        if found:
+            return found
+
+        host = urlparse(site_url).netloc
+        for url, title in self._search(f"site:{host} ректор"):
+            if not is_same_domain(url, site_url):
+                continue
+            if "проректор" in f"{url} {title}".lower():
+                continue
+            return url
+        return ""
+
+    def _fetch_soup(self, url: str) -> BeautifulSoup | None:
+        response = self.fetcher.get(url)
+        if not response.text:
+            return None
+        return BeautifulSoup(response.text, "lxml")
+
+    def _structure_pages(
+        self, soup: BeautifulSoup | None, site_url: str
+    ) -> list[str]:
+        pages: list[str] = [site_url.rstrip("/") + "/sveden/struct/"]
+        if soup is not None:
             for anchor in soup.select("a[href]"):
                 href = anchor.get("href", "")
-                text = normalize_whitespace(anchor.get_text(" ", strip=True))
-                haystack = f"{href} {text}".lower()
-                if "проректор" in haystack or "prorector" in haystack:
-                    score = 2
-                elif RECTOR_TITLE_RE.search(haystack):
-                    score = 12
-                elif "руководств" in haystack or "management" in haystack:
-                    score = 6
-                elif "администрац" in haystack or "administration" in haystack:
-                    score = 4
-                else:
+                text = normalize_whitespace(
+                    anchor.get_text(" ", strip=True)
+                ).lower()
+                lowered = href.lower()
+                if not (
+                    "структура и органы управления" in text
+                    or "sveden/struct" in lowered
+                    or re.search(r"/(?:official/)?struct(?:ure)?/?$", lowered)
+                ):
                     continue
                 absolute = canonical_url(href, site_url)
-                if not is_same_domain(absolute, site_url):
-                    continue
-                candidates.append((score, absolute))
-            if candidates:
-                candidates.sort(key=lambda item: (-item[0], len(item[1])))
-                return candidates[0][1]
+                if is_same_domain(absolute, site_url) and absolute not in pages:
+                    pages.append(absolute)
+        return pages
+
+    def _scan_page_for_rector(
+        self, soup: BeautifulSoup | None, site_url: str, min_score: int = 0
+    ) -> str:
+        if soup is None:
+            return ""
+        candidates: list[tuple[int, str]] = []
+        for anchor in soup.select("a[href]"):
+            href = anchor.get("href", "")
+            text = normalize_whitespace(anchor.get_text(" ", strip=True))
+            haystack = f"{href} {text}".lower()
+            if "проректор" in haystack or "prorector" in haystack:
+                continue
+            if RECTOR_PLURAL_RE.search(haystack):
+                continue
+            if RECTOR_WHOLE_RE.search(text) or "rector" in href.lower():
+                score = 20
+            elif RECTOR_TITLE_RE.search(haystack):
+                score = 12
+            elif "руководств" in haystack or "management" in haystack:
+                score = 6
+            elif "администрац" in haystack or "administration" in haystack:
+                score = 4
+            else:
+                continue
+            absolute = canonical_url(href, site_url)
+            if not is_same_domain(absolute, site_url):
+                continue
+            lowered_url = absolute.lower()
+            if re.search(r"/(news|novosti|press)(/|$)", lowered_url) or re.search(
+                r"/20\d{2}/\d{2}/\d{2}/", lowered_url
+            ):
+                # Новость «директор института...» — не страница ректора.
+                continue
+            if re.search(
+                r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}", lowered_url
+            ):
+                # Страницы-заглушки CMS с UUID не бывают профилем ректора.
+                continue
+            candidates.append((score, absolute))
+        candidates = [item for item in candidates if item[0] >= min_score]
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda item: (-item[0], len(item[1])))
+        return candidates[0][1]
 
         host = urlparse(site_url).netloc
         for url, title in self._search(f"site:{host} ректор"):
@@ -199,6 +340,14 @@ class OfficialSiteDiscovery:
             LOGGER.info("Не удалось определить ФИО ректора: %s", page_url)
             return None
         name = self._normalize_name(name)
+        if any(part.lower().strip(".,") in NAME_STOPWORDS for part in name.split()):
+            LOGGER.info("ФИО ректора похоже на заголовок страницы: %s", name)
+            return None
+        if not self._page_looks_like_rector(page_url, soup, text, name):
+            LOGGER.info(
+                "Страница %s не похожа на страницу ректора (%s)", page_url, name
+            )
+            return None
 
         profile_soup, profile_text, profile_url = self._follow_profile(
             soup, page_url, name
@@ -279,13 +428,37 @@ class OfficialSiteDiscovery:
         return None, "", ""
 
     @staticmethod
+    def _page_looks_like_rector(
+        page_url: str, soup: BeautifulSoup, text: str, name: str
+    ) -> bool:
+        """Отсекает случайные страницы, где ФИО просто встретилось в тексте."""
+
+        path = urlparse(page_url).path.lower()
+        if re.search(r"rector|rektor|rukovoditel|rukovodstvo", path):
+            return True
+        tokens = [token for token in name.split() if len(token) >= 4]
+        if not tokens:
+            return False
+        headings = " ".join(
+            normalize_whitespace(heading.get_text(" ", strip=True)).lower()
+            for heading in soup.find_all(["h1", "h2"])
+        )
+        if not any(token.lower() in headings for token in tokens):
+            return False
+        for match in re.finditer("ректор", text, re.IGNORECASE):
+            window = text[max(0, match.start() - 300) : match.start() + 300].lower()
+            if any(token.lower() in window for token in tokens):
+                return True
+        return False
+
+    @staticmethod
     def _normalize_name(name: str) -> str:
         parts = name.split()
-        if len(parts) == 3 and re.search(
-            r"(?:вич|вна|чна)$", parts[1].lower()
-        ):
-            return f"{parts[2]} {parts[0]} {parts[1]}"
-        return name
+        if len(parts) == 3 and _is_patronymic(parts[1]):
+            parts = [parts[2], parts[0], parts[1]]
+        return " ".join(
+            _nominative(part) if len(part) > 2 else part for part in parts
+        )
 
     @staticmethod
     def _find_name(soup: BeautifulSoup, text: str) -> str:
@@ -337,6 +510,12 @@ class OfficialSiteDiscovery:
             "сервисы",
             "вход",
             "меню",
+            "поиск",
+            "русский",
+            "английский",
+            "english",
+            "версия",
+            "слабовидящих",
         }
         name_re = re.compile(
             r"(?=\b([А-ЯЁ][а-яё\-]{2,})\s+([А-ЯЁ][а-яё\-]{2,})"

@@ -11,6 +11,9 @@ RUN apt-get update \
 
 COPY backend/requirements*.txt /app/backend/
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+# МГУ и другие SPA-сайты, а также обход TLS-блокировок: парсеру нужен
+# настоящий браузер, иначе сбор возвращает 0 документов.
+RUN python -m playwright install --with-deps chromium
 RUN curl -kfsSL https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt -w "\n" >> "$(python -m certifi)"
 
 COPY backend /app/backend

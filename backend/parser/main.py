@@ -187,6 +187,20 @@ SECTION_ORDER = {
     "homepage": 10,
 }
 
+# Ссылки «Форумы ректоров», «Совет ректоров» ведут не к ректорату.
+LEADERSHIP_NOISE_RE = re.compile(
+    r"ректор(?:ов|ам|ами|ах|ы)\b|проректор|rector'?s\b", re.IGNORECASE
+)
+
+POSITION_START_RE = re.compile(
+    r"^\s*(?:и\.?\s*о\.?\s*)?(?:"
+    r"первый|ректор|президент|проректор|директор|декан|заведующ|руководител|"
+    r"начальник|председател|заместител|научный\s+руководител|главный|"
+    r"управляющ|советник|министр|генеральный"
+    r")",
+    re.IGNORECASE,
+)
+
 AMOUNT_RE = re.compile(
     r"(\d[\d\s]*(?:[.,]\d+)?\s*(?:млн|млрд|тыс\.?)?\s*"
     r"(?:руб(?:лей|\.)?|₽|rub))",
@@ -302,6 +316,17 @@ def _looks_like_table_name(value: str) -> bool:
     if any(token.lower() in utils.NAME_BLACKLIST for token in tokens):
         return False
     return True
+
+
+def _is_rector_position(position: str) -> bool:
+    """Должность ректора, в том числе с уточнением: «Ректор НГУ, ...»."""
+
+    lowered = normalize_whitespace(position or "").lower()
+    if "проректор" in lowered:
+        return False
+    return lowered.startswith(
+        ("ректор", "и.о. ректор", "и. о. ректор", "и.о.ректор")
+    )
 
 
 def _position_rank(position: str) -> int:
@@ -652,6 +677,47 @@ def _strip_leading_date(value: str) -> str:
     return DATE_PREFIX_RE.sub("", normalize_whitespace(value)).strip(" :—–-")
 
 
+def _split_block_person(text: str) -> tuple[str, str]:
+    """Из блока «должность | ФИО [| контакты]» выделяет ФИО и должность."""
+
+    text = normalize_whitespace(text)
+    if "|" not in text:
+        names = find_person_names(text)
+        if not names:
+            return "", ""
+        position = text.replace(names[0], " ", 1).strip(" ,;:—–-")
+        return names[0], _clean_position(position)
+
+    name = ""
+    position = ""
+    for part in (chunk.strip() for chunk in text.split("|")):
+        if not part:
+            continue
+        if not name:
+            names = find_person_names(part)
+            if names:
+                name = names[0]
+                continue
+        if not position and not re.search(r"[+@]|https?://|\d{3}", part):
+            position = part
+    if not name:
+        names = find_person_names(text)
+        name = names[0] if names else ""
+    return name, _clean_position(position or text)
+
+
+def _clean_position(position: str) -> str:
+    """Убирает из должности хвосты абзаца и пояснения в скобках."""
+
+    value = normalize_whitespace(position).split("|")[0].strip()
+    # Должность — короткая фраза; всё после точки с запятой или длинного
+    # пояснения относится к тексту страницы, а не к названию должности.
+    value = re.split(r";|\.\s", value)[0].strip()
+    if len(value) > 90:
+        value = re.split(r",\s", value)[0].strip() or value[:90].strip()
+    return value.strip(" ,;:—–-")
+
+
 # ----------------------------------------------------------------------
 # Разбор стандартных таблиц /sveden/struct/
 # ----------------------------------------------------------------------
@@ -829,6 +895,8 @@ class UniversityParser:
         self._failed_urls: set[str] = set()
         self._documents: dict[str, SourceDocument] = {}
         self._leadership: list[Leadership] = []
+        self._rector_profile_url: str = ""
+        self._broken_hosts: set[str] = set()
         self._contacts: list[Contact] = []
         self._contact_index: dict[tuple[str, str], Contact] = {}
         self._projects: list[Project] = []
@@ -911,7 +979,7 @@ class UniversityParser:
             base_url,
         )
 
-        if self.settings.aggregators_only:
+        if self.settings.aggregators_only and allowed_sections is None:
             LOGGER.info("Режим: только агрегаторы (без обхода сайта вуза)")
             self._enrich_aggregators(base_url)
             self._enrich_rector_from_web()
@@ -966,6 +1034,7 @@ class UniversityParser:
                 self._errors.append(message)
 
         self._enrich_bios()
+        self._enrich_rector_from_web()
         self._enrich_aggregators(base_url)
         self._enrich_news_mentions()
         card = self._build_card(base_url, name, profile_obj, homepage_doc)
@@ -1101,6 +1170,17 @@ class UniversityParser:
             candidates: list[tuple[int, str]] = []
             for absolute, text, haystack in links:
                 score = 0
+                if section_name == "leadership":
+                    if LEADERSHIP_NOISE_RE.search(haystack):
+                        # «Форумы ректоров» и «проректоры» — не раздел ректората.
+                        continue
+                    path = utils.urlparse(absolute).path.lower()
+                    if (
+                        "rector" in path or "rektor" in path
+                    ) and "struct" not in path and "sveden" not in path:
+                        # Одиночная страница ректора не заменяет список руководства:
+                        # ниже подставится стандартная /sveden/struct/.
+                        continue
                 for pattern in patterns:
                     if pattern in haystack:
                         score += len(pattern)
@@ -1163,7 +1243,15 @@ class UniversityParser:
             if sitemap_url in visited:
                 continue
             visited.add(sitemap_url)
-            result = self.client.get(sitemap_url)
+            host = utils.urlparse(sitemap_url).netloc.lower()
+            if host in self._broken_hosts and self.settings.enable_playwright:
+                result = self._fallback_fetch(sitemap_url, "sitemap")
+            else:
+                result = self.client.get(sitemap_url)
+                if result is None and self.settings.enable_playwright:
+                    if "SSL" in (self.client.last_error or ""):
+                        self._broken_hosts.add(host)
+                    result = self._fallback_fetch(sitemap_url, "sitemap")
             if result is None:
                 continue
             locations = re.findall(
@@ -1248,6 +1336,43 @@ class UniversityParser:
     # ------------------------------------------------------------------
     # Загрузка и очистка
     # ------------------------------------------------------------------
+    def _fallback_fetch(self, url: str, section: str) -> FetchResult | None:
+        """Fallback на curl_cffi/Playwright, если requests не смог загрузить.
+
+        Включается через ``--with-official-site`` (CLI) или CRM-коллектор:
+        без браузерного транспорта сайты вроде msu.ru отдают 0 документов.
+        """
+
+        if not self.settings.enable_playwright:
+            return None
+        if self.settings.respect_robots:
+            allowed, _ = self.client.robots.can_fetch(url)
+            if not allowed:
+                return None
+        fetcher = StealthFetcher(
+            timeout=min(self.settings.timeout, 30.0),
+            enable_playwright=True,
+        )
+        try:
+            response = fetcher.get(url)
+        finally:
+            fetcher.close()
+        if not response.text:
+            return None
+        LOGGER.info(
+            "%s: requests недоступен, загружено через %s (%s)",
+            section,
+            response.engine,
+            url,
+        )
+        return FetchResult(
+            url=url,
+            final_url=response.final_url or url,
+            status_code=response.status_code or 200,
+            text=response.text,
+            content_type=response.content_type,
+        )
+
     def _get_page(
         self,
         url: str,
@@ -1261,13 +1386,21 @@ class UniversityParser:
             return None, None
         if self._cache is not None:
             failure = self._cache.get_failure(canonical)
-            if failure is not None:
+            if failure is not None and not self.settings.enable_playwright:
                 self._warnings.append(
                     f"{section}: пропущено после недавней ошибки "
                     f"({failure.get('error')}): {canonical}"
                 )
                 self._failed_urls.add(canonical)
                 return None, None
+            if failure is not None:
+                # Прошлая ошибка (SSL, 403) может быть обойдена браузером.
+                LOGGER.info(
+                    "%s: игнорирую прошлую ошибку (%s), пробую заново: %s",
+                    section,
+                    failure.get("error"),
+                    canonical,
+                )
 
         html = ""
         final_url = canonical
@@ -1280,7 +1413,17 @@ class UniversityParser:
             content_type = str(cached.get("content_type") or "text/html")
             LOGGER.info("CACHE %s", canonical)
         else:
-            result = self.client.get(canonical)
+            host = utils.urlparse(canonical).netloc.lower()
+            if host in self._broken_hosts and self.settings.enable_playwright:
+                # Хост уже не отдался обычному HTTP-клиенту: не тратим
+                # таймаут на каждую страницу, сразу идём через браузер.
+                result = self._fallback_fetch(canonical, section)
+            else:
+                result = self.client.get(canonical)
+                if result is None:
+                    if "SSL" in (self.client.last_error or ""):
+                        self._broken_hosts.add(host)
+                    result = self._fallback_fetch(canonical, section)
             if result is None:
                 message = (
                     f"{section}: {self.client.last_error or 'не удалось загрузить'} "
@@ -1427,8 +1570,17 @@ class UniversityParser:
         try:
             with sync_playwright() as runtime:
                 browser = runtime.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.goto(url, timeout=int(self.settings.timeout * 1000))
+                page = browser.new_page(locale="ru-RU")
+                timeout_ms = int(max(self.settings.timeout, 45.0) * 1000)
+                try:
+                    page.goto(
+                        url, timeout=timeout_ms, wait_until="networkidle"
+                    )
+                except Exception:
+                    page.goto(
+                        url, timeout=timeout_ms, wait_until="domcontentloaded"
+                    )
+                page.wait_for_timeout(2000)
                 html = page.content()
                 browser.close()
             LOGGER.info("Playwright отрендерил %s (%s символов)", url, len(html))
@@ -1440,7 +1592,108 @@ class UniversityParser:
     # ------------------------------------------------------------------
     # Руководство
     # ------------------------------------------------------------------
+    def _leadership_candidate_count(
+        self, doc: SourceDocument, soup: BeautifulSoup
+    ) -> int:
+        """Сколько персон можно извлечь со страницы руководства."""
+
+        rows = SvedenTableParser(doc.url).parse(soup)
+        count = sum(
+            1
+            for row in rows
+            if _looks_like_table_name(strip_name(row.get("name", "")))
+        )
+        if count < 2:
+            count += len(self._leadership_from_text(doc))
+        return count
+
+    @staticmethod
+    def _base_domain_url(url: str) -> str:
+        """Стандартная страница структуры на основном домене вуза."""
+
+        host = utils.urlparse(url).netloc.lower()
+        parts = host.split(".")
+        if len(parts) > 2 and parts[0] not in {"www", "m"}:
+            host = ".".join(parts[-2:])
+        return f"https://{host}/sveden/struct/"
+
+    def _better_leadership_source(
+        self, doc: SourceDocument, soup: BeautifulSoup
+    ) -> tuple[SourceDocument, BeautifulSoup]:
+        """Если раздел оказался оглавлением, идём на страницу структуры.
+
+        На части сайтов ссылка «Руководство» ведёт на список органов
+        управления, а ФИО лежат на официальной странице «Структура и органы
+        управления». Признак — слишком мало извлечённых персон.
+        """
+
+        best_count = self._leadership_candidate_count(doc, soup)
+        if best_count >= 5:
+            return doc, soup
+
+        candidates: list[tuple[int, str]] = []
+        for anchor in soup.select("a[href]"):
+            href = anchor.get("href") or ""
+            text = normalize_whitespace(anchor.get_text(" ", strip=True)).lower()
+            lowered = href.lower()
+            if "структура и органы управления" in text:
+                priority = 0
+            elif "sveden/struct" in lowered:
+                priority = 1
+            elif re.search(r"/(?:official/)?struct(?:ure)?/?$", lowered):
+                priority = 2
+            else:
+                continue
+            url = canonical_url(href, doc.url)
+            if not url or url == doc.url or not is_same_domain(url, doc.url):
+                continue
+            candidates.append((priority, url))
+
+        # Ссылка «Руководство» может вести на поддомен (rector.kpfu.ru),
+        # где есть только ректор. Официальный список — на /sveden/struct/
+        # основного домена.
+        candidates.append((3, self._base_domain_url(doc.url)))
+
+        best_doc, best_soup = doc, soup
+        seen: set[str] = set()
+        for _, url in sorted(candidates)[:4]:
+            if url in seen:
+                continue
+            seen.add(url)
+            alt_doc, alt_soup = self._get_page(url, section="leadership")
+            if alt_soup is None:
+                continue
+            count = self._leadership_candidate_count(alt_doc, alt_soup)
+            if count > best_count:
+                best_count = count
+                best_doc, best_soup = alt_doc, alt_soup
+                LOGGER.info("Руководство: использую страницу структуры %s", url)
+                if count >= 5:
+                    break
+        return best_doc, best_soup
+
+    def _remember_rector_link(
+        self, soup: BeautifulSoup, page_url: str
+    ) -> None:
+        """Запоминает ссылку «Ректор» — из неё можно взять фото."""
+
+        if self._rector_profile_url:
+            return
+        for anchor in soup.select("a[href]"):
+            text = normalize_whitespace(anchor.get_text(" ", strip=True))
+            if not re.fullmatch(
+                r"\s*(?:и\.?\s*о\.?\s*)?ректор\s*", text, re.IGNORECASE
+            ):
+                continue
+            url = canonical_url(anchor.get("href", ""), page_url)
+            if url and is_same_domain(url, page_url):
+                self._rector_profile_url = url
+                return
+
     def _parse_leadership(self, doc: SourceDocument, soup: BeautifulSoup) -> None:
+        self._remember_rector_link(soup, doc.url)
+        doc, soup = self._better_leadership_source(doc, soup)
+        self._remember_rector_link(soup, doc.url)
         table_parser = SvedenTableParser(doc.url)
         rows = table_parser.parse(soup)
         leaders: list[Leadership] = []
@@ -1455,7 +1708,7 @@ class UniversityParser:
 
         for row in rows:
             name = strip_name(row.get("name", ""))
-            position = normalize_whitespace(row.get("position", ""))
+            position = _clean_position(row.get("position", ""))
             if not _looks_like_table_name(name):
                 continue
             if not position and not row.get("email") and not row.get("phone"):
@@ -1608,16 +1861,16 @@ class UniversityParser:
         leaders: list[Leadership] = []
         blocks = doc.blocks
         for index, block in enumerate(blocks):
-            text = block.text
-            if not utils.contains_position(text):
+            text = normalize_whitespace(block.text)
+            if not text or not POSITION_START_RE.match(text):
+                # Абзацы устава и новостей не должны становиться «ректоратом».
                 continue
-            names = find_person_names(text)
-            if names:
-                position = truncate_text(text, 250)
+            name, position = _split_block_person(text)
+            if name:
                 leaders.append(
                     Leadership(
-                        full_name=names[0],
-                        position=position,
+                        full_name=name,
+                        position=truncate_text(position or text, 160),
                         source_url=doc.url,
                     )
                 )
@@ -1629,12 +1882,16 @@ class UniversityParser:
             if index + 1 < len(blocks):
                 neighbours.append(blocks[index + 1].text)
             for neighbour in neighbours:
+                neighbour_text = normalize_whitespace(neighbour)
+                if POSITION_START_RE.match(neighbour_text):
+                    # Соседняя строка — уже другой руководитель, не склеиваем.
+                    continue
                 names = find_person_names(neighbour)
                 if names:
                     leaders.append(
                         Leadership(
                             full_name=names[0],
-                            position=truncate_text(text, 250),
+                            position=truncate_text(text, 160),
                             source_url=doc.url,
                         )
                     )
@@ -2549,11 +2806,63 @@ class UniversityParser:
                 else {},
             )
 
+    def _enrich_rector_photo(self, rector: Leadership) -> None:
+        """Достаёт фото ректора со страницы профиля, найденной на сайте."""
+
+        fetcher = StealthFetcher(
+            timeout=min(self.settings.timeout, 25.0),
+            enable_playwright=self.settings.enable_playwright,
+        )
+        try:
+            profile = OfficialSiteDiscovery(fetcher).extract_rector(
+                self._rector_profile_url
+            )
+        except Exception as exc:  # noqa: BLE001 - фото не критично
+            LOGGER.warning("Не удалось прочитать профиль ректора: %s", exc)
+            profile = None
+        finally:
+            fetcher.close()
+        if profile is None:
+            return
+        if _name_key(profile.full_name) != _name_key(rector.full_name):
+            LOGGER.info(
+                "Профиль %s не совпал с ректором %s",
+                profile.full_name,
+                rector.full_name,
+            )
+            return
+        rector.photo_url = rector.photo_url or profile.photo_url
+        rector.bio = rector.bio or profile.bio
+        rector.reception_phone = rector.reception_phone or profile.reception_phone
+        rector.reception_email = rector.reception_email or profile.reception_email
+        if rector.photo_url:
+            LOGGER.info("Фото ректора найдено в профиле: %s", rector.full_name)
+
     def _enrich_rector_from_web(self) -> None:
         """Находит сайт/страницу ректора автоматически и добавляет запись."""
 
         if not self.settings.rector_lookup:
             return
+        parsed_rector = next(
+            (
+                item
+                for item in self._leadership
+                if _is_rector_position(item.position or "")
+            ),
+            None,
+        )
+        if parsed_rector is not None:
+            if parsed_rector.photo_url:
+                # Ректор уже найден на официальном сайте — не перекрываем его
+                # результатом поиска, который может попасть на новость.
+                LOGGER.info(
+                    "Ректор уже найден на сайте: %s", parsed_rector.full_name
+                )
+                return
+            if self._rector_profile_url:
+                self._enrich_rector_photo(parsed_rector)
+                if parsed_rector.photo_url:
+                    return
         fetcher = StealthFetcher(
             timeout=min(self.settings.timeout, 25.0),
             enable_playwright=self.settings.enable_playwright,
@@ -2579,7 +2888,28 @@ class UniversityParser:
             )
             return
 
-        self._leadership = [leader]
+        # Не теряем уже собранное руководство: ставим проверенного ректора
+        # первым, а остальные записи сохраняем.
+        key = _name_key(leader.full_name)
+        previous = {_name_key(item.full_name): item for item in self._leadership}
+        existing = previous.get(key)
+        if existing is not None:
+            leader.bio = leader.bio or existing.bio
+            leader.photo_url = leader.photo_url or existing.photo_url
+            leader.unit = leader.unit or existing.unit
+            leader.email = leader.email or existing.email
+            leader.phone = leader.phone or existing.phone
+            leader.office_phone = leader.office_phone or existing.office_phone
+            leader.reception_email = (
+                leader.reception_email or existing.reception_email
+            )
+            leader.reception_phone = (
+                leader.reception_phone or existing.reception_phone
+            )
+        others = [
+            item for item in self._leadership if _name_key(item.full_name) != key
+        ]
+        self._leadership = [leader, *others]
         if site_url:
             host = utils.urlparse(site_url).netloc.lower().split(":")[0]
             if host.startswith("www."):
@@ -3454,6 +3784,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Не искать автоматически страницу ректора и фото.",
     )
     parser.add_argument(
+        "--no-playwright",
+        action="store_true",
+        help="Не рендерить страницы в браузере при блокировке или SPA-сайте.",
+    )
+    parser.add_argument(
         "--search-engine",
         choices=(
             "auto",
@@ -3525,6 +3860,11 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         settings.use_aggregators = False
     if args.with_official_site:
         settings.aggregators_only = False
+        # Обход сайта вуза без браузера бесполезен: МГУ и другие SPA-сайты
+        # отдают пустую HTML-оболочку, а requests падает по SSL.
+        settings.enable_playwright = True
+    if args.no_playwright:
+        settings.enable_playwright = False
     if args.aggregators_only:
         settings.aggregators_only = True
     if args.no_news_search:
