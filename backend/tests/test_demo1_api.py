@@ -67,6 +67,32 @@ def review_payload(run, decision="accept"):
                            "reason": "Synthetic fixture source checked"} for f in run["facts"]]}
 
 
+def test_ai_collection_crawls_the_official_site_even_with_aggregator_default(monkeypatch):
+    monkeypatch.setenv("PARSER_AGGREGATORS_ONLY", "true")
+    snapshot = example_card()
+
+    class Parser:
+        def __init__(self, settings, client):
+            assert not settings.aggregators_only
+
+        def parse(self, *, url, name, profile, allowed_sections):
+            assert url == "https://university.example" and "leadership" in allowed_sections
+            return snapshot
+
+        def collect_institution_documents(self, urls):
+            return []
+
+        def collect_pdf_documents(self, sources):
+            return [], []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("app.api.v1.ai.UniversityParser", Parser)
+    result = get_collector()("https://university.example", "Учебный пример")
+    assert result.documents == snapshot.documents
+
+
 def test_ui_api_full_path_and_pptx_download(api_client):
     client, repository, calls = api_client
     card, run = collected(client)
@@ -368,6 +394,160 @@ def test_card_chat_reads_current_accepted_facts_and_isolates_history(api_client,
     assert len(client.get(path, headers=headers).json()) == 3
 
 
+def test_card_chat_guides_user_and_refreshes_the_open_card(api_client, monkeypatch):
+    client, repository, calls = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('employee')[0]}"}
+    card = repository.create_card("Учебный вуз", "", "https://university.example")
+    path = f"/api/v1/ai/cards/{card['id']}/chat"
+    tool, arguments = "guide_workflow", {"topic": "collection"}
+
+    class WorkflowProvider(DemoProvider):
+        async def chat(self, messages, **options):
+            assert options["function_call"] == "auto"
+            assert tool in {item["name"] for item in options["functions"]}
+            return Choices(index=0, finish_reason="function_call", message=Messages(
+                role="assistant", function_call={"name": tool, "arguments": arguments},
+            ))
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(WorkflowProvider())
+    help_response = client.post(path, headers=headers, json={"message": "С чего начать сбор?"})
+    assert help_response.status_code == 200, help_response.text
+    assert "Обновить данные" in help_response.json()["answer"]["text"]
+    assert repository.card_job(card["id"]) is None and calls == []
+
+    tool, arguments = "read_card", {"section": "contacts"}
+    empty = client.post(path, headers=headers, json={"message": "Где рабочие телефоны?"}).json()["answer"]
+    assert "о контактах" in empty["text"] and "Обновить данные" in empty["text"]
+    assert empty["sources"] == []
+
+    tool, arguments = "refresh_card", {"website": "https://other.example"}
+    request = {"message": "Сверь данные этого вуза с официальным сайтом", "request_key": "chat-refresh"}
+    invalid = client.post(path, headers=headers, json=request)
+    assert invalid.status_code == 502 and invalid.json()["detail"] == "invalid_chat_tool_call"
+    assert repository.card_job(card["id"]) is None
+
+    arguments = {}
+    refreshed = client.post(path, headers=headers, json=request)
+    assert refreshed.status_code == 200, refreshed.text
+    answer = refreshed.json()["answer"]
+    assert "поставлено в очередь" in answer["text"]
+    job = repository.job(answer["job_id"])
+    assert job["status"] == "completed" and job["card_id"] == card["id"]
+    assert job["identity"]["include_institution"] and job["identity"]["public_site_only"]
+    assert calls == ["https://university.example"] and len(repository.cards()) == 1
+    assert client.get(path, headers=headers).json()[-1]["answer"] == answer
+
+    repeated = client.post(path, headers=headers, json=request)
+    assert repeated.json()["answer"]["job_id"] == job["job_id"]
+    assert "Сбор завершён" in repeated.json()["answer"]["text"]
+    assert calls == ["https://university.example"]
+
+    repository.update_job(job["job_id"], status="running")
+    busy = client.post(path, headers=headers, json={**request, "request_key": "another-refresh"})
+    assert busy.status_code == 409 and busy.json()["detail"] == "card_job_already_running"
+    assert repository.card_job(card["id"])["job_id"] == job["job_id"]
+
+    repository.update_job(job["job_id"], status="completed")
+    head = client.post(path, headers=headers, json={"message": "Кто руководит вузом?"}).json()["answer"]
+    assert "Проверить факты" in head["text"] and head["sources"] == []
+    run = client.get(f"/api/v1/ai/runs/{job['result']['run_id']}").json()
+    reviewed = client.post(f"/api/v1/ai/runs/{run['run_id']}/reviews", json=review_payload(run))
+    assert reviewed.status_code == 200, reviewed.text
+    head = client.post(path, headers=headers, json={"message": "Кто руководит вузом?"}).json()["answer"]
+    assert "Иванов Иван Иванович" in head["text"]
+    assert head["sources"][0]["url"] == "https://university.example/leadership"
+    refreshed = client.post(path, headers=headers, json={
+        "message": "Проверь, появились ли изменения на сайте", "request_key": "refresh-after-review",
+    })
+    assert refreshed.status_code == 200, refreshed.text
+    job_after_review = repository.job(refreshed.json()["answer"]["job_id"])
+    assert job_after_review["status"] == "completed" and job_after_review["job_id"] != job["job_id"]
+    assert calls == ["https://university.example", "https://university.example"]
+    updated_head = client.post(path, headers=headers, json={"message": "Кто руководит вузом?"}).json()["answer"]
+    assert updated_head == head
+
+
+def test_card_chat_matches_partnership_after_review_and_goal_clarification(api_client, monkeypatch):
+    client, repository, _ = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('employee')[0]}"}
+    card, run = collected(client)
+    path = f"/api/v1/ai/cards/{card['id']}/chat"
+    question = "Что предложить на встрече?"
+    value = "Вуз готовит бакалавров по программной инженерии"
+    seen_goals = []
+    matches = [{
+        "catalog_id": "sber-student-internships",
+        "basis_fact_ids": ["program-fact"],
+        "proposal": "Обсудить возможность стажировок для студентов.",
+        "rationale": "Подготовка по программной инженерии связана с практикой в разработке.",
+        "discussion_question": "Какие команды интересуют студентов на практике?",
+    }]
+
+    def add_program(research, _):
+        base = research.facts[0]
+        subject = EntitySubject(entity_kind="institution", entity_id=card["id"], entity_name=card["name"])
+        for fact_id, field, text in [
+            ("program-fact", FactField.EDUCATION_AREAS, value),
+            ("city-fact", FactField.LOCATION, "Город Иркутск"),
+        ]:
+            research.facts.append(base.model_copy(update={
+                "fact_id": fact_id, "field": field, "subject": subject, "value": text,
+                "evidence": [base.evidence[0].model_copy(update={"quote": text})],
+            }))
+
+    class MatchProvider(DemoProvider):
+        async def chat(self, messages, **options):
+            assert any(tool["name"] == "recommend_partnership" for tool in options["functions"])
+            if messages[-1]["content"] == question:
+                goal = "Обучение сотрудников"
+            else:
+                goal = "стажировки для студентов"
+                assert "Какая цель встречи" in messages[-2]["content"]
+            return Choices(index=0, finish_reason="function_call", message=Messages(
+                role="assistant", function_call={"name": "recommend_partnership", "arguments": {"goal": goal}},
+            ))
+
+        async def complete(self, system, payload, schema):
+            assert {fact["fact_id"] for fact in payload["facts"]} == {"program-fact", "city-fact"}
+            seen_goals.append(payload["meeting"]["goal"])
+            return json.dumps({"matches": matches})
+
+    run = repository.mutate(run["run_id"], run["revision"], add_program).model_dump(mode="json")
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(MatchProvider())
+    pending = client.post(path, headers=headers, json={"message": question}).json()["answer"]
+    assert "Проверить факты" in pending["text"] and pending["sources"] == []
+    assert seen_goals == []
+    review_url = f"/api/v1/ai/runs/{run['run_id']}/reviews"
+    decision = review_payload(run)
+    decision["decisions"] = [item for item in decision["decisions"] if item["fact_id"] == "city-fact"]
+    run = client.post(review_url, json=decision).json()
+    generic = client.post(path, headers=headers, json={"message": question}).json()["answer"]
+    assert "только общие данные" in generic["text"] and generic["sources"] == []
+    assert seen_goals == []
+    decision = review_payload(run)
+    decision["decisions"] = [item for item in decision["decisions"] if item["fact_id"] == "program-fact"]
+    reviewed = client.post(review_url, json=decision)
+    assert reviewed.status_code == 200, reviewed.text
+    clarification = client.post(path, headers=headers, json={"message": question}).json()["answer"]
+    assert "Какая цель встречи" in clarification["text"] and seen_goals == []
+    response = client.post(path, headers=headers, json={"message": "Хотим обсудить стажировки для студентов."})
+    assert response.status_code == 200, response.text
+    answer = response.json()["answer"]
+    assert seen_goals == ["стажировки для студентов"]
+    assert all(part in answer["text"] for part in ("СберСтудент", "Что предложить", "Почему", "Что спросить", "[1]"))
+    assert len(answer["sources"]) == 1
+    assert answer["sources"][0]["fact_id"] == "program-fact"
+    assert answer["sources"][0]["quote"] == value
+    assert client.get(path, headers=headers).json()[-1]["answer"] == answer
+
+    matches.clear()
+    client.post(path, headers=headers, json={"message": question})
+    empty = client.post(path, headers=headers, json={"message": "Хотим обсудить стажировки для студентов."}).json()["answer"]
+    assert "пока нет предложений" in empty["text"] and empty["sources"] == []
+
+
 def test_refresh_is_idempotent_and_sources_are_not_recollected(api_client):
     client, repository, calls = api_client
     card, run = collected(client)
@@ -481,7 +661,9 @@ def test_chat_collects_new_card_and_reuses_it_on_retry(api_client, monkeypatch):
 
     class IntakeProvider(DemoProvider):
         async def chat(self, messages, **options):
-            assert any(tool["name"] == "collect_card" for tool in options["functions"])
+            tool = next(tool for tool in options["functions"] if tool["name"] == "collect_card")
+            assert tool["parameters"]["properties"]["website"]["type"] == "string"
+            assert "website" not in tool["parameters"]["required"]
             return Choices(index=0, finish_reason="function_call", message=Messages(
                 role="assistant", function_call={"name": "collect_card", "arguments": arguments},
             ))
@@ -489,12 +671,22 @@ def test_chat_collects_new_card_and_reuses_it_on_retry(api_client, monkeypatch):
     app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(IntakeProvider())
     path = "/api/v1/ai/chat/intake"
     payload = {"message": "Собери карточку Учебный университет: https://university.example", "request_key": "one"}
+    by_name = {"message": "Собери Учебный университет", "request_key": "one"}
     assert client.post(path, json=payload).status_code == 401
-    assert "message" in client.post(path, json={"message": "Собери Учебный университет"}, headers=headers).json()
+    monkeypatch.setattr("app.api.v1.ai.resolve_site", lambda name: None)
+    missing = client.post(path, json=by_name, headers=headers)
+    assert missing.status_code == 422 and missing.json()["detail"] == "official_site_not_found"
     assert repository.cards() == []
-    response = client.post(path, json=payload, headers=headers)
+
+    def resolve_site(name):
+        assert name == "Учебный университет"
+        return "https://university.example"
+
+    monkeypatch.setattr("app.api.v1.ai.resolve_site", resolve_site)
+    response = client.post(path, json=by_name, headers=headers)
     assert response.status_code == 200, response.text
     collection = response.json()["collection"]
+    assert collection["card"]["website"] == "https://university.example"
     card_id, job_id = collection["card"]["id"], collection["job"]["job_id"]
     job = client.get(f"/api/v1/ai/jobs/{job_id}").json()
     assert job["status"] == "completed" and job["identity"]["public_site_only"]
@@ -771,6 +963,7 @@ def test_refresh_supports_biography_and_institution_context_without_autoaccept(a
             if "fields" in payload:
                 return json.dumps({"facts": [{"subject": {"entity_kind": "institution", "entity_name": "Университет Северный",
                     "entity_fragment_id": payload["fragments"][0]["fragment_id"]}, "field": "institution.students", "value": "1200",
+                    "value_fragment_id": payload["fragments"][0]["fragment_id"],
                     "metric_context": {"period": "2025 году", "scope": "студентов очной формы", "unit": "человек"},
                     "fragment_ids": [payload["fragments"][0]["fragment_id"]]}], "gaps": []})
             return await super().complete(system, payload, schema)

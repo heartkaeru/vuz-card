@@ -15,26 +15,32 @@ from .workflow_models import WorkflowError
 class CollectCard(StrictModel):
     name: str = Field(min_length=1, max_length=300)
     city: str = Field(default="", max_length=160)
-    website: str = Field(min_length=1, max_length=2048)
+    website: str | None = Field(default=None, min_length=1, max_length=2048)
+
+
+def collect_tool_schema():
+    schema = CollectCard.model_json_schema()
+    # GigaChat expects a concrete property type. A missing website is still valid.
+    website = schema["properties"]["website"]
+    schema["properties"]["website"] = next(
+        variant for variant in website["anyOf"] if variant["type"] == "string"
+    )
+    return schema
 
 
 COLLECT_TOOL = {
     "name": "collect_card",
-    "description": "Создаёт черновик и запускает сбор по официальному сайту, указанному сотрудником.",
-    "parameters": CollectCard.model_json_schema(),
+    "description": "Создаёт черновик и запускает сбор по официальному сайту; если адрес не указан, сервер найдёт его по названию.",
+    "parameters": collect_tool_schema(),
 }
 COLLECT_PROMPT = """Для явной просьбы создать карточку или собрать сведения о новом вузе вызови collect_card.
 Название, сайт и город бери из последнего сообщения. Если город не указан, оставь его пустым.
-Используй только официальный URL, явно указанный в сообщении. Если не хватает названия или URL,
-воздержись от вызова. Не запускай сбор по ссылке, приведённой как пример или в вопросе о возможностях."""
+Используй официальный URL, только если он явно указан в сообщении. Если URL нет, оставь website пустым:
+сервер найдёт сайт по названию. Если не хватает названия, воздержись от вызова.
+Не запускай сбор по ссылке, приведённой как пример или в вопросе о возможностях."""
 
 
 def supplied_website(args, question):
-    try:
-        model_url = str(HttpUrl(args.website))
-        public_url(model_url)
-    except ValueError:
-        raise WorkflowError("public_website_required") from None
     supplied = re.findall(r"https?://[^\s<>«»\"']+", question, flags=re.IGNORECASE)
     supplied = {url.rstrip(".,;!?)") for url in supplied}
 
@@ -42,18 +48,35 @@ def supplied_website(args, question):
         parts = urlsplit(str(HttpUrl(url)))
         return urlunsplit(parts._replace(path=parts.path.rstrip("/"), fragment=""))
 
-    if len(supplied) != 1:
-        raise WorkflowError("chat_collection_url_required")
-    try:
-        candidate = canonical(supplied.pop())
-    except ValueError:
-        raise WorkflowError("chat_collection_url_required") from None
-    website = canonical(model_url)
-    if website != candidate:
+    if len(supplied) > 1:
         raise WorkflowError("chat_collection_url_required")
     if " ".join(args.name.casefold().split()) not in " ".join(question.casefold().split()):
         raise WorkflowError("chat_collection_name_required")
     city = args.city if " ".join(args.city.casefold().split()) in " ".join(question.casefold().split()) else ""
+
+    if not supplied:
+        # Ignore any URL the model may invent; discovery uses the server-side search.
+        return {"name": args.name, "city": city, "website": None}
+    try:
+        candidate = canonical(next(iter(supplied)))
+    except ValueError:
+        raise WorkflowError("chat_collection_url_required") from None
+    if args.website:
+        try:
+            website = canonical(str(HttpUrl(args.website)))
+            public_url(website)
+        except ValueError:
+            raise WorkflowError("public_website_required") from None
+        if website != candidate:
+            raise WorkflowError("chat_collection_url_required")
+    else:
+        website = candidate
+        try:
+            public_url(website)
+        except ValueError:
+            raise WorkflowError("public_website_required") from None
+    if website != candidate:
+        raise WorkflowError("chat_collection_url_required")
     return {"name": args.name, "city": city, "website": website}
 
 

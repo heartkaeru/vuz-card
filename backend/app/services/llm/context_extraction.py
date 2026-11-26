@@ -14,6 +14,16 @@ from .models import EntitySubject, Evidence, ExtractionResult, Fact, FactField, 
 from .names import folded
 
 
+INSTITUTION_NOUN = r"(?:университет|институт|академия|колледж|техникум|училище|школа|вуз|учреждение|образовательная организация)"
+FOUNDING_ACTION = r"(?:основан|учрежд[её]н|создан|образован)(?:а|о)?"
+FOUNDING_CONTEXT = re.compile(
+    r"\b(?:дата\s+(?:создания|основания)|год\s+основания)(?:\s+образовательной\s+организации)?\s*(?=[:|–—-]|\d)"
+    rf"|\b{INSTITUTION_NOUN}\s+(?:был[ао]?\s+)?{FOUNDING_ACTION}\b"
+    rf"|\b{FOUNDING_ACTION}\s+(?:(?:[а-яё-]+(?:ый|ий|ой|ая|яя|ое|ее))\s+){{0,4}}{INSTITUTION_NOUN}\b",
+    re.I,
+)
+
+
 def normalize(value):
     return folded(" ".join(value.split()))
 
@@ -70,8 +80,8 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
     reference_selection = bool(request.fields and all(f.value.startswith("institution.") for f in request.fields))
     metric_requested = request.fields is not None and any(f.value == "institution.students" for f in request.fields)
     if reference_selection:
-        prompt = (("Для institution.students возвращай value как одно дословное число или выражение численности, "
-                  "а value_fragment_id не указывай. Для остальных полей ОБЯЗАТЕЛЬНО выбирай value_fragment_id без value. "
+        prompt = (("Для institution.students укажи value_fragment_id блока со значением и value как дословное "
+                  "число или выражение численности из него. Для остальных полей указывай value_fragment_id без value. "
                   if metric_requested else "Для этого запроса ОБЯЗАТЕЛЬНО выбирай value_fragment_id, не возвращай value. ") +
                   "Для полей, кроме institution.students, выбирай один целый исходный абзац по его ID; текст перенесёт сервис. "
                   "Не собирай собственные перечисления из разных абзацев. "
@@ -82,15 +92,15 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
         digest = hashlib.sha256(document.text.encode("utf-8")).hexdigest()
         for index, batch in enumerate(batches(document, pipeline.chunk_size)):
             chunk_id = f"{document.source_id}:context:{index}"
+            if sum(f.end - f.start for f in batch) > pipeline.chunk_size:
+                errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
+                                            code="context_scope_too_large"))
+                continue
             if processed >= pipeline.max_chunks:
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                             code="context_batch_limit_reached"))
                 continue
             processed += 1
-            if sum(f.end - f.start for f in batch) > pipeline.chunk_size:
-                errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
-                                            code="context_scope_too_large"))
-                continue
             fragments = {f.fragment_id: f for f in batch}
             text = {f.fragment_id: document.text[f.start:f.end] for f in batch}
             payload = {
@@ -111,9 +121,10 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
             }
             if request.fields is not None:
                 schema["$defs"]["ContextFactProposal"]["properties"]["field"]["enum"] = [f.value for f in request.fields]
-            if reference_selection and not metric_requested:
+            if reference_selection:
                 definition = schema["$defs"]["ContextFactProposal"]
-                del definition["properties"]["value"]
+                if not metric_requested:
+                    del definition["properties"]["value"]
                 definition["properties"]["value_fragment_id"] = {"type": "string", "enum": list(fragments)}
                 definition["required"].append("value_fragment_id")
             try:
@@ -127,13 +138,18 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
             gaps.extend(output.gaps)
             for item in output.facts:
                 issues = []
+                is_metric = item.field.value == "institution.students"
+                if reference_selection and not is_metric and item.value_fragment_id is None:
+                    issues.append("invalid_context_value_selection")
+                if is_metric and item.value is None:
+                    issues.append("student_metric_number_required")
                 if item.value_fragment_id is not None:
                     if item.value_fragment_id not in item.fragment_ids or item.value_fragment_id not in text:
                         issues.append("invalid_context_value_selection")
                         item.value = "Неподтверждённый выбор фрагмента"
                     else:
                         selected_text = text[item.value_fragment_id]
-                        if item.value is None:
+                        if item.value is None or (reference_selection and not is_metric):
                             item.value = selected_text
                         elif not literal_value_in_text(item.value, selected_text):
                             issues.append("value_not_in_selected_fragment")
@@ -163,7 +179,7 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                     for ref in value_refs
                 ):
                     issues.append("context_entity_value_scope_mismatch")
-                if item.field.value == "institution.students":
+                if is_metric:
                     if item.metric_context is None:
                         issues.append("student_metric_context_required")
                     else:
@@ -174,7 +190,7 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                             or subject.entity_kind == "institution"
                             and fragments[ref].institution_anchor_id == anchor.fragment_id)]
                         metric_text = " ".join(text[ref] for ref in qualified)
-                        if not re.search(r"\d", item.value):
+                        if "student_metric_number_required" not in issues and not re.search(r"\d", item.value):
                             issues.append("student_metric_number_required")
                         if not re.search(r"\b(?:19|20)\d{2}\b", item.metric_context.period):
                             issues.append("student_metric_period_required")
@@ -184,10 +200,7 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                 elif item.metric_context is not None:
                     issues.append("metric_context_on_non_metric_fact")
                 if item.field.value == "institution.founded":
-                    if not (re.search(r"\b(?:17|18|19|20)\d{2}\b", item.value) and re.search(
-                        r"\bдат\w*\s+(?:создания|основания)|\bгод\w*\s+основания|\b(?:основан|учрежд[её]н|создан|образован)(?:а|о|ы)?\b",
-                        item.value, re.I,
-                    )):
+                    if not (re.search(r"\b(?:17|18|19|20)\d{2}\b", item.value) and FOUNDING_CONTEXT.search(item.value)):
                         issues.append("institution_founding_context_required")
                 if item.field.value == "institution.location" and not re.search(
                     r"\bгород|\bг\.\s*[А-ЯЁ]|адрес|местонахожд|расположен", " ".join(text[ref] for ref in value_refs), re.I,

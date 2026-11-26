@@ -1,4 +1,4 @@
-"""A read-only dialogue over the active, reviewed version of one card."""
+"""Dialogue and tool selection for one institution card."""
 
 import json
 import re
@@ -11,7 +11,8 @@ from .changes import effective_facts, head_key, normalized
 from .card_edits import EDIT_TOOL, EditCard, preview_edit
 from .card_intake import COLLECT_PROMPT, COLLECT_TOOL, collection_arguments
 from .client import LLMError
-from .models import StrictModel
+from .models import MeetingContext, StrictModel
+from .partnership import has_partnership_basis, match_partnership, partnership_facts
 
 
 TOOL_NAME = "read_card"
@@ -29,12 +30,84 @@ class ChatReply(StrictModel):
     fact_ids: list[str] = Field(max_length=12)
 
 
+class GuideWorkflow(StrictModel):
+    topic: Literal["capabilities", "collection", "review", "presentation", "edit"]
+
+
+class MatchMeeting(StrictModel):
+    goal: str = Field(max_length=500, description="Дословный фрагмент реплики пользователя с конкретной темой "
+                                                "встречи. Пустая строка для общего запроса о предложениях.")
+
+
 READ_TOOL = {
     "name": TOOL_NAME,
-    "description": "Читает актуальные принятые сведения выбранного вуза. Для уточнения о человеке возьми его имя из диалога.",
+    "description": "Отвечает на вопрос по уже сохранённым сведениям или показывает содержимое карточки. "
+                   "Для поиска по источникам и обновления вызывай refresh_card. Имя человека можно взять из диалога.",
     "parameters": ReadCard.model_json_schema(),
 }
-READ_PROMPT = """Ты консультируешь сотрудника по выбранному вузу. Для вопроса вызови read_card.
+GUIDE_TOOL = {
+    "name": "guide_workflow",
+    "description": "Объясняет возможности агента или следующий шаг в CRM. Не меняет карточку и не запускает задания.",
+    "parameters": GuideWorkflow.model_json_schema(),
+}
+REFRESH_TOOL = {
+    "name": "refresh_card",
+    "description": "Выполняет просьбу найти, собрать или актуализировать сведения об открытом вузе "
+                   "на его официальном сайте. Используется для поиска в целом и полного сбора, в том числе "
+                   "до принятия фактов. Для показа сохранённых сведений вызывай read_card.",
+    "parameters": StrictModel.model_json_schema(),
+    "few_shot_examples": [
+        {"request": "Поищи информацию об этом университете", "params": {}},
+        {"request": "Собери полную информацию о вузе", "params": {}},
+    ],
+}
+PARTNERSHIP_TOOL = {
+    "name": "recommend_partnership",
+    "description": "Подбирает предложения и переговорные аргументы для встречи с открытым вузом по принятым фактам и каталогу.",
+    "parameters": MatchMeeting.model_json_schema(),
+    "few_shot_examples": [
+        {"request": "С чем нам пойти к руководству этого университета?", "params": {"goal": ""}},
+        {"request": "Что предложить для повышения квалификации преподавателей?",
+         "params": {"goal": "повышения квалификации преподавателей"}},
+    ],
+}
+WORKFLOW_GUIDE = {
+    "capabilities": "Я отвечаю по принятым сведениям этой карточки и показываю источники. "
+    "Могу запустить сбор по официальному сайту, объяснить, как проверить найденное и получить презентацию, "
+    "подобрать предложения к встрече или предложить замену одного принятого значения.",
+    "collection": "Чтобы собрать или обновить сведения об открытом вузе, попросите меня запустить сбор "
+    "или нажмите «Обновить данные». Для нового учреждения откройте «Общий чат» и укажите название. "
+    "Если знаете официальный сайт, добавьте ссылку.",
+    "review": "В карточке откройте «Проверить факты». Сверьте цитаты с источниками, отметьте нужные записи "
+    "и нажмите «Принять выбранные». После этого я смогу использовать эти сведения в ответах.",
+    "presentation": "Сначала примите нужные факты в карточке. Затем нажмите «Презентация» в чате. "
+    "Если сведения надо сверить повторно, перейдите к сверке из сообщения, которое появится после запуска.",
+    "edit": "Назовите владельца, поле и новое значение. Я покажу предлагаемую замену одного принятого "
+    "значения. Она сохранится после кнопки «Подтвердить правку».",
+}
+SECTION_LABELS = {
+    "leadership": "о руководстве",
+    "contacts": "о контактах",
+    "profile": "о профиле вуза",
+    "projects": "о проектах",
+    "events": "о событиях",
+    "all": "по этому вопросу",
+}
+READ_PROMPT = """Ты консультируешь сотрудника по выбранному вузу. Определи намерение по смыслу просьбы.
+Для вопроса о фактах открытого вуза вызови read_card.
+Для вопроса о возможностях, порядке работы или следующем шаге вызови guide_workflow.
+Для подбора продуктов, идей сотрудничества или аргументов к встрече с открытым вузом вызови recommend_partnership.
+Вызови его и после того, как пользователь ответил на вопрос агента о цели подбора.
+В goal скопируй дословно конкретную тему из реплики пользователя. Используй предыдущие реплики пользователя,
+если он ссылается на уже названную тему. Общая просьба подобрать предложения к встрече не задаёт тему:
+передай пустую строку, чтобы уточнить цель. Не выводи цель из профиля вуза или из ответов агента.
+Если речь о другом вузе, не делай подбор по открытой карточке.
+Для прямой просьбы собрать, перепроверить или обновить сведения открытого вуза вызови refresh_card.
+Если сотрудник просит найти сведения о вузе в целом, запусти сбор по источникам. Если он просит показать
+то, что уже известно или сохранено в карточке, прочитай её через read_card.
+Это относится и к пустой карточке. Вопросы о том, как запустить сбор или что он делает, являются
+просьбой о справке, а не командой на сбор. Запускай сбор только по просьбе в последнем сообщении.
+Если явно назван другой вуз, не запускай refresh_card по открытой карточке.
 Для прямой просьбы заменить существующее значение вызови propose_card_edit. Передай новое значение дословно
 из последнего сообщения. В owner используй именительный падеж («ректор»), ФИО или подразделение.
 Указывай current_value только если пользователь явно назвал прежнее значение. Иначе оставь его пустым.
@@ -53,7 +126,7 @@ ANSWER_PROMPT = """Ответь по-русски на последний воп
 биографии, текущем статусе проектов или событий. Ссылки будут показаны отдельно. Верни JSON без разметки."""
 
 
-def read_facts(run, args: ReadCard, *, limit=40):
+def read_facts(run, args: ReadCard, *, limit=40, candidates=False):
     prefix = {
         "leadership": ("person.", "appointment."),
         "contacts": ("contact.", "appointment.position"),
@@ -63,13 +136,21 @@ def read_facts(run, args: ReadCard, *, limit=40):
         "all": ("",),
     }[args.section]
     person = normalized(args.person)
+    available = []
+    if run:
+        reconfirmed = run.reconfirmed_candidate_ids if candidates else set()
+        available = effective_facts(run) if not candidates else [
+            fact for fact in run.facts if fact.validation_status == "passed" and not fact.issues
+            and fact.verification_status in {"pending", "conflict"}
+            and fact.fact_id not in reconfirmed
+        ]
     facts = [
-        fact for fact in effective_facts(run)
+        fact for fact in available
         if fact.institution_id == run.institution.id
         and (fact.origin == "manual_edit" or
              fact.evidence and urlsplit(fact.evidence[0].url).scheme in {"http", "https"})
         and fact.field.value.startswith(prefix)
-    ] if run else []
+    ]
     if person and args.section in {"contacts", "leadership"}:
         tokens = set(person.split())
         matching = [
@@ -118,20 +199,78 @@ def cited_answer(text, facts):
     }
 
 
+def missing_facts_answer(run, args, *, head=False):
+    label = "о руководителе вуза" if head else SECTION_LABELS[args.section]
+    candidates = read_facts(run, args, candidates=True, limit=None)
+    if head:
+        candidates = card_heads(candidates)
+    text = f"В карточке пока нет принятой записи {label}."
+    if candidates:
+        text += " Найденные сведения ждут сверки. Откройте «Проверить факты», сверьте источники и примите нужные записи."
+    elif run and run.status in {"queued", "running"}:
+        text += " Дождитесь завершения сбора, затем проверьте найденные сведения."
+    elif not run or run.status == "failed":
+        text += " Попросите меня собрать сведения или нажмите «Обновить данные»."
+    else:
+        text += " Проверьте, есть ли эти сведения на официальном сайте, и при необходимости повторите сбор."
+    return cited_answer(text, [])
+
+
+def refresh_reply(job):
+    text = {
+        "queued": "Задание на обновление сведений поставлено в очередь.",
+        "running": "Обновление сведений уже выполняется.",
+        "completed": "Сбор завершён. Проверьте найденные сведения в карточке.",
+        "failed": "Сбор завершился ошибкой. Проверьте адрес сайта и попробуйте ещё раз.",
+    }[job["status"]]
+    return {**cited_answer(text, []), "job_id": job["job_id"]}
+
+
+async def partnership_reply(provider, run, goal):
+    facts = {fact.fact_id: fact for fact in partnership_facts(run)} if run else {}
+    if not facts:
+        text = ("Для подбора партнёрств нужны принятые сведения о профиле вуза, направлениях подготовки, "
+                "проектах или событиях. Соберите недостающие сведения или примите их в разделе «Проверить факты».")
+        return cited_answer(text, [])
+    if not has_partnership_basis(facts.values()):
+        return cited_answer("В карточке пока есть только общие данные. Для обоснованного предложения "
+                            "примите сведения о направлениях подготовки, проектах, событиях или задаче вуза.", [])
+    if not goal:
+        return cited_answer("Какая цель встречи с вузом? Например, обсудить стажировки для студентов "
+                            "или обучение преподавателей.", [])
+
+    matches = await match_partnership(provider, list(facts.values()), MeetingContext(goal=goal))
+    if not matches:
+        return cited_answer("Для этой цели пока нет предложений с опорой на принятые факты. Уточните задачу "
+                            "встречи или примите сведения о связанных направлениях, проектах и потребностях вуза.", [])
+
+    source_numbers = {}
+    proposals = []
+    for match in matches:
+        for fact_id in match.basis_fact_ids:
+            source_numbers.setdefault(fact_id, len(source_numbers) + 1)
+        citations = ", ".join(str(source_numbers[fact_id]) for fact_id in match.basis_fact_ids)
+        name = match.product_name + (" (внешний курс)" if match.kind == "external_course" else "")
+        proposals.append(f"{name}\nЧто предложить — {match.proposal}\n"
+                         f"Почему это уместно — {match.rationale} [{citations}]\n"
+                         f"Что спросить — {match.discussion_question}")
+    reply = cited_answer("\n\n".join(proposals), (facts[fact_id] for fact_id in source_numbers))
+    for source in reply["sources"]:
+        source["value"] = f"[{source_numbers[source['fact_id']]}] {source['value']}"
+    return reply
+
+
 async def answer_card(provider, card, run, history, question):
     if HEAD_QUESTION.fullmatch(normalized(question).rstrip(" ?.!")):
-        heads = card_heads(read_facts(run, ReadCard(section="leadership"), limit=None))
+        args = ReadCard(section="leadership")
+        heads = card_heads(read_facts(run, args, limit=None))
         if not heads:
-            return {"text": "В карточке пока нет принятой записи о руководителе вуза. "
-                            "Откройте раздел руководства и проверьте найденные сведения.", "sources": []}
+            return missing_facts_answer(run, args, head=True)
         if len({fact.subject.person_name for fact in heads}) > 1:
             return cited_answer("В карточке есть несколько принятых записей о руководителе. "
                                 "Сверьте их в разделе руководства.", heads[:12])
         position = heads[0]
         return cited_answer(f"По данным карточки: {position.subject.person_name} — {position.value}.", [position])
-    has_facts = bool(run and effective_facts(run))
-    if not has_facts and "://" not in question:
-        return {"text": "В карточке пока нет принятых фактов. Соберите и проверьте сведения в карточке вуза.", "sources": []}
     messages = [{"role": "system", "content": f"{READ_PROMPT}\n{COLLECT_PROMPT}\nВыбранный вуз: {card['name']}"}]
     for turn in history[-CONTEXT_LIMIT:]:
         messages.extend([
@@ -139,13 +278,29 @@ async def answer_card(provider, card, run, history, question):
             {"role": "assistant", "content": turn["answer"]["text"]},
         ])
     messages.append({"role": "user", "content": question})
-    tools = [READ_TOOL, EDIT_TOOL, COLLECT_TOOL]
+    tools = [GUIDE_TOOL, REFRESH_TOOL, READ_TOOL, EDIT_TOOL, COLLECT_TOOL, PARTNERSHIP_TOOL]
     choice = await provider.chat(messages, functions=tools, function_call="auto")
     if choice.finish_reason == "stop":
         choice = await provider.chat(messages, functions=tools, function_call={"name": TOOL_NAME})
     call = choice.message.function_call
     if call and call.name == COLLECT_TOOL["name"]:
         return {"collection_request": collection_arguments(choice, question)}
+    if choice.finish_reason == "function_call" and call:
+        try:
+            if call.name == GUIDE_TOOL["name"]:
+                guide = GuideWorkflow.model_validate(call.arguments)
+                return cited_answer(WORKFLOW_GUIDE[guide.topic], [])
+            if call.name == REFRESH_TOOL["name"]:
+                StrictModel.model_validate(call.arguments)
+                return {"refresh_request": True}
+            if call.name == PARTNERSHIP_TOOL["name"]:
+                args = MatchMeeting.model_validate(call.arguments)
+                user_messages = (message["content"] for message in messages if message["role"] == "user")
+                goal = normalized(args.goal)
+                provided = goal and any(goal in normalized(text) for text in user_messages)
+                return await partnership_reply(provider, run, args.goal if provided else "")
+        except ValidationError:
+            raise LLMError("invalid_chat_tool_call") from None
     if choice.finish_reason == "function_call" and call and call.name == EDIT_TOOL["name"]:
         try:
             edit = preview_edit(run, EditCard.model_validate(call.arguments), question)
@@ -161,7 +316,7 @@ async def answer_card(provider, card, run, history, question):
 
     facts = {fact.fact_id: fact for fact in read_facts(run, args)}
     if not facts:
-        return {"text": "В принятых сведениях карточки не нашлось данных по этому вопросу.", "sources": []}
+        return missing_facts_answer(run, args)
     result = {"facts": [
         {
             "id": fact.fact_id, "field": fact.field.value, "value": fact.value[:1500],

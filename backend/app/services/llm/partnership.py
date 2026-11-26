@@ -1,5 +1,6 @@
 """Propose meeting opportunities from the reviewed card and a fixed catalog."""
 
+from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
 from typing import Literal
@@ -130,6 +131,9 @@ OPERATIONAL_FIELDS = {
     FactField.PROFILE, FactField.STRUCTURE, FactField.PROJECT_NAME,
     FactField.PROJECT_DESCRIPTION, FactField.EVENT_NAME, FactField.EVENT_DESCRIPTION,
 }
+CONTEXT_ONLY_FIELDS = {
+    FactField.TYPE, FactField.LOCATION, FactField.EDUCATION_LEVELS, FactField.STUDENTS,
+}
 PROMPT = (Path(__file__).parent / "prompts" / "match_partnership.txt").read_text(encoding="utf-8")
 
 
@@ -148,10 +152,14 @@ def partnership_facts(run: ResearchRun) -> list[Fact]:
     ]
 
 
+def has_partnership_basis(facts: Iterable[Fact]) -> bool:
+    return any(fact.field not in CONTEXT_ONLY_FIELDS for fact in facts)
+
+
 async def match_partnership(
     provider: JSONProvider, facts: list[Fact], meeting: MeetingContext
 ) -> list[PartnershipMatch]:
-    if not facts:
+    if not has_partnership_basis(facts):
         return []
     operational_ids = {fact.fact_id for fact in facts if fact.field in OPERATIONAL_FIELDS}
     catalog = {
@@ -180,6 +188,7 @@ async def match_partnership(
         raise LLMError("invalid_partnership_response") from None
 
     fact_ids = {fact.fact_id for fact in facts}
+    basis_ids = {fact.fact_id for fact in facts if fact.field not in CONTEXT_ONLY_FIELDS}
     seen = set()
     matches = []
     for proposal in output.matches:
@@ -188,6 +197,8 @@ async def match_partnership(
         if catalog_id not in catalog or catalog_id in seen or not basis <= fact_ids:
             raise LLMError("invalid_partnership_response")
         seen.add(catalog_id)
+        if not basis & basis_ids:
+            continue
         entry = catalog[catalog_id]
         if entry.requires_operational_context and not basis & operational_ids:
             raise LLMError("invalid_partnership_response")

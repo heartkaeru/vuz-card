@@ -3,13 +3,12 @@ export type University = {
   name: string;
   city: string;
   tone: "mint" | "blue" | "yellow";
-  draft?: boolean;
   website?: string;
   backendId?: string;
   version?: number;
 };
 
-export type Section = "about" | "contacts" | "projects" | "events" | "review";
+export type Section = "about" | "collection" | "contacts" | "projects" | "events" | "review" | "history";
 export type View = "overview" | "universities" | "events" | "reports";
 
 export const initialUniversities: University[] = [
@@ -64,7 +63,6 @@ export function createUniversity(name: string, city: string): University {
     name: cleanName,
     city: cleanCity,
     tone: "mint",
-    draft: true,
   };
 }
 
