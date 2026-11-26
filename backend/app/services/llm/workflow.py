@@ -14,6 +14,7 @@ from parser.models import UniversityData
 from .client import LLMError
 from .fragment_models import parse_extraction_request
 from .models import GenerationRequest, Institution, MeetingContext
+from .official_sources import official_program_candidates
 from .pipeline import REVIEW_WINDOW_DAYS, AssistantPipeline, DraftValidationError
 from .workflow_models import ResearchRun, ReviewBatch, WorkflowError
 from .changes import compare_run, effective_facts, head_key, person_aliases, person_identity, reconfirmation_matches
@@ -92,6 +93,9 @@ class LLMWorkflow:
                 try:
                     request = parse_extraction_request(json.dumps(payload, ensure_ascii=False))
                     results[mode] = await self.pipeline.extract_facts(request)
+                    if mode == "0.3" and (context_fields is None or "institution.education_areas" in context_fields):
+                        facts = results[mode].facts
+                        facts.extend(official_program_candidates(stage_card.documents, run.institution, facts))
                 except ValidationError:
                     errors.append(f"{mode}:invalid_parser_llm_contract")
                 except LLMError as exc:

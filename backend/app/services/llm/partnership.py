@@ -1,5 +1,6 @@
 """Propose meeting opportunities from the reviewed card and a fixed catalog."""
 
+import re
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
@@ -7,8 +8,9 @@ from typing import Literal
 
 from pydantic import Field, HttpUrl, ValidationError, field_validator
 
-from .changes import effective_facts
+from .changes import effective_facts, normalized
 from .client import JSONProvider, LLMError
+from .evidence import literal_value_in_text
 from .models import Fact, FactField, MeetingContext, StrictModel
 from .workflow_models import ResearchRun
 
@@ -131,6 +133,39 @@ OPERATIONAL_FIELDS = {
     FactField.PROFILE, FactField.STRUCTURE, FactField.PROJECT_NAME,
     FactField.PROJECT_DESCRIPTION, FactField.EVENT_NAME, FactField.EVENT_DESCRIPTION,
 }
+OPERATIONAL_TOPICS = {
+    "sber-campus-card": (
+        re.compile(r"\b(?:кампусн\w* карт\w*|скуд|пропускн\w* (?:систем\w*|режим\w*)|"
+                   r"систем\w* пропуск\w*|(?:цифров\w*|электронн\w*) пропуск\w*|"
+                   r"контрол\w* доступ\w* в (?:корпус\w*|кампус\w*))\b"),
+    ),
+    "sber-payroll": (
+        re.compile(r"\b(?:зарплат\w*|заработн\w* плат\w*|"
+                   r"реестр\w* (?:\w+ ){0,3}(?:выплат\w*|расчет\w*) (?:\w+ ){0,2}сотрудник\w*)\b"),
+        re.compile(r"\b(?:реестр\w*|автоматиз\w*|расчет\w*|зачислен\w*|"
+                   r"перечислен\w*|зарплатн\w* проект\w*|схем\w* выплат\w*)\b"),
+    ),
+    "sber-health-corporate": (
+        re.compile(r"\b(?:медицинск\w* (?:консультац\w*|поддерж\w*|помощ\w*|страхован\w*|"
+                   r"программ\w*|обслуживан\w*|услуг\w*|осмотр\w*)|"
+                   r"телемедицин\w*|медосмотр\w*|медстрахова\w*|диспансеризац\w*|дмс)\b"),
+        re.compile(r"\b(?:сотрудник\w*|работник\w*|преподавател\w*|персонал\w*|трудов\w* коллектив\w*)\b"),
+    ),
+}
+OPERATIONAL_INITIATIVE = re.compile(
+    r"\b(?:модерниз\w*|автоматиз\w*|внедр(?:я|ени|ить)\w*|обнов[ли]\w*|интеграци\w*|"
+    r"планиру\w*|запланирова\w*|предусматрива\w*|потребност\w*|необходимост\w*|нужда\w*|требу[ею]тся|"
+    r"объявил\w* проект\w*|анонсирова\w*|реализу\w*|разрабатыва\w*|закуп\w*|"
+    r"запуска\w*|переход\w* на)\b"
+)
+INACTIVE_INITIATIVE = re.compile(
+    r"\b(?:не (?:планиру\w*|предусматрива\w*|требу\w*|нужн\w*|нужда\w*|будет)|"
+    r"(?:отмен(?:ен|ил)|заверш(?:ен|ил))\w*|отказ\w* от|отсутств\w* потребност\w*|"
+    r"(?:учебн\w*|курсов\w*) проект\w*)\b"
+)
+PLANNED_INITIATIVE = re.compile(
+    r"\b(?:планиру\w*|запланирова\w*|анонсирова\w*|анонс\w*|объявил\w* проект\w*)\b"
+)
 CONTEXT_ONLY_FIELDS = {
     FactField.TYPE, FactField.LOCATION, FactField.EDUCATION_LEVELS, FactField.STUDENTS,
 }
@@ -156,22 +191,39 @@ def has_partnership_basis(facts: Iterable[Fact]) -> bool:
     return any(fact.field not in CONTEXT_ONLY_FIELDS for fact in facts)
 
 
+def operational_initiative(fact: Fact, topics: tuple[re.Pattern[str], ...]) -> str | None:
+    for sentence in re.split(r"[;\n]+|(?<=[.!?])\s+", fact.value):
+        wording = normalized(sentence)
+        if (OPERATIONAL_INITIATIVE.search(wording) and not INACTIVE_INITIATIVE.search(wording)
+                and all(topic.search(wording) for topic in topics)
+                and any(literal_value_in_text(sentence, proof.quote) for proof in fact.evidence)):
+            return " ".join(sentence.split())
+    return None
+
+
 async def match_partnership(
     provider: JSONProvider, facts: list[Fact], meeting: MeetingContext
 ) -> list[PartnershipMatch]:
     if not has_partnership_basis(facts):
         return []
-    operational_ids = {fact.fact_id for fact in facts if fact.field in OPERATIONAL_FIELDS}
+    operational_basis = {
+        key: {fact.fact_id: initiative for fact in facts if fact.field in OPERATIONAL_FIELDS
+              and (initiative := operational_initiative(fact, topics))}
+        for key, topics in OPERATIONAL_TOPICS.items()
+    }
     catalog = {
         key: entry for key, entry in MATCH_CATALOG.items()
-        if operational_ids or not entry.requires_operational_context
+        if not entry.requires_operational_context or operational_basis[key]
     }
     schema = MatchOutput.model_json_schema()
     schema["$defs"]["MatchProposal"]["properties"]["catalog_id"]["enum"] = list(catalog)
     raw = await provider.complete(PROMPT, {
         "meeting": meeting.model_dump(mode="json"),
-        "catalog": [entry.model_dump(mode="json", exclude={"available_for_matching", "requires_operational_context"})
-                    for entry in catalog.values()],
+        "catalog": [
+            {**entry.model_dump(mode="json", exclude={"available_for_matching", "requires_operational_context"}),
+             **({"required_basis_fact_ids": sorted(operational_basis[key])} if entry.requires_operational_context else {})}
+            for key, entry in catalog.items()
+        ],
         "facts": [{
             "fact_id": fact.fact_id,
             "field": fact.field.value,
@@ -200,10 +252,18 @@ async def match_partnership(
         if not basis & basis_ids:
             continue
         entry = catalog[catalog_id]
-        if entry.requires_operational_context and not basis & operational_ids:
-            raise LLMError("invalid_partnership_response")
+        rationale = proposal.rationale
+        if entry.requires_operational_context:
+            initiatives = [operational_basis[catalog_id][fact_id] for fact_id in proposal.basis_fact_ids
+                           if fact_id in operational_basis[catalog_id]]
+            if not initiatives:
+                raise LLMError("invalid_partnership_response")
+            planned = next((text for text in initiatives if PLANNED_INITIATIVE.search(normalized(text))), None)
+            if planned:
+                rationale = planned if len(planned) <= 220 else "В источнике указаны планы вуза по этой инициативе."
         matches.append(PartnershipMatch(
-            **proposal.model_dump(exclude={"catalog_id", "basis_fact_ids"}),
+            **proposal.model_dump(exclude={"catalog_id", "basis_fact_ids", "rationale"}),
+            rationale=rationale,
             basis_fact_ids=list(dict.fromkeys(proposal.basis_fact_ids)),
             product_name=entry.name, catalog_url=entry.url, kind=entry.kind,
         ))

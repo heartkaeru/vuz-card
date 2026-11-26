@@ -13,6 +13,7 @@ export type ResearchHandle = { generate: () => Promise<CardActionResult>; refres
 type Props = {
   university: University; showFacts: boolean; reviewOutlet: HTMLDivElement | null; onShowFacts: () => void;
   onConnected: (card: ApiCard) => void; onRunChange: (run: ResearchRun | null) => void;
+  chatCollectionJobId?: string;
 };
 type ReviewTab = "candidates" | "conflicts" | "accepted";
 const fields: Record<string, string> = {
@@ -125,7 +126,9 @@ function groupReviewFacts(facts: Fact[], institutionName: string, identityFacts 
   return [...groups.values()];
 }
 
-export const ResearchPanel = forwardRef<ResearchHandle, Props>(function ResearchPanel({ university, showFacts, reviewOutlet, onShowFacts, onConnected, onRunChange }, ref) {
+export const ResearchPanel = forwardRef<ResearchHandle, Props>(function ResearchPanel({
+  university, showFacts, reviewOutlet, onShowFacts, onConnected, onRunChange, chatCollectionJobId,
+}, ref) {
   const [website, setWebsite] = useState(university.website ?? "");
   const [leadershipUrl, setLeadershipUrl] = useState("");
   const [biographyUrl, setBiographyUrl] = useState("");
@@ -170,6 +173,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [replacePrevious, setReplacePrevious] = useState(false);
   const [recheckConfirmed, setRecheckConfirmed] = useState(false);
   const recheckRef = useRef<HTMLDetailsElement>(null);
+  const initializedCardId = useRef<string | null>(null);
   const busy = saving || matching || job?.status === "queued" || job?.status === "running";
   const websiteSuggestionCodes = new Set(["no_valid_extraction", "no_source_documents", "empty_source_documents", "collection_failed"]);
   const suggestWebsite = !website.trim() || job?.status === "failed" && websiteSuggestionCodes.has(job.result?.code ?? "");
@@ -217,6 +221,12 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
 
   function load(detail: CardDetail) {
     setCard(detail); setWebsite(detail.website); setRun(detail.run); onRunChange(detail.run); setJob(detail.job);
+    if (detail.job?.status === "failed" && detail.job.result?.code === "facts_require_freshness_check"
+        && detail.job.identity?.expected_revision !== detail.run?.revision) setJob(null);
+    setMaterial(detail.job?.status === "completed" && detail.job.result?.material_id
+        && detail.job.identity?.expected_revision === detail.run?.revision ? detail.job.result as Material : null);
+    if (initializedCardId.current === detail.id) return;
+    initializedCardId.current = detail.id;
     if (detail.job?.identity?.presentation_variant) setPresentationVariant(detail.job.identity.presentation_variant);
     if (detail.job?.identity?.leadership_url) setLeadershipUrl(detail.job.identity.leadership_url);
     if (detail.job?.identity?.biography_url) setBiographyUrl(detail.job.identity.biography_url);
@@ -228,10 +238,6 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       setMeetingGoal(detail.job.identity.meeting.goal);
       setMeetingDate(detail.job.identity.meeting.date ?? "");
     }
-    if (detail.job?.status === "failed" && detail.job.result?.code === "facts_require_freshness_check"
-        && detail.job.identity?.expected_revision !== detail.run?.revision) setJob(null);
-    if (detail.job?.status === "completed" && detail.job.result?.material_id &&
-        detail.job.identity?.expected_revision === detail.run?.revision) setMaterial(detail.job.result as Material);
   }
 
   function showCandidates() {
@@ -245,7 +251,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       .then((detail) => { if (active) load(detail); })
       .catch((failure) => { if (active) setError(errorText(failure)); });
     return () => { active = false; };
-  }, [university.backendId]);
+  }, [university.backendId, chatCollectionJobId]);
 
   useEffect(() => { setSelected([]); setPastChanges(null); setRecheckConfirmed(false); setReviewTab("candidates"); }, [run?.run_id, run?.revision]);
   useEffect(() => { setSourceChecked(false); setReplacePrevious(false); }, [run?.run_id, run?.revision, selected.join("|")]);
@@ -264,15 +270,16 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
 
   useEffect(() => {
     if (!job || !["queued", "running"].includes(job.status)) return;
+    const jobId = job.job_id;
     let active = true;
-    const timer = window.setInterval(async () => {
+    async function poll() {
       try {
-        const next = await api<Job>(`/jobs/${job.job_id}`);
+        const next = await api<Job>(`/jobs/${jobId}`);
         if (!active) return;
-        setJob(next);
         if (next.status === "completed" || next.status === "failed") {
           if (next.result?.run_id) {
             const updatedRun = await api<ResearchRun>(`/runs/${next.result.run_id}`);
+            if (!active) return;
             setRun(updatedRun); onRunChange(updatedRun);
           }
           if (next.result?.material_id) setMaterial(next.result as Material);
@@ -281,10 +288,15 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
             setPreviewAfterGenerationFrom(null);
             setError(next.message + (next.result?.code ? ` (${errorText(new Error(next.result.code))})` : ""));
           }
+          setJob(next);
+          return;
         }
+        setJob(next);
       } catch (failure) { if (active) setError(errorText(failure)); }
-    }, 1400);
-    return () => { active = false; window.clearInterval(timer); };
+      if (active) timer = window.setTimeout(poll, 1400);
+    }
+    let timer = window.setTimeout(poll, 1400);
+    return () => { active = false; window.clearTimeout(timer); };
   }, [job?.job_id, job?.status]);
 
   async function refresh(): Promise<CardActionResult> {

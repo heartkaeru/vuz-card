@@ -58,6 +58,7 @@ export default function UniversityDashboard() {
   const researchRef = useRef<ResearchHandle>(null);
   const [reviewOutlet, setReviewOutlet] = useState<HTMLDivElement | null>(null);
   const [runs, setRuns] = useState<Record<string, ResearchRun | null>>({});
+  const [chatCollectionJobs, setChatCollectionJobs] = useState<Record<string, string>>({});
   const [cardEditVersion, setCardEditVersion] = useState(0);
   const [reportSearch, setReportSearch] = useState("");
   const [reports, setReports] = useState<SavedMaterial[]>([]);
@@ -463,6 +464,7 @@ export default function UniversityDashboard() {
             </div>
             <div className="collection-panel-slot" hidden={section !== "collection"} aria-hidden={section !== "collection"}>
               <ResearchPanel key={selectedUniversity.id + "-" + cardEditVersion} ref={researchRef} university={selectedUniversity}
+                chatCollectionJobId={selectedUniversity.backendId ? chatCollectionJobs[selectedUniversity.backendId] : undefined}
                 showFacts={section === "review"} reviewOutlet={reviewOutlet} onShowFacts={() => setSection("review")}
                 onRunChange={(run) => setRuns((current) => ({ ...current, [selectedUniversity.id]: run }))}
                 onConnected={(card) => setUniversities((current) => current.map((item) => item.id === selectedId
@@ -602,6 +604,9 @@ export default function UniversityDashboard() {
         universityName={chatCard?.name ?? "Общий чат"} onClose={onChatClose}
         onOpenCard={(card) => { openChatCard(card); setChatMode("card"); }}
         onEditApplied={() => setCardEditVersion((version) => version + 1)}
+        onCollectionQueued={(cardId, jobId) => {
+          setChatCollectionJobs((current) => current[cardId] === jobId ? current : { ...current, [cardId]: jobId });
+        }}
         onCollection={(card) => {
           setSection("collection");
           openChatCard(card);

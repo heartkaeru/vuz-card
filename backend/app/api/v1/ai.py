@@ -27,8 +27,10 @@ from app.services.llm.client import ConfigurationError, GigaChatProvider, GigaCh
 from app.auth.security import decode_access_token
 from app.services.llm.card_chat import HISTORY_LIMIT, answer_card
 from app.services.llm.card_intake import plan_collection
+from app.services.llm.collection_intent import named_update_query, refresh_scope, refresh_sources
 from app.services.llm.general_chat import answer_general, registry_answer
 from app.services.llm.models import Institution, MeetingContext, StrictModel
+from app.services.llm.official_sources import official_leadership_document, official_reference_document
 from app.services.llm.partnership import PartnershipMatch, match_partnership, partnership_facts
 from app.services.llm.pipeline import AssistantPipeline, DraftValidationError, fact_needs_recheck
 from app.services.llm.render import render_markdown
@@ -100,8 +102,15 @@ def get_collector():
                        bio_urls=(biography_url,) if biography_url else ()) if leadership_url or biography_url else None)
             result = parser.parse(url=website, name=name, profile=profile,
                                   allowed_sections=("about", "leadership", "contacts") if include_institution or not leadership_url else ("leadership",))
-            existing = {document.url for document in result.documents}
-            reference_documents = parser.collect_institution_documents(institution_urls)
+            if not leadership_url:
+                official = official_leadership_document(parser.client, website, result.documents,
+                                                        max_chars=settings.max_document_chars)
+                if official:
+                    result.documents.insert(0, official)
+            existing = {document.url: document for document in result.documents}
+            reference_documents = [document for url in institution_urls if
+                                   (document := official_reference_document(parser.client, url, website, name,
+                                                                            max_chars=settings.max_document_chars))]
             if len(reference_documents) < len(institution_urls):
                 result.warnings.append("Часть справочных HTML-страниц не получена. Для PDF используйте отдельное поле отчёта.")
             pdf_documents, pdf_errors = parser.collect_pdf_documents(pdf_sources)
@@ -112,10 +121,12 @@ def get_collector():
                     result.warnings.append(f"PDF: обработаны страницы {document.metadata['pdf_selected_pages']} из {document.metadata['pdf_page_count']}; полный отчёт не обработан.")
                 if document.metadata.get("pdf_pages_without_text"):
                     result.warnings.append("pdf_pages_without_text_ocr_required")
-            for document in reference_documents:
-                if document.url not in existing:
-                    result.documents.append(document)
-                    existing.add(document.url)
+            for document in reversed(reference_documents):
+                previous = existing.get(document.url)
+                if previous:
+                    result.documents.remove(previous)
+                result.documents.insert(0, document)
+                existing[document.url] = document
             if leadership_url:
                 # The homepage was used for discovery, not selected as a fact source.
                 result.documents = [document for document in result.documents
@@ -248,7 +259,8 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
         research = await workflow.extract(research.run_id, context_fields=[
             "institution.profile", "institution.type", "institution.location", "institution.founded",
             "institution.education_areas", "institution.education_levels", "institution.students", "institution.structure"])
-        if research.status == "failed" or not research.facts:
+        has_candidates = any(fact.validation_status == "passed" and not fact.issues for fact in research.facts)
+        if research.status == "failed" or not has_candidates:
             stage_errors = [error.code for result in research.results.values() for error in result.errors]
             if no_documents:
                 repository.update_job(
@@ -259,7 +271,9 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
                     result={"run_id": research.run_id, "code": "no_source_documents"},
                 )
                 return
-            repository.update_job(job_id, status="failed", progress=100, message="Не удалось извлечь проверяемые факты",
+            message = ("Все найденные записи отклонены проверкой. Причины доступны в карточке."
+                       if research.facts else "Не удалось извлечь проверяемые факты")
+            repository.update_job(job_id, status="failed", progress=100, message=message,
                                   result={"run_id": research.run_id, "code": stage_errors[0] if stage_errors else "no_valid_extraction"})
         else:
             message = "Сведения собраны. Проверьте изменения"
@@ -460,18 +474,29 @@ async def chat_message(card_id: str, payload: ChatRequest, background: Backgroun
     card, run, turns = checked(lambda: repository.chat_snapshot(card_id, user_id, HISTORY_LIMIT))
     run_id, revision = (run.run_id, run.revision) if run else (None, None)
     context = [turn for turn in turns if (turn["run_id"], turn["revision"]) == (run_id, revision)]
+    registry = await checked_async(repository.cards) if named_update_query(payload.message) else None
+    direction = refresh_scope(payload.message, card, registry) if registry is not None else None
     try:
-        answer = await answer_card(pipeline.provider, card, run, context, payload.message)
+        answer = direction or await answer_card(pipeline.provider, card, run, context, payload.message)
     except LLMError as exc:
         raise HTTPException(502, str(exc)) from None
     except WorkflowError as exc:
         raise HTTPException(422, str(exc)) from None
+    if "registry_query" in answer:
+        answer = registry_answer(await checked_async(repository.cards), answer["registry_query"])
     if "collection_request" in answer:
         return {"collection": await start_chat_collection(
             answer["collection_request"], payload, user_id, background, repository, pipeline, collector,
         )}
     last_id = turns[-1]["id"] if turns else None
     if "refresh_request" in answer:
+        if registry is None:
+            registry = await checked_async(repository.cards)
+        scope = refresh_scope(payload.message, card, registry)
+        if scope:
+            return checked(lambda: repository.save_chat_turn(
+                card_id, user_id, run_id, revision, last_id, payload.message, scope,
+            ))
         try:
             public_url(card["website"])
         except ValueError:
@@ -479,6 +504,16 @@ async def chat_message(card_id: str, payload: ChatRequest, background: Backgroun
                       "sources": []}
         else:
             source_options = {"include_institution": True, "public_site_only": True}
+            try:
+                urls = refresh_sources(payload.message, card["website"])
+            except ValueError:
+                answer = {"text": "Для сбора укажите до трёх ссылок на публичные страницы официального сайта открытого вуза.",
+                          "sources": []}
+                return checked(lambda: repository.save_chat_turn(
+                    card_id, user_id, run_id, revision, last_id, payload.message, answer,
+                ))
+            if urls:
+                source_options["institution_urls"] = urls
             identity = {"version": card["version"], **source_options}
             key = f"chat-refresh:{user_id}:{payload.request_key}"
             turn, job, created = checked(lambda: repository.save_chat_turn(

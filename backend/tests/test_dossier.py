@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -10,8 +11,9 @@ from pptx import Presentation
 from app.services.llm.client import FixtureProvider
 from app.services.llm.context_models import ContextExtractionRequest, ContextField
 from app.services.llm.fragment_models import FragmentExtractionRequest
-from app.services.llm.models import DraftResult, GenerationRequest
+from app.services.llm.models import DraftResult, GenerationRequest, Institution
 from app.services.llm.pipeline import AssistantPipeline, DraftValidationError
+from app.services.llm.official_sources import official_program_candidates, official_reference_document
 from app.services.meeting_pptx import build_meeting_presentation
 from parser.biography import mark_biography_subject
 from parser.cleaner import HTMLCleaner
@@ -20,6 +22,57 @@ from parser.institution_context import mark_institution_context
 
 NAME = "Иванов Иван Иванович"
 INSTITUTION = {"id": "draft:dossier-test", "name": "Учебный университет", "card_version": 1}
+
+
+def test_official_program_reference_keeps_subdomain_and_literal_title_anchor():
+    url = "https://admission.university.example/about/program"
+    page = SimpleNamespace(final_url=url, text="""<html><head>
+        <title>09.03.04. Программная инженерия | Приёмная комиссия. Учебный университет</title>
+        <link rel="canonical" href="/about/program">
+        </head><body><main><h1>Программная инженерия</h1><p>Бакалавриат</p></main></body></html>""")
+    client = SimpleNamespace(get=lambda _: page)
+    document = official_reference_document(client, url, "https://university.example",
+                                           "Учебный университет", max_chars=4000)
+    assert document.url == url
+    anchor = next(fragment for fragment in document.fragments
+                  if "Приёмная комиссия. Учебный университет" in document.text[fragment.start:fragment.end])
+    assert any(fragment.institution_anchor_id == anchor.fragment_id
+               and "Бакалавриат" in document.text[fragment.start:fragment.end] for fragment in document.fragments)
+    institution = Institution.model_validate(INSTITUTION)
+    fact, = official_program_candidates([document], institution, [])
+    assert fact.value == "09.03.04. Программная инженерия" and fact.verification_status == "pending"
+    assert fact.evidence[0].url == url
+    assert document.text[anchor.start:anchor.end] == fact.evidence[0].quote
+    assert not list(official_program_candidates([document], institution, [fact]))
+
+
+def test_program_disclosure_keeps_query_and_links_literal_heading_to_publisher():
+    url = "https://university.example/sveden/education/program?f=2026_09.03.03"
+    value = "09.03.03 Прикладная информатика: Системы искусственного интеллекта"
+    owner = "Учебный университет"
+    page = SimpleNamespace(final_url=url, text=f"""<html><head>
+        <title>Информация о реализуемой образовательной программе</title>
+        <link rel="canonical" href="/sveden/education/program">
+        </head><body><main><h4>{value}</h4>
+        <span itemprop="eduCode">09.03.03</span><span itemprop="eduName">Прикладная информатика</span>
+        </main><footer><p>© 2026 {owner}</p></footer></body></html>""")
+    client = SimpleNamespace(get=lambda _: page)
+    institution = Institution.model_validate(INSTITUTION)
+
+    document = official_reference_document(client, url, "https://university.example",
+                                           institution.name, max_chars=4000)
+    assert document.url == url
+    fact, = official_program_candidates([document], institution, [])
+    assert fact.value == value and fact.verification_status == "pending"
+    assert [proof.quote for proof in fact.evidence] == [value, owner]
+    for proof in fact.evidence:
+        assert document.text[proof.start_offset:proof.end_offset] == proof.quote
+        assert proof.url == url
+
+    page.text = page.text.replace(owner, "Другой университет")
+    other = official_reference_document(client, url, "https://university.example",
+                                        institution.name, max_chars=4000)
+    assert not list(official_program_candidates([other], institution, []))
 
 
 def biography_request():
