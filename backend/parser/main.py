@@ -48,6 +48,7 @@ from .config import (
     Settings,
     UniversityProfile,
 )
+from .models import focus_document
 from .models import (
     Achievement,
     AggregatorPassport,
@@ -71,7 +72,7 @@ from .models import (
 from .news_search import NewsSearch
 from .official_site import OfficialSiteDiscovery, resolve_official_site
 from .specialties import cooperation_directions, dedupe_specialties, parse_specialties
-from .stealth import StealthFetcher
+from .stealth import StealthFetcher, looks_like_spa_shell
 from .store import CrawlCache, DocumentStore
 from .utils import (
     BlockedError,
@@ -173,6 +174,14 @@ SECTION_ORDER = {
 # Разделы официального сайта, которые собираются всегда, когда сайт известен:
 # руководство и контакты есть только там, и они должны быть актуальными.
 OFFICIAL_CORE_SECTIONS: tuple[str, ...] = ("about", "leadership", "contacts", "programs")
+
+# Страницы руководства длиннее этого порога сокращаются до фрагментов об
+# основном руководстве перед отправкой в нейросеть.
+LEADERSHIP_FOCUS_MIN_CHARS = 6000
+KEY_LEADERSHIP_TEXT_RE = re.compile(
+    r"(?<![а-я])(?:ректор|проректор|президент|ректорат|учен[а-я]*\s+совет|"
+    r"при[её]мн(?![а-я]*\s+комисс))",
+)
 
 # Основное руководство: ректор (0), президент (1), первый проректор (2),
 # проректоры (3), научный руководитель (4).
@@ -1553,9 +1562,13 @@ class UniversityParser:
             return None
         error_code = getattr(self.client, "last_error_code", "")
         last_error = str(getattr(self.client, "last_error", "") or "")
-        # 404, запрет robots.txt и лимит запросов браузер не обходит.
+        # 404, запрет robots.txt, лимит запросов, таймаут и DNS браузер не
+        # исправит. Резервный загрузчик сначала пробует curl_cffi, а Chromium
+        # запускает только при JS-проверке, SPA или отказе TLS.
         if error_code == "response_too_large" or re.search(
-            r"HTTP 4\d\d|robots\.txt|лимит запросов|Public website required", last_error
+            r"HTTP 4\d\d|robots\.txt|лимит запросов|Public website required|"
+            r"Timeout|timed out|NameResolution|Failed to resolve|ConnectionRefused",
+            last_error,
         ):
             return None
         if self.settings.respect_robots:
@@ -1727,9 +1740,14 @@ class UniversityParser:
             content_type=content_type,
         )
 
-        # Если HTML не содержит контента (SPA/JS), пробуем браузерный
-        # рендеринг — только если он явно разрешён настройкой.
-        if len(doc.text) < 200 and self.settings.enable_playwright and canonical not in self._raw_pages:
+        # Если HTML — пустая оболочка SPA (контент рисует JavaScript), пробуем
+        # браузер. Короткая обычная страница браузера не требует.
+        if (
+            len(doc.text) < 200
+            and self.settings.enable_playwright
+            and canonical not in self._raw_pages
+            and looks_like_spa_shell(html, content_type)
+        ):
             rendered = self._render_with_playwright(canonical)
             if rendered and rendered != html:
                 cache_entry = None
@@ -3694,7 +3712,7 @@ class UniversityParser:
             passport=self._passport,
             passports=self._passports,
             news_mentions=self._news_mentions,
-            documents=list(self._documents.values()),
+            documents=self._documents_for_llm(leadership),
             conflicts=self._collect_conflicts(),
             warnings=dedupe_preserve(self._warnings),
             errors=dedupe_preserve(self._errors),
@@ -3718,6 +3736,48 @@ class UniversityParser:
                 + ", ".join(sorted(labels)[:5])
             )
         return conflicts[:50]
+
+    def _documents_for_llm(self, leadership: list[Leadership]) -> list[SourceDocument]:
+        """Документы для нейросети без лишнего текста.
+
+        Каждый фрагмент — отдельный запрос к GigaChat, а запросы идут
+        последовательно. Страница «Структура и органы управления» крупного
+        вуза — это сотни руководителей подразделений (у УрФУ ~93 тыс.
+        символов, около половины всех запросов), хотя в карточку попадает
+        только основное руководство. Поэтому из больших страниц руководства
+        оставляем фрагменты о ректоре, проректорах и приёмной, а главную
+        страницу (меню и лента новостей) не отправляем, если есть страница
+        «Основные сведения».
+        """
+
+        documents = list(self._documents.values())
+        has_about = any(doc.section == "about" and doc.text for doc in documents)
+        surnames = {
+            leader.full_name.split()[0].lower().replace("ё", "е")[:-1]
+            for leader in leadership
+            if leader.full_name and len(leader.full_name.split()[0]) > 3
+        }
+
+        def relevant(text: str) -> bool:
+            folded = text.lower().replace("ё", "е")
+            return bool(KEY_LEADERSHIP_TEXT_RE.search(folded)) or any(
+                surname and surname in folded for surname in surnames
+            )
+
+        result: list[SourceDocument] = []
+        for doc in documents:
+            if doc.section == "homepage" and has_about:
+                continue
+            if doc.section == "leadership" and len(doc.text) > LEADERSHIP_FOCUS_MIN_CHARS:
+                focused = focus_document(doc, relevant)
+                if focused is not None:
+                    LOGGER.info(
+                        "Для нейросети: %s — %s из %s символов (только основное руководство)",
+                        doc.url, len(focused.text), len(doc.text),
+                    )
+                    doc = focused
+            result.append(doc)
+        return result
 
     def _key_leadership(self) -> list[Leadership]:
         """Основное руководство для связи: ректор, президент, проректоры.

@@ -55,6 +55,85 @@ window.chrome = window.chrome || {runtime: {}};
 
 MAX_RESPONSE_BYTES = 8_000_000
 
+# --- Когда нужен браузер ------------------------------------------------------
+# Chromium запускается только там, где без него страницу не получить:
+# 1) JS-проверка браузера антибота (Cloudflare «Just a moment», DDoS-Guard,
+#    «Проверяем браузер»): она пропускает после выполнения JavaScript;
+# 2) SPA-сайт отдал пустую оболочку (контент рисует JavaScript);
+# 3) TLS/соединение отвергнуто для обычного клиента, но не таймаут и не DNS.
+# Капчу («вы не робот», «введите символы») браузер не решает — её не трогаем.
+# Поисковики и справочные API браузером не открываются никогда.
+JS_CHALLENGE_MARKERS = (
+    "just a moment",
+    "checking your browser",
+    "проверка браузера",
+    "проверяем браузер",
+    "что вы не бот",
+    "ddos-guard",
+    "cf-chl",
+    "challenge-platform",
+    "enable javascript and cookies",
+    "включите javascript",
+)
+CAPTCHA_MARKERS = ("captcha", "вы не робот", "введите символы", "smartcaptcha", "recaptcha")
+CHALLENGE_SERVERS = ("cloudflare", "ddos-guard", "qrator", "variti", "stormwall")
+SPA_MARKERS = (
+    'id="app"', "id='app'", 'id="root"', "id='root'", "id=\"__next\"", "__next_data__",
+    "__nuxt", "data-sveltekit", "_app/immutable", "ng-version", "ng-app", "data-reactroot",
+    "window.__initial_state__", "<app-root",
+)
+NO_BROWSER_HOSTS = (
+    "yandex.ru", "yandex.com", "google.com", "googleapis.com", "bing.com",
+    "duckduckgo.com", "yahoo.com", "wikipedia.org", "wikidata.org",
+)
+BROWSER_NETWORK_ERRORS = ("ssl", "tls", "certificate", "handshake", "connection reset", "http/2", "http2")
+
+
+def browser_allowed_for(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return not any(host == item or host.endswith("." + item) for item in NO_BROWSER_HOSTS)
+
+
+def needs_js_challenge(status: int, text: str, headers: dict | None = None) -> bool:
+    """Ответ — JS-проверка антибота, которую проходит только браузер."""
+
+    sample = (text or "")[:200_000].lower()
+    if any(marker in sample for marker in CAPTCHA_MARKERS) and not any(
+        marker in sample for marker in JS_CHALLENGE_MARKERS
+    ):
+        return False  # капча: браузер не поможет
+    server = " ".join(str(value) for value in (headers or {}).values()).lower()
+    if status in {403, 503} and any(name in server for name in CHALLENGE_SERVERS):
+        return True
+    if visible_text_length(text) > 3000:
+        return False
+    return any(marker in sample for marker in JS_CHALLENGE_MARKERS)
+
+
+def looks_like_spa_shell(html: str, content_type: str = "text/html") -> bool:
+    """Пустая HTML-оболочка SPA: текста почти нет, контент рисует JavaScript."""
+
+    if content_type and "html" not in content_type.lower():
+        return False
+    if visible_text_length(html) >= 400:
+        return False
+    lowered = (html or "")[:300_000].lower()
+    if "<html" not in lowered and "<!doctype" not in lowered:
+        return False
+    if any(marker in lowered for marker in SPA_MARKERS):
+        return True
+    # Много скриптов и почти нет текста — тоже оболочка.
+    return lowered.count("<script") >= 5 and visible_text_length(html) < 200
+
+
+def network_error_needs_browser(error: str) -> bool:
+    """Таймаут и DNS браузер не исправит; отказ TLS/сброс соединения — может."""
+
+    lowered = (error or "").lower()
+    if any(word in lowered for word in ("timed out", "timeout", "resolve", "name or service", "refused")):
+        return False
+    return any(word in lowered for word in BROWSER_NETWORK_ERRORS)
+
 # --- Ограничения Chromium для небольшого сервера (1 vCPU / 2 ГБ) ---------------
 # Один headless-Chromium с открытой страницей занимает ~250–400 МБ. Одновременно
 # держим не больше PARSER_MAX_BROWSERS браузеров (по умолчанию один): задачи,
@@ -309,24 +388,27 @@ class StealthFetcher:
             return StealthResponse(url, 0, "", error="public_website_required")
         except Exception as exc:  # noqa: BLE001 - сеть/SSL/таймаут
             LOGGER.warning("Не удалось загрузить %s: %s", url, exc)
-            if not self.enable_playwright:
-                return StealthResponse(url, 0, "", error=str(exc))
-            return self._playwright_get(url, timeout, error=str(exc))
+            if (
+                self.enable_playwright
+                and browser_allowed_for(url)
+                and network_error_needs_browser(str(exc))
+            ):
+                LOGGER.info("%s: соединение отвергнуто (%s), пробую браузер", url, exc)
+                return self._playwright_get(url, timeout, error=str(exc))
+            return StealthResponse(url, 0, "", error=str(exc))
 
-        if self.looks_blocked(status, text) and self.enable_playwright:
-            LOGGER.info("Блокировка %s, пробую Playwright", url)
+        if not (self.enable_playwright and browser_allowed_for(url)):
+            return StealthResponse(url, status, text, content_type, final_url=final_url)
+
+        if needs_js_challenge(status, text, dict(response.headers)):
+            LOGGER.info("%s: JS-проверка антибота, открываю в браузере", url)
             rendered = self._playwright_get(url, timeout)
             if rendered.ok and not self.looks_blocked(rendered.status_code, rendered.text):
                 return rendered
-
-        if (
-            self.enable_playwright
-            and status < 400
-            and visible_text_length(text) < 400
-        ):
+        elif status < 400 and looks_like_spa_shell(text, content_type):
             # SPA-сайты (например, МГУ на SvelteKit) отдают пустую оболочку:
             # весь контент дорисовывается в браузере.
-            LOGGER.info("%s: пустая HTML-оболочка, рендерю через Playwright", url)
+            LOGGER.info("%s: пустая HTML-оболочка SPA, рендерю в браузере", url)
             rendered = self._playwright_get(url, timeout)
             if rendered.ok and visible_text_length(
                 rendered.text

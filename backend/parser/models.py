@@ -621,3 +621,59 @@ class UniversityData(BaseModel):
 
 
 AggregatorPassport.model_rebuild()
+
+
+def focus_document(document: SourceDocument, keep, min_chars: int = 1) -> SourceDocument | None:
+    """Копия документа только с нужными фрагментами (смещения пересчитаны).
+
+    ``keep(text)`` решает, нужен ли фрагмент. Сохраняются и фрагменты, на
+    которые ссылаются оставленные (заголовок-владелец контакта, якорь
+    биографии), чтобы документ оставался валидным для LLM-контрактов.
+    Возвращает ``None``, если сокращать нечего или остаётся слишком мало.
+    """
+
+    by_id = {fragment.fragment_id: fragment for fragment in document.fragments}
+    keep_ids = {
+        fragment.fragment_id
+        for fragment in document.fragments
+        if keep(document.text[fragment.start:fragment.end])
+    }
+    for fragment_id in list(keep_ids):
+        fragment = by_id[fragment_id]
+        for hint in fragment.contact_hints:
+            keep_ids.update(hint.context_fragment_ids)
+        if fragment.biography_subject:
+            keep_ids.add(fragment.biography_subject.anchor_fragment_id)
+        if fragment.institution_anchor_id:
+            keep_ids.add(fragment.institution_anchor_id)
+    keep_ids &= set(by_id)
+    if not keep_ids or len(keep_ids) == len(by_id):
+        return None
+    parts: list[str] = []
+    fragments: list[DocumentFragment] = []
+    offset = 0
+    for fragment in document.fragments:
+        if fragment.fragment_id not in keep_ids:
+            continue
+        piece = document.text[fragment.start:fragment.end]
+        if parts:
+            offset += 2
+        fragments.append(fragment.model_copy(update={"start": offset, "end": offset + len(piece)}))
+        parts.append(piece)
+        offset += len(piece)
+    text = "\n\n".join(parts)
+    if len(text) < min_chars:
+        return None
+    import hashlib
+
+    return document.model_copy(
+        update={
+            "text": text,
+            "fragments": fragments,
+            "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "metadata": {**document.metadata, "focused_from_chars": str(len(document.text))},
+            "blocks": [],
+            "main_html": "",
+        }
+    )
+

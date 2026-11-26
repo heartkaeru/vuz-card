@@ -663,3 +663,90 @@ def test_list_universities_sql_casts_optional_filters():
     source = inspect.getsource(api_repository.ApiRepository.list_universities) if hasattr(
         api_repository, "ApiRepository") else inspect.getsource(api_repository)
     assert "CAST(:region AS text) IS NULL" in source and "CAST(:search AS text) IS NULL" in source
+
+
+def test_llm_documents_keep_only_key_leadership_fragments():
+    rows = "".join(
+        f"<tr><td>Центр {index}</td><td>Сотрудников Сотрудник Сотрудникович{index % 10}</td>"
+        f"<td>Директор центра</td><td>+7 (343) 375-{index:02d}-{index:02d}</td></tr>"
+        for index in range(10, 90)
+    )
+    html = f"""<html><body><main>
+      <h2>Ректорат</h2><p>Ректор Иванов Иван Иванович</p><p>Приёмная ректора: +7 (343) 375-45-07</p>
+      <table><tr><th>Подразделение</th><th>ФИО</th><th>Должность</th><th>Телефон</th></tr>{rows}</table>
+    </main></body></html>"""
+    doc = HTMLCleaner().to_document(html, url="https://vuz.ru/sveden/struct/", section="leadership")
+    about = HTMLCleaner().to_document("<main><p>" + "Сведения об университете. " * 20 + "</p></main>",
+                                      url="https://vuz.ru/sveden/common/", section="about")
+    home = HTMLCleaner().to_document("<main><p>" + "Новости и меню сайта. " * 20 + "</p></main>",
+                                     url="https://vuz.ru/", section="homepage")
+    parser = UniversityParser(Settings(use_sqlite=False, use_cache=False, enable_playwright=False))
+    parser._documents = {("a", "leadership"): doc, ("b", "about"): about, ("c", "homepage"): home}
+    try:
+        documents = parser._documents_for_llm([Leadership(full_name="Иванов Иван Иванович", position="Ректор")])
+    finally:
+        parser.close()
+    assert [item.section for item in documents] == ["leadership", "about"]  # главная не нужна
+    focused = documents[0]
+    assert len(focused.text) < len(doc.text) / 3
+    assert "Иванов Иван Иванович" in focused.text and "375-45-07" in focused.text
+    assert "Директор центра" not in focused.text
+    # Смещения пересчитаны: документ проходит контракт LLM 0.2.
+    from app.services.llm.fragment_models import FragmentExtractionRequest
+    from parser.llm_adapter import to_llm_request
+
+    card = UniversityData(university=UniversityInfo(name="Тест", url="https://vuz.ru/"), documents=[focused])
+    FragmentExtractionRequest.model_validate(to_llm_request(card, institution_id="t"))
+
+
+def test_chromium_runs_only_when_needed(monkeypatch):
+    from parser import stealth
+
+    long_text = "<html><body><main>" + "<p>Обычная страница вуза с текстом.</p>" * 40 + "</main></body></html>"
+    spa = '<!doctype html><html><body><div id="app"></div><script src="/_app/immutable/start.js"></script></body></html>'
+    challenge = "<html><title>Just a moment...</title><body>Checking your browser</body></html>"
+    captcha = "<html><body>Подтвердите, что вы не робот. Введите символы с картинки (captcha)</body></html>"
+    short_page = "<html><body><p>Контакты: +7 (343) 375-44-44</p></body></html>"
+
+    class Response:
+        def __init__(self, url, status, text, headers=None):
+            self.url, self.status_code, self.content = url, status, text.encode("utf-8")
+            self.headers = {"Content-Type": "text/html; charset=utf-8", **(headers or {})}
+
+    pages = {
+        "https://vuz.ru/": (200, long_text, None),
+        "https://spa.ru/": (200, spa, None),
+        "https://protected.ru/": (503, challenge, {"Server": "cloudflare"}),
+        "https://captcha.ru/": (200, captcha, None),
+        "https://short.ru/": (200, short_page, None),
+        "https://yandex.ru/search/?text=x": (200, challenge, None),
+    }
+
+    class Session:
+        def get(self, url, **kwargs):
+            if url == "https://timeout.ru/":
+                raise TimeoutError("Operation timed out after 20000 milliseconds")
+            if url == "https://tls.ru/":
+                raise OSError("SSL handshake failed: connection reset")
+            status, text, headers = pages[url]
+            return Response(url, status, text, headers)
+
+        def close(self):
+            pass
+
+    rendered: list[str] = []
+    fetcher = StealthFetcher(enable_playwright=True, min_delay=0)
+    fetcher._session = Session()
+    monkeypatch.setattr(
+        fetcher, "_playwright_get",
+        lambda url, timeout, error="": rendered.append(url) or StealthResponse(url, 0, "", engine="playwright"),
+    )
+    for url in ("https://vuz.ru/", "https://spa.ru/", "https://protected.ru/", "https://captcha.ru/",
+                "https://short.ru/", "https://yandex.ru/search/?text=x", "https://timeout.ru/", "https://tls.ru/"):
+        fetcher.get(url)
+    assert rendered == ["https://spa.ru/", "https://protected.ru/", "https://tls.ru/"]
+
+    assert stealth.looks_like_spa_shell(spa)
+    assert not stealth.looks_like_spa_shell(short_page)
+    assert not stealth.network_error_needs_browser("Connection timed out")
+    assert stealth.network_error_needs_browser("SSL: CERTIFICATE_VERIFY_FAILED")
