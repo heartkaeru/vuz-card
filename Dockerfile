@@ -8,8 +8,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# libatomic1 нужен самому драйверу Playwright (Node.js): без него падает уже
+# команда `playwright install`, и --with-deps не успевает его поставить.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements*.txt /app/backend/
