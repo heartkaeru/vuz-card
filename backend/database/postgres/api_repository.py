@@ -136,8 +136,9 @@ class SupabaseUniversityRepository:
                         AND o.appointment_status='current' ORDER BY o.verification_status='verified' DESC LIMIT 1) AS rector_fio,
                        u.version, COALESCE(u.updated_at,u.created_at) AS updated_at,u.created_at
                 FROM public.vuz_universities u LEFT JOIN public.vuz_legal_entities le ON le.id=u.legal_entity_id
-                WHERE (:search IS NULL OR u.name ILIKE :pattern OR COALESCE(u.short_name,'') ILIKE :pattern)
-                  AND (:region IS NULL OR COALESCE(u.region,'') ILIKE :region)
+                WHERE (CAST(:search AS text) IS NULL OR u.name ILIKE CAST(:pattern AS text)
+                       OR COALESCE(u.short_name,'') ILIKE CAST(:pattern AS text))
+                  AND (CAST(:region AS text) IS NULL OR COALESCE(u.region,'') ILIKE CAST(:region AS text))
                 ORDER BY u.name
             """), {"search": search, "pattern": f"%{search}%" if search else None,
                     "region": region})

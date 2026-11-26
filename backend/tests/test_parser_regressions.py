@@ -642,3 +642,24 @@ def _try_browser() -> str:
         return str(exc)
     finally:
         fetcher.close()
+
+
+def test_site_lookup_names_and_origin():
+    from parser.official_site import _origin
+
+    assert _passport_matches("НИУ ВШЭ", "Высшая школа экономики")
+    assert not _passport_matches("НИУ ВШЭ", "Лицей НИУ ВШЭ")
+    assert _passport_matches("Казанский федеральный университет", "Казанский университет")
+    assert not _passport_matches("Казанский федеральный университет", "Набережночелнинский институт КФУ")
+    assert _origin("https", "tpu.ru:443") == "https://tpu.ru/"
+    assert _origin("http", "vuz.ru:8080") == "http://vuz.ru:8080/"
+
+
+def test_list_universities_sql_casts_optional_filters():
+    import inspect
+
+    from database.postgres import api_repository
+
+    source = inspect.getsource(api_repository.ApiRepository.list_universities) if hasattr(
+        api_repository, "ApiRepository") else inspect.getsource(api_repository)
+    assert "CAST(:region AS text) IS NULL" in source and "CAST(:search AS text) IS NULL" in source

@@ -27,6 +27,7 @@ from .utils import (
     is_same_domain,
     looks_like_person_name,
     normalize_whitespace,
+    registrable_domain,
     slugify,
     truncate_text,
 )
@@ -233,6 +234,25 @@ class OfficialSiteDiscovery:
     # Официальный сайт
     # ------------------------------------------------------------------
     def find_site(self, university_name: str, short_name: str = "") -> str:
+        site = self._find_site(university_name, short_name)
+        return self._prefer_root(site, university_name, short_name) if site else ""
+
+    def _prefer_root(self, site: str, university_name: str, short_name: str) -> str:
+        """Поддомен (school.hse.ru) → основной сайт вуза (hse.ru), если он о том же вузе."""
+
+        parsed = urlparse(site)
+        host = parsed.netloc.lower().split(":")[0]
+        bare = host[4:] if host.startswith("www.") else host
+        root = registrable_domain(bare)
+        if not root or root == bare:
+            return site
+        for candidate in (f"https://www.{root}/", f"https://{root}/"):
+            verified = self._verify_site(candidate, university_name, short_name)
+            if verified:
+                return verified
+        return site
+
+    def _find_site(self, university_name: str, short_name: str = "") -> str:
         if not normalize_whitespace(university_name) and not normalize_whitespace(short_name):
             return ""
         wiki_site = self._wikipedia_site(university_name or short_name, short_name)
@@ -282,7 +302,7 @@ class OfficialSiteDiscovery:
         if not self._text_mentions(text, university_name, short_name):
             return ""
         scheme = final.scheme or "https"
-        return f"{scheme}://{final.netloc or urlparse(site_url).netloc}/"
+        return _origin(scheme, final.netloc or urlparse(site_url).netloc)
 
     @staticmethod
     def _text_mentions(text: str, university_name: str, short_name: str = "") -> bool:
@@ -898,7 +918,7 @@ class OfficialSiteDiscovery:
             if not _response_ok(probe):
                 continue
             final = urlparse(probe.final_url or site)
-            return f"{final.scheme or scheme}://{final.netloc or parsed.netloc}/"
+            return _origin(final.scheme or scheme, final.netloc or parsed.netloc)
         return ""
 
     def _wikipedia_infobox_site(self, title: str) -> str:
@@ -953,6 +973,15 @@ class OfficialSiteDiscovery:
             return bool(name) and normalize_whitespace(name).lower() in haystack
         stems = {token[: max(4, len(token) - 2)] for token in tokens}
         return sum(1 for stem in stems if stem in haystack) >= min(2, len(stems))
+
+
+def _origin(scheme: str, netloc: str) -> str:
+    """Корень сайта без порта по умолчанию: https://tpu.ru:443 → https://tpu.ru/."""
+
+    netloc = netloc.lower()
+    if (scheme == "https" and netloc.endswith(":443")) or (scheme == "http" and netloc.endswith(":80")):
+        netloc = netloc.rsplit(":", 1)[0]
+    return f"{scheme}://{netloc}/"
 
 
 def _response_ok(response: object) -> bool:

@@ -63,6 +63,10 @@ def name_match_score(query: str, title: str) -> float:
         # Все слова запроса есть, но в названии есть и другие значимые слова:
         # «Российский государственный университет» ≠ «… гуманитарный университет».
         return 35.0
+    if len(t_tokens) >= 2 and t_tokens < q_tokens and (q_tokens - t_tokens) <= STATUS_WORDS:
+        # Короткое название без статуса: «Казанский университет» =
+        # «Казанский федеральный университет».
+        return 70.0
     return 30.0 * SequenceMatcher(None, t, q).ratio()
 
 
@@ -106,19 +110,40 @@ def abbreviation(title: str) -> str:
 
 
 def short_name_matches(query: str, title: str) -> bool:
-    """Короткое название («МГУ», «СПбГУ», «НИУ ВШЭ») соответствует полному."""
+    """Короткое название («МГУ», «СПбГУ», «НИУ ВШЭ») соответствует полному.
+
+    Подразделения и подведомственные организации («Лицей НИУ ВШЭ»,
+    «Набережночелнинский институт КФУ») вузом не считаются.
+    """
 
     q = normalize_whitespace(query)
     if not q or not title:
         return False
     folded_title = _fold(title)
-    if re.search(rf"(?<![а-яa-z0-9]){re.escape(_fold(q))}(?![а-яa-z0-9])", folded_title):
-        return True
+    match = re.search(rf"(?<![а-яa-z0-9]){re.escape(_fold(q))}(?![а-яa-z0-9])", folded_title)
+    if match:
+        return not SUBORDINATE_RE.search(folded_title[: match.start()])
+    if SUBORDINATE_RE.match(folded_title):
+        return False
     capitals = re.sub(r"[^А-ЯЁA-Z]", "", q).replace("Ё", "Е")
     if len(capitals) < 2:
         return False
     abbr = abbreviation(title)
-    return capitals == abbr or (len(capitals) >= 3 and abbr.endswith(capitals))
+    return capitals == abbr or (len(capitals) >= 3 and len(abbr) >= 2 and (
+        abbr.endswith(capitals) or (len(abbr) >= 3 and capitals.endswith(abbr))
+    ))
+
+
+# Подразделения и подведомственные организации вуза.
+SUBORDINATE_RE = re.compile(
+    r"(?<![а-яa-z])(?:лице[йя]|гимнази|школ[аы]\s|факультет|кафедр|филиал|колледж|техникум|"
+    r"обсерватори|библиотек|музе[йя]|издательств|институт[а-я]*\s+(?!.*университет$))"
+)
+# Слова статуса, без которых название вуза остаётся тем же.
+STATUS_WORDS = {
+    "федеральный", "национальный", "исследовательский", "государственный",
+    "приволжский", "российский", "межрегиональный", "автономный",
+}
 
 
 def _query_is_specific(query: str) -> bool:
