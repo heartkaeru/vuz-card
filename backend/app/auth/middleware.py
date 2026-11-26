@@ -9,7 +9,7 @@ from starlette.responses import Response
 from app.auth.security import decode_access_token
 
 
-_UNIVERSITY_WRITE_PATH = re.compile(r"^/api/v1/universities(?:/[^/]+)?/?$")
+_UNIVERSITY_WRITE_PATH = re.compile(r"^/api/v1/universities(?:/.*)?/?$")
 _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 

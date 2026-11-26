@@ -1,127 +1,54 @@
-"""Runtime access to the Supabase university registry."""
+"""Supabase registry adapter with SQLite-backed AI workflow state."""
 
 import os
 from contextlib import closing
 from pathlib import Path
-from uuid import UUID, uuid4
-
-from psycopg.rows import dict_row
+from uuid import UUID
 
 from app.services.llm.workflow_models import WorkflowError
-from database.postgres.db import connect as connect_postgres, set_actor
+from database.postgres.api_repository import (
+    RepositoryConflict,
+    RepositoryNotFound,
+    SupabaseUniversityRepository,
+)
 from database.schema import connect as connect_sqlite
 from parser.public_http import website_key
 
 
 class SupabaseRegistry:
-    """Small server-side repository for the existing vuz_universities table."""
+    """Async SQLAlchemy access to the Supabase university registry."""
 
     def __init__(self, dsn: str | None = None):
         self.dsn = (dsn if dsn is not None else os.environ.get("DATABASE_URL", "")).strip()
         if not self.dsn:
             raise RuntimeError("DATABASE_URL is required for the Supabase registry")
+        self._repository = SupabaseUniversityRepository(dsn=self.dsn)
 
-    def _connect(self):
+    async def list_cards(self):
+        return await self._repository.list_cards()
+
+    async def get_card(self, card_id: str):
+        return await self._repository.get_card(card_id)
+
+    async def create_or_resolve(self, name: str, city: str, website: str):
         try:
-            return connect_postgres(self.dsn, application_name="vuz-card-api", row_factory=dict_row)
-        except Exception:
-            # psycopg errors can include connection details; never return those to the UI.
-            raise RuntimeError("Supabase connection failed; check DATABASE_URL and network access") from None
+            return await self._repository.create_or_resolve_card(name, city, website)
+        except RepositoryConflict as exc:
+            if str(exc) == "chat_collection_card_ambiguous":
+                raise WorkflowError(str(exc)) from None
+            raise
 
-    @staticmethod
-    def _card(row):
-        return {
-            "id": str(row["id"]),
-            "name": row["name"],
-            "city": row["city"] or "",
-            "website": row["website"] or "",
-            "version": row["version"],
-            "created_at": row["created_at"].isoformat() if row["created_at"] else "",
-        }
-
-    def list_cards(self):
-        with self._connect() as db:
-            rows = db.execute(
-                """SELECT id, name, city, website, version, created_at
-                   FROM public.vuz_universities ORDER BY name"""
-            ).fetchall()
-        return [self._card(row) for row in rows]
-
-    def get_card(self, card_id: str):
+    async def delete_card(self, card_id: str, actor: str = "") -> bool:
         try:
-            parsed_id = str(UUID(card_id))
-        except (ValueError, TypeError, AttributeError):
-            return None
-        with self._connect() as db:
-            row = db.execute(
-                """SELECT id, name, city, website, version, created_at
-                   FROM public.vuz_universities WHERE id=%s::uuid""",
-                (parsed_id,),
-            ).fetchone()
-        return self._card(row) if row else None
-
-    def find_by_website(self, website: str):
-        key = website_key(website)
-        if not key:
-            return None
-        matches = [card for card in self.list_cards() if website_key(card["website"]) == key]
-        if len(matches) > 1:
-            raise WorkflowError("chat_collection_card_ambiguous")
-        return matches[0] if matches else None
-
-    def create_or_resolve(self, name: str, city: str, website: str):
-        name = " ".join(name.split())
-        city = " ".join(city.split())
-        website = website.strip()
-        if website:
-            existing = self.find_by_website(website)
-            if existing:
-                if city and existing["city"] and city.casefold() != existing["city"].casefold():
-                    raise WorkflowError("chat_collection_card_ambiguous")
-                return existing
-
-        with self._connect() as db:
-            with db.transaction():
-                set_actor(db, kind="ai", label="vuz-card-runtime")
-                existing = db.execute(
-                    """SELECT id, name, city, website, version, created_at
-                       FROM public.vuz_universities
-                       WHERE name_key=public.vuz_name_key(%s)""",
-                    (name,),
-                ).fetchone()
-                if existing:
-                    card = self._card(existing)
-                    if city and card["city"] and city.casefold() != card["city"].casefold():
-                        raise WorkflowError("chat_collection_card_ambiguous")
-                    if website and card["website"] and website_key(website) != website_key(card["website"]):
-                        raise WorkflowError("chat_collection_card_ambiguous")
-                    return card
-
-                row = db.execute(
-                    """INSERT INTO public.vuz_universities
-                       (id, name, city, website, institution_type, is_demo, verification_status)
-                       VALUES (%s::uuid, %s, NULLIF(%s, ''), NULLIF(%s, ''), 'unknown', false, 'ai_draft')
-                       RETURNING id, name, city, website, version, created_at""",
-                    (str(uuid4()), name, city, website),
-                ).fetchone()
-                return self._card(row)
-
-    def delete_card(self, card_id: str, actor: str = "") -> bool:
-        try:
-            parsed_id = str(UUID(card_id))
-        except (ValueError, TypeError, AttributeError):
+            await self._repository.delete_university(
+                card_id, actor_type="system", actor_label=f"card-purge:{actor[:120] or 'api'}"
+            )
+            return True
+        except RepositoryNotFound:
             return False
-        try:
-            with self._connect() as db:
-                with db.transaction():
-                    set_actor(db, kind="system", label=f"card-purge:{actor[:120] or 'api'}")
-                    deleted = db.execute(
-                        "SELECT public.vuz_purge_university(%s::uuid)", (parsed_id,),
-                    ).fetchone()[0]
-                    return bool(deleted)
         except Exception as exc:
-            if (getattr(exc, "sqlstate", None) == "P0001"
-                    and getattr(getattr(exc, "diag", None), "message_primary", None) == "university_has_children"):
+            sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+            if sqlstate == "P0001":
                 raise WorkflowError("university_has_children") from None
             raise RuntimeError("Supabase card deletion failed") from None
 
@@ -160,11 +87,11 @@ class SupabaseDemoRepository:
             raise WorkflowError("chat_collection_card_ambiguous")
         return matches[0] if matches else None
 
-    def cards(self):
+    async def cards(self):
         local_cards = self._local.cards()
         local_by_id = {card["id"]: card for card in local_cards}
         result = []
-        for card in self._registry.list_cards():
+        for card in await self._registry.list_cards():
             saved = local_by_id.pop(card["id"], None)
             if saved is None:
                 key = website_key(card["website"])
@@ -179,30 +106,49 @@ class SupabaseDemoRepository:
                 result.append({**card, "id": saved["id"], "latest_run": saved["latest_run"]})
             else:
                 result.append({**card, "latest_run": None})
-        # Preserve pre-existing local drafts until they are explicitly matched or migrated.
         result.extend(local_by_id.values())
         return result
 
-    def card(self, card_id):
+    async def resolve_registry_id(self, workflow_card_id: str):
+        """Map a legacy SQLite workflow ID to its authoritative Supabase UUID."""
+        card = await self._registry.get_card(workflow_card_id)
+        if card is not None:
+            return card["id"]
+        try:
+            local_card = self._local.card(workflow_card_id)
+        except WorkflowError as exc:
+            if str(exc) == "card_not_found":
+                return workflow_card_id
+            raise
+        key = website_key(local_card["website"])
+        if not key:
+            return workflow_card_id
+        matches = [item for item in await self._registry.list_cards()
+                   if website_key(item["website"]) == key]
+        if len(matches) > 1:
+            raise WorkflowError("chat_collection_card_ambiguous")
+        return matches[0]["id"] if matches else workflow_card_id
+
+    async def card(self, card_id):
+        card = await self._registry.get_card(card_id)
+        if card is not None:
+            return self._remember(card)
         try:
             return self._local.card(card_id)
         except WorkflowError as exc:
             if str(exc) != "card_not_found":
                 raise
-        card = self._registry.get_card(card_id)
-        if card is None:
-            raise WorkflowError("card_not_found")
-        return self._remember(card)
+        raise WorkflowError("card_not_found")
 
-    def create_card(self, name, city, website):
-        card = self._registry.create_or_resolve(name, city, website)
+    async def create_card(self, name, city, website):
+        card = await self._registry.create_or_resolve(name, city, website)
         local = self._local_match(card["website"])
         if local:
             return self._local.card(local["id"])
         return self._remember(card)
 
-    def start_card_intake(self, name, city, website, request_key, source_options):
-        card = self._registry.create_or_resolve(name, city, website)
+    async def start_card_intake(self, name, city, website, request_key, source_options):
+        card = await self._registry.create_or_resolve(name, city, website)
         local = self._local_match(card["website"])
         if not local:
             self._remember(card)
@@ -210,11 +156,18 @@ class SupabaseDemoRepository:
             card["name"], card["city"], card["website"], request_key, source_options,
         )
 
-    def delete_card(self, card_id, actor=""):
+    async def delete_card(self, card_id, actor=""):
         local_exists = self._local.has_card(card_id)
         if local_exists:
             self._local.ensure_card_deletable(card_id)
-        registry_deleted = self._registry.delete_card(card_id, actor=actor)
+        registry_card_id = await self.resolve_registry_id(card_id)
+        try:
+            UUID(registry_card_id)
+            valid_registry_id = True
+        except (ValueError, TypeError, AttributeError):
+            valid_registry_id = False
+        registry_deleted = (await self._registry.delete_card(registry_card_id, actor=actor)
+                            if valid_registry_id else False)
         local_deleted = self._local.delete_card(card_id, actor=actor) if local_exists else False
         if not registry_deleted and not local_deleted:
             raise WorkflowError("card_not_found")
