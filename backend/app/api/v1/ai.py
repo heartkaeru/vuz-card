@@ -82,7 +82,6 @@ def get_collector():
                 include_institution=False, public_site_only=False):
         settings = Settings.from_env()
         # The LLM needs source documents from the official site, including on refresh.
-        settings.aggregators_only = False
         settings.max_retries = 1
         settings.timeout = min(settings.timeout, 20)
         settings.max_total_requests = min(settings.max_total_requests, 30)
@@ -92,6 +91,10 @@ def get_collector():
         settings.enable_playwright = True
         # A refresh must attempt the live source, not silently refresh cached dates.
         settings.use_cache = False
+        # Паспорт агрегаторов и поиск новостей в документы для LLM не попадают,
+        # а занимают минуты: в этом сценарии они не нужны.
+        settings.use_aggregators = False
+        settings.use_news_search = False
         client = HttpClient(settings, session=public_site_session()) if public_site_only else None
         parser = UniversityParser(settings, client=client)
         try:

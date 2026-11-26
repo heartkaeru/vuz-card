@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, Iterator
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
@@ -50,6 +50,8 @@ from .utils import (
     clean_phone,
     extract_emails,
     extract_phones,
+    is_requisite_number,
+    is_same_domain,
     looks_like_person_name,
     normalize_whitespace,
     parse_date,
@@ -117,6 +119,8 @@ DEPARTMENT_MARKERS = (
     "колледж",
     "лицей",
 )
+
+INLINE_SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "canvas", "img", "input", "button"}
 
 LEADERSHIP_SCOPES = {"rucovodstvo", "rucovodstvoZam", "rucovodstvoFil"}
 LOCAL_PHONE_RE = re.compile(r"(?<![\d+])\d{3}[- ]\d{2}[- ]\d{2}(?!\d)")
@@ -233,7 +237,11 @@ class HTMLCleaner:
 
         # Если собственный экстрактор дал слишком мало текста, пробуем
         # Trafilatura (если библиотека установлена).
-        if trafilatura is not None and len(text) < 400:
+        structured = any(
+            block.kind in {"leadership_profile", "table_row"} or block.contact_hints is not None
+            for block in blocks
+        )
+        if trafilatura is not None and len(text) < 400 and not structured:
             try:
                 extracted = trafilatura.extract(
                     html,
@@ -332,6 +340,9 @@ class HTMLCleaner:
                     if selector == "form" and (node.find(["main", "article", "table"])
                                                 or node.select_one("[itemprop]")):
                         node.unwrap()
+                    elif selector == "header" and node.find_parent(["article", "main"]) is not None:
+                        # Шапка статьи (заголовок, дата) — часть контента, а не сайта.
+                        continue
                     else:
                         node.decompose()
             except Exception:  # noqa: BLE001 - некорректный селектор не критичен
@@ -365,8 +376,14 @@ class HTMLCleaner:
                     node.decompose()
 
         for node in soup.select("[hidden], [aria-hidden='true']"):
-            if node.name not in {"main", "article", "body"}:
-                node.decompose()
+            if node.name in {"main", "article", "body"}:
+                continue
+            # Неактивные вкладки и аккордеоны («Руководство», «Контакты»)
+            # скрыты атрибутом, но содержат настоящий текст. Удаляем только
+            # декоративные элементы без содержательного текста.
+            if len(node.get_text(" ", strip=True)) >= 30:
+                continue
+            node.decompose()
 
     def _select_main(self, soup: BeautifulSoup) -> Tag | None:
         # Селекторы заданы в порядке приоритета. Берём первый селектор,
@@ -455,9 +472,14 @@ class HTMLCleaner:
             key = lowered
             if cleaned and cleaned[-1].text.lower() == key:
                 continue
-            if key in seen:
-                continue
-            seen.add(key)
+            # Повтор длинного абзаца (дублированный блок вёрстки) убираем по
+            # всему документу. Короткие строки, строки таблиц и карточки
+            # руководителей повторяются законно («Заместитель директора»,
+            # общий телефон приёмной) и сохраняются.
+            if block.kind in {"paragraph", "text", "quote"} and len(text) >= 80:
+                if key in seen:
+                    continue
+                seen.add(key)
             cleaned.append(Block(kind=block.kind, text=text, contact_hints=block.contact_hints,
                                  subject_department=block.subject_department, leadership_position=block.leadership_position))
         return cleaned
@@ -525,20 +547,84 @@ class HTMLCleaner:
                     self._walk(child, blocks, include_deputies)
             return
 
-        if name in CONTAINER_TAGS:
+        # Неизвестные обёртки (<a class="card">, <span>, <font>, <center>,
+        # пользовательские элементы) с блочным содержимым — тоже контейнеры,
+        # иначе весь их текст терялся бы.
+        if name in CONTAINER_TAGS or self._has_block_descendant(node):
             before = len(blocks)
+            inline_run: list[str] = []
+
+            def flush() -> None:
+                text = normalize_whitespace(" ".join(inline_run))
+                inline_run.clear()
+                if self._meaningful_inline(text):
+                    blocks.append(Block("text", text))
+
             for child in node.children:
-                if isinstance(child, Tag):
+                if isinstance(child, Comment):
+                    continue
+                if isinstance(child, NavigableString):
+                    inline_run.append(str(child))
+                    continue
+                if not isinstance(child, Tag):
+                    continue
+                if child.name == "br":
+                    inline_run.append(" ")
+                    continue
+                if child.name in INLINE_SKIP_TAGS:
+                    continue
+                if self._is_block_like(child):
+                    flush()
                     self._walk(child, blocks, include_deputies)
+                else:
+                    # Строчный элемент рядом с блоками: «Ректор: <b>Иванов</b>».
+                    inline_run.append(self._node_text(child))
             if len(blocks) == before:
                 # Текст лежит прямо в div/section без абзацев.
+                inline_run.clear()
                 text = self._node_text(node)
-                if len(text) >= 20:
+                if self._meaningful_inline(text):
                     blocks.append(Block("text", text))
+            else:
+                flush()
             return
 
         # Строчные элементы: пусть их обрабатывает родитель.
         return
+
+    @staticmethod
+    def _is_block_like(node: Tag) -> bool:
+        return (
+            node.name in BLOCK_TAGS
+            or node.name in CONTAINER_TAGS
+            or node.name in {"tr", "table", "center", "fieldset", "form", "header", "footer"}
+            or bool(set(str(node.get("itemprop", "")).split()) & (LEADERSHIP_SCOPES | {"teachingStaff"}))
+            or HTMLCleaner._has_block_descendant(node)
+        )
+
+    @staticmethod
+    def _has_block_descendant(node: Tag) -> bool:
+        return node.find(list(BLOCK_TAGS) + sorted(CONTAINER_TAGS - {"body"}) + ["tr", "table"]) is not None
+
+    @staticmethod
+    def _meaningful_inline(text: str) -> bool:
+        """Короткий текст без абзаца оставляем, если в нём есть смысл.
+
+        Отдельно стоящий телефон «+7 (495) 123-45-67» (18 символов) или ФИО
+        короче 20 символов раньше терялись.
+        """
+
+        if not text or re.fullmatch(r"[\W_]+", text):
+            return False
+        if len(text) >= 20:
+            return True
+        return bool(
+            EMAIL_RE.search(text)
+            or PHONE_RE.search(text)
+            or LOCAL_PHONE_RE.search(text)
+            or looks_like_person_name(text)
+            or (len(text) >= 3 and contains_position(text))
+        )
 
     @staticmethod
     def _node_text(node: Tag) -> str:
@@ -690,7 +776,16 @@ class HTMLCleaner:
         for item in node.select('[itemprop~="email"], [itemprop~="telephone"]'):
             if not belongs(item):
                 continue
-            context = item.parent.get_text(" ", strip=True).lower()
+            # Подпись контакта («Приёмная: …») ищем рядом с самим значением,
+            # а не во всей карточке: иначе упоминание приёмной где-то в
+            # карточке отбрасывает и личные контакты.
+            parent = item.parent
+            if parent is not None and parent is not node and len(parent.get_text(" ", strip=True)) <= 200:
+                context = parent.get_text(" ", strip=True).lower()
+            else:
+                previous = item.find_previous(string=True)
+                label = str(previous) if previous is not None and node in previous.parents else ""
+                context = f"{label} {item.get_text(' ', strip=True)}".lower()
             if not branch and (re.search(r"при[её]мн|канцеляр|секретар|подразделени|общая почта|общий телефон", context)
                                or ("факс" in context and "телефон" not in context)):
                 continue
@@ -795,9 +890,11 @@ class HTMLCleaner:
                     context_fragment_ids=context,
                 )
             )
-        phones = list(PHONE_RE.finditer(text))
+        phones = [match for match in PHONE_RE.finditer(text)
+                  if not is_requisite_number(text, match.start())]
         if allow_local_phone and not phones:
-            phones = list(LOCAL_PHONE_RE.finditer(text))
+            phones = [match for match in LOCAL_PHONE_RE.finditer(text)
+                      if not is_requisite_number(text, match.start())]
         for match in phones:
             phone = re.sub(r"[\s.(,\-]+$", "", match.group(0)).strip()
             if not clean_phone(phone) and not (allow_local_phone and LOCAL_PHONE_RE.fullmatch(phone)):
@@ -851,9 +948,22 @@ class HTMLCleaner:
     @staticmethod
     def _canonical_url(soup: BeautifulSoup, fallback: str) -> str:
         node = soup.find("link", rel=lambda value: value and "canonical" in value)
-        if node and node.get("href"):
-            return normalize_whitespace(node["href"])
-        return fallback
+        if not node or not node.get("href"):
+            return fallback
+        href = normalize_whitespace(node["href"])
+        absolute = urljoin(fallback, href) if fallback else href
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return fallback
+        if fallback:
+            if not is_same_domain(absolute, fallback):
+                return fallback
+            # Многие CMS ставят canonical на главную для всех страниц:
+            # такой canonical склеил бы разные документы в один URL.
+            fallback_path = urlparse(fallback).path.strip("/")
+            if fallback_path and not parsed.path.strip("/"):
+                return fallback
+        return absolute
 
     @staticmethod
     def _published_at(soup: BeautifulSoup) -> datetime | None:
@@ -889,7 +999,12 @@ class HTMLCleaner:
                 parsed = _parse_datetime(match.group(1))
                 if parsed:
                     return parsed
-        time_node = soup.find("time")
+        time_node = soup.select_one("article time, main time, [itemprop~='datePublished']")
+        if time_node is None:
+            times = soup.find_all("time")
+            # Одна-единственная дата на странице — дата публикации. Если их
+            # несколько (лента, часы в шапке), выбрать верную нельзя.
+            time_node = times[0] if len(times) == 1 else None
         if time_node:
             parsed = _parse_datetime(
                 time_node.get("datetime") or time_node.get_text(" ", strip=True)

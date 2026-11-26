@@ -67,13 +67,15 @@ def review_payload(run, decision="accept"):
                            "reason": "Synthetic fixture source checked"} for f in run["facts"]]}
 
 
-def test_ai_collection_crawls_the_official_site_even_with_aggregator_default(monkeypatch):
-    monkeypatch.setenv("PARSER_AGGREGATORS_ONLY", "true")
+def test_ai_collection_crawls_the_official_site(monkeypatch):
+    monkeypatch.setenv("PARSER_SECTIONS", "about")
     snapshot = example_card()
 
     class Parser:
         def __init__(self, settings, client):
-            assert not settings.aggregators_only
+            # Сборщик для LLM обходит официальный сайт и не тратит время на
+            # агрегаторы и поиск новостей.
+            assert not settings.use_aggregators and not settings.use_news_search
 
         def parse(self, *, url, name, profile, allowed_sections):
             assert url == "https://university.example" and "leadership" in allowed_sections

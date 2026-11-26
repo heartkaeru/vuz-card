@@ -37,6 +37,52 @@ SITE_ADDRESS=203.0.113.10
 chmod 600 backend/.env deploy/site.env
 ```
 
+## Ресурсы сервера и Chromium
+
+Парсер использует headless-Chromium (Playwright) для SPA-сайтов вузов и
+проверок «вы не бот» на агрегаторах. Ориентиры для сервера 1 vCPU / 2 ГБ / 100 ГБ:
+
+| Что | Память | Диск |
+| --- | --- | --- |
+| Система и Docker | ~250–350 МБ | — |
+| Backend (FastAPI, парсер, словари pymorphy3) | ~250–400 МБ | образ ~1,5 ГБ, из них Chromium с библиотеками ~0,6 ГБ |
+| Chromium во время рендеринга | ~250–400 МБ | — |
+| Frontend (Next.js) | ~150–250 МБ | ~0,5 ГБ |
+| Caddy | ~30 МБ | ~0,1 ГБ |
+
+Итого в пике около 1–1,4 ГБ из 2 ГБ: Chromium помещается, если одновременно
+работает **один** браузер. Это задано по умолчанию (`PARSER_MAX_BROWSERS=1`):
+параллельные задания ждут очереди, а не запускают второй браузер. Картинки,
+видео и шрифты в браузере не загружаются. При сборке образа нужно ещё
+~2–3 ГБ свободного диска и ~1 ГБ памяти, поэтому собирайте, когда на сервере
+не идёт сбор.
+
+Перед запуском проверьте свободные ресурсы:
+
+```sh
+free -h
+df -h /
+docker system df
+```
+
+На 2 ГБ памяти рекомендуется файл подкачки на 2 ГБ: он страхует сборку образа и
+пиковые моменты от остановки процессов из-за нехватки памяти.
+
+```sh
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+Проверить, что Chromium в контейнере запускается (при сборке это делается
+автоматически — в логе должна быть строка `chromium ok`):
+
+```sh
+docker compose exec backend python -c "from parser.stealth import StealthFetcher; f = StealthFetcher(enable_playwright=True); print(f._playwright_get('https://example.com', 30).status_code); f.close()"
+```
+
 ## Запуск
 
 После установки Docker Engine и Compose Plugin из официальной инструкции для ОС сервера, в каталоге репозитория выполните:

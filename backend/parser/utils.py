@@ -40,10 +40,27 @@ MONTHS = {
     "декабр": 12,
 }
 
+# Каждая часть ФИО начинается с заглавной буквы: «Иванов Иван Иванович»
+# или «ИВАНОВ Иван Иванович». Строчные фразы («приказ об этом») не являются ФИО.
+_NAME_TOKEN = r"[А-ЯЁ][А-ЯЁа-яё]{1,24}(?:-[А-ЯЁ][А-ЯЁа-яё]{1,24})?"
 PERSON_NAME_RE = re.compile(
-    rf"\b([{CYRILLIC}][{CYRILLIC}\-]{{1,24}})\s+"
-    rf"([{CYRILLIC}][{CYRILLIC}\-]{{1,24}})\s+"
-    rf"([{CYRILLIC}][{CYRILLIC}\-]{{1,24}})\b"
+    rf"(?<![{CYRILLIC}\-])({_NAME_TOKEN})\s+({_NAME_TOKEN})\s+({_NAME_TOKEN})(?![{CYRILLIC}\-])"
+)
+# «Иванов И. И.», «Иванов И.И.» и «И. И. Иванов».
+PERSON_INITIALS_RE = re.compile(
+    rf"(?<![{CYRILLIC}\-])(?:({_NAME_TOKEN})\s+([А-ЯЁ])\.\s*([А-ЯЁ])\.?(?![А-ЯЁа-яё])"
+    rf"|([А-ЯЁ])\.\s*([А-ЯЁ])\.\s*({_NAME_TOKEN})(?![{CYRILLIC}\-]))"
+)
+PATRONYMIC_RE = re.compile(
+    r"(?:вич|вна|ична|инична|оглы|кызы|улы|уулу)$", re.IGNORECASE
+)
+# Числа из реквизитов (ИНН, ОГРН, КПП, счета) похожи на телефоны, но ими не являются.
+REQUISITE_CONTEXT_RE = re.compile(
+    r"(?:инн|огрн(?:ип)?|кпп|окпо|октмо|окато|оквэд|окогу|окфс|окопф|бик|"
+    r"р/с|к/с|л/с|расч[её]тный\s+сч[её]т|корр?\.?\s*сч[её]т|лицевой\s+сч[её]т|"
+    r"сч[её]т|рег\.?\s*номер|регистрационный\s+номер|№\s*лицензии|лицензи[яи])"
+    r"[\s:№.\-]*$",
+    re.IGNORECASE,
 )
 PERSON_NAME_LATIN_RE = re.compile(
     r"\b([A-Z][a-z]{1,20})\s+([A-Z]\.\s*)?([A-Z][a-z]{1,24})\b"
@@ -57,7 +74,7 @@ PHONE_RE = re.compile(
     r"(?:\d[\s\-().]*){10}(?!\d)"
 )
 DATE_ISO_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})(?!\d)")
-DATE_DOT_RE = re.compile(r"\b(\d{1,2})[./](\d{1,2})[./](\d{2,4})\b")
+DATE_DOT_RE = re.compile(r"(?<![\d.])(\d{1,2})([./])(\d{1,2})\2(\d{4}|\d{2})(?![\d.]\d)")
 DATE_RU_RE = re.compile(
     r"\b(\d{1,2})\s+"
     r"(январ[яе]?|феврал[яе]?|март[ае]?|апрел[яе]?|ма[йя]|июн[яе]?|"
@@ -171,7 +188,7 @@ JUNK_URL_PARTS = (
     "/signin",
     "/sign-in",
     "/account",
-    "/profile",
+    "/profile/edit",
     "/cart",
     "/basket",
     "/checkout",
@@ -179,10 +196,42 @@ JUNK_URL_PARTS = (
     "javascript:",
     "mailto:",
     "tel:",
-    "#",
 )
 
-TRACKING_QUERY_PREFIXES = ("utm_", "yclid", "gclid", "fbclid", "from", "ref")
+TRACKING_QUERY_PREFIXES = ("utm_",)
+TRACKING_QUERY_KEYS = {
+    "yclid",
+    "ysclid",
+    "gclid",
+    "fbclid",
+    "_openstat",
+    "from",
+    "ref",
+    "_ga",
+}
+
+# Публичные суффиксы второго уровня: «spb.ru» — не домен организации.
+PUBLIC_SECOND_LEVEL = {
+    "spb.ru", "msk.ru", "com.ru", "net.ru", "org.ru", "pp.ru", "edu.ru",
+    "ac.ru", "gov.ru", "mil.ru", "int.ru", "nsk.ru", "nnov.ru", "kazan.ru",
+    "perm.ru", "samara.ru", "tomsk.ru", "omsk.ru", "e-burg.ru", "ekb.ru",
+    "krasnoyarsk.ru", "novosibirsk.ru", "nsk.su", "com.ua", "co.uk", "ac.uk",
+    "org.uk", "com.kz", "edu.kz", "org.kz", "by.ru", "spb.su", "msk.su",
+}
+
+
+def registrable_domain(host: str) -> str:
+    """Домен организации без поддоменов: ``lib.ifmo.spb.ru`` → ``ifmo.spb.ru``."""
+
+    host = (host or "").lower().strip(".").split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    parts = [part for part in host.split(".") if part]
+    if len(parts) <= 2:
+        return ".".join(parts)
+    if ".".join(parts[-2:]) in PUBLIC_SECOND_LEVEL:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
 
 
 class FetchError(RuntimeError):
@@ -244,6 +293,35 @@ def setup_logging(
     # Сторонние библиотеки не должны засорять журнал.
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
+
+
+# Сокращения, после которых точка не завершает предложение.
+SENTENCE_ABBREVIATIONS = {
+    "г", "гг", "им", "ул", "д", "т", "см", "пр", "просп", "проф", "акад", "доц",
+    "др", "н", "э", "к", "т.е", "т.к", "т.н", "т.д", "т.п", "руб", "млн", "млрд",
+    "тыс", "стр", "рис", "табл", "англ", "лат", "ст", "чл", "корр", "напр",
+    "наб", "пл", "пер", "обл", "р", "св", "ок", "кв", "каб", "тел", "доб",
+}
+
+
+def sentence_boundaries(text: str) -> list[int]:
+    """Позиции начала предложений (после «. »), без разрыва на сокращениях.
+
+    «Работал в г. Москве», «им. Ломоносова», инициалы «А. С. Пушкин» не
+    делят текст; «МГУ. Затем» — делит.
+    """
+
+    starts: list[int] = []
+    for match in re.finditer(r"(?<=[А-ЯЁа-яёA-Za-z0-9»)\]])\.\s+(?=[«\"(]?[А-ЯЁA-Z])", text or ""):
+        word_match = re.search(r"([А-ЯЁа-яёA-Za-z.]+)$", text[: match.start()])
+        word = word_match.group(1) if word_match else ""
+        bare = word.lower().strip(".")
+        if bare in SENTENCE_ABBREVIATIONS or bare.split(".")[-1] in SENTENCE_ABBREVIATIONS:
+            continue
+        if len(word) == 1 and word.isupper():
+            continue  # инициал
+        starts.append(match.end())
+    return starts
 
 
 def normalize_whitespace(text: str) -> str:
@@ -374,7 +452,7 @@ def canonical_url(url: str, base_url: str = "") -> str:
         if not part:
             continue
         key = part.split("=", 1)[0].lower()
-        if key.startswith(TRACKING_QUERY_PREFIXES):
+        if key.startswith(TRACKING_QUERY_PREFIXES) or key in TRACKING_QUERY_KEYS:
             continue
         query_parts.append(part)
     return urlunparse(
@@ -398,18 +476,62 @@ def is_same_domain(url: str, base_url: str) -> bool:
 
     left = _host(url)
     right = _host(base_url)
-    return left == right or left.endswith("." + right) or right.endswith("." + left)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    # Поддомены одной организации считаются одним сайтом, но публичный
+    # суффикс («spb.ru», «ru») организацией не является.
+    left_root = registrable_domain(left)
+    right_root = registrable_domain(right)
+    if left_root != right_root or "." not in left_root:
+        return False
+    return left.endswith("." + right) or right.endswith("." + left) or left_root in {left, right}
 
 
 def is_probably_content_link(url: str) -> bool:
     """Отсекает поиск, теги, файлы и служебные ссылки."""
 
-    lowered = url.lower()
+    lowered = url.lower().strip()
+    if not lowered or lowered.startswith("#"):
+        return False
     if any(part in lowered for part in JUNK_URL_PARTS):
         return False
-    if re.search(r"\.(?:jpg|jpeg|png|gif|svg|webp|pdf|docx?|xlsx?|pptx?|zip|rar|mp4|mp3)(?:\?|$)", lowered):
+    path = urlparse(lowered).path
+    if re.search(r"\.(?:jpg|jpeg|png|gif|svg|webp|pdf|docx?|xlsx?|pptx?|zip|rar|mp4|mp3)$", path):
         return False
     return True
+
+
+def url_path_lower(url: str) -> str:
+    """Путь URL без query/fragment в нижнем регистре (для проверки расширений)."""
+
+    return urlparse(url or "").path.lower()
+
+
+def _image_src(image: object) -> str:
+    """Лучший источник картинки: lazy-атрибуты, затем крупнейший из srcset."""
+
+    for attribute in ("data-src", "data-original", "data-lazy-src", "data-lazy"):
+        value = image.get(attribute)  # type: ignore[attr-defined]
+        if value:
+            return str(value)
+    srcset = str(image.get("srcset") or image.get("data-srcset") or "")  # type: ignore[attr-defined]
+    if srcset:
+        best, best_width = "", -1
+        for candidate in srcset.split(","):
+            pieces = candidate.strip().split()
+            if not pieces:
+                continue
+            width = 0
+            if len(pieces) > 1:
+                match = re.match(r"(\d+)", pieces[1])
+                width = int(match.group(1)) if match else 0
+            if width > best_width:
+                best, best_width = pieces[0], width
+        if best:
+            return best
+    return str(image.get("src") or "")  # type: ignore[attr-defined]
 
 
 def find_photo(soup: object, base_url: str, full_name: str) -> str:
@@ -451,14 +573,18 @@ def find_photo(soup: object, base_url: str, full_name: str) -> str:
             )
         ):
             return
-        if src.lower().endswith((".svg", ".gif")):
+        if url_path_lower(src).endswith((".svg", ".gif", ".ico")):
             return
         score = 0
-        if any(token in lowered for token in tokens):
+        name_hit = any(token in lowered for token in tokens)
+        if name_hit:
             score += 6
+        elif re.search(r"/(?:news|novosti|press|events|afisha)/", lowered):
+            # Фото из новостей и афиши — не портрет человека.
+            return
         if any(
             marker in lowered
-            for marker in ("rector", "ректор", "photo", "avatar", "person", "staff")
+            for marker in ("rector", "ректор", "avatar", "person", "staff", "portrait", "rukovod", "портрет")
         ):
             score += 4
         try:
@@ -476,13 +602,8 @@ def find_photo(soup: object, base_url: str, full_name: str) -> str:
 
     for image in soup.find_all("img"):  # type: ignore[attr-defined]
         add(
-            str(
-                image.get("data-src")
-                or image.get("data-original")
-                or image.get("src")
-                or ""
-            ),
-            str(image.get("alt") or ""),
+            _image_src(image),
+            str(image.get("alt") or image.get("title") or ""),
             f"{image.get('class') or ''} {image.get('id') or ''}",
             str(image.get("width") or ""),
             str(image.get("height") or ""),
@@ -503,10 +624,7 @@ def find_photo(soup: object, base_url: str, full_name: str) -> str:
             add(str(link.get("href") or ""), "image_src", "link")
 
     if not candidates:
-        fallback = _content_image(soup, base_url)
-        if fallback:
-            return fallback
-        return ""
+        return _content_image(soup, base_url, full_name)
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1]
 
@@ -526,31 +644,48 @@ CONTENT_IMAGE_SKIP = (
 )
 
 
-def _content_image(soup: object, base_url: str) -> str:
-    """Главная картинка контента: портрет без alt на странице ректора."""
+def _content_image(soup: object, base_url: str, full_name: str = "") -> str:
+    """Портрет без alt на странице человека.
 
+    Картинка принимается, только если рядом с ней (в ближайших родителях)
+    упомянута фамилия человека. Иначе это может быть фото новости или
+    баннер, и ректору приписывать его нельзя.
+    """
+
+    tokens = [
+        token.lower()
+        for token in re.findall(r"[А-ЯЁA-Zа-яёa-z\-]{4,}", full_name or "")
+        if token.lower() not in {"ректор", "rector"}
+    ]
+    if not tokens:
+        return ""
     containers = soup.select(  # type: ignore[attr-defined]
         "main, article, [class*=content], [class*=article], [class*=body]"
     ) or [soup]
     for container in containers:
         for image in container.find_all("img"):  # type: ignore[attr-defined]
-            src = str(
-                image.get("data-src")
-                or image.get("data-original")
-                or image.get("src")
-                or ""
-            ).strip()
+            src = _image_src(image).strip()
             if not src:
                 continue
             lowered = src.lower()
             if any(marker in lowered for marker in CONTENT_IMAGE_SKIP):
                 continue
-            if not lowered.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            if not url_path_lower(src).endswith((".jpg", ".jpeg", ".png", ".webp")):
                 continue
             alt = str(image.get("alt") or "").lower()
             if "программа" in alt or "проект" in alt or "новост" in alt:
                 continue
-            return canonical_url(src, base_url)
+            parent = image.parent
+            nearby = ""
+            for _ in range(3):
+                if parent is None:
+                    break
+                nearby = parent.get_text(" ", strip=True).lower()
+                if len(nearby) > 40:
+                    break
+                parent = parent.parent
+            if any(token in nearby[:1500] for token in tokens):
+                return canonical_url(src, base_url)
     return ""
 
 
@@ -623,33 +758,54 @@ def _plausible_phone_digits(digits: str) -> bool:
     return False
 
 
+def is_requisite_number(text: str, start: int) -> bool:
+    """Число стоит после подписи реквизита (ИНН, ОГРН, КПП, счёт и т. п.)."""
+
+    window = (text or "")[max(0, start - 40):start]
+    return bool(REQUISITE_CONTEXT_RE.search(window))
+
+
+def iter_phone_matches(text: str) -> Iterator[re.Match[str]]:
+    """Совпадения PHONE_RE, похожие на телефон и не являющиеся реквизитами."""
+
+    for match in PHONE_RE.finditer(text or ""):
+        digits = re.sub(r"\D", "", match.group(0))
+        if not _plausible_phone_digits(digits):
+            continue
+        if is_requisite_number(text, match.start()):
+            continue
+        yield match
+
+
 def clean_phone(value: str) -> str:
     """Извлекает первый телефон из строки и нормализует его."""
 
     if not value:
         return ""
-    match = PHONE_RE.search(value)
-    if not match:
+    match = next(iter_phone_matches(value), None)
+    if match is None:
         return ""
-    candidate = match.group(0)
-    digits = re.sub(r"\D", "", candidate)
-    if not _plausible_phone_digits(digits):
-        return ""
-    return normalize_phone(candidate)
+    return normalize_phone(match.group(0))
 
 
 def extract_phones(text: str) -> list[str]:
-    """Извлекает все телефоны из текста."""
+    """Извлекает все телефоны из текста (без ИНН/ОГРН/счетов)."""
 
     if not text:
         return []
-    phones = []
-    for match in PHONE_RE.finditer(text):
-        candidate = match.group(0)
-        digits = re.sub(r"\D", "", candidate)
-        if _plausible_phone_digits(digits):
-            phones.append(normalize_phone(candidate))
+    phones = [normalize_phone(match.group(0)) for match in iter_phone_matches(text)]
     return dedupe_preserve(phones)
+
+
+def phone_key(value: str) -> str:
+    """Ключ сравнения телефонов: ``8 (495) 1…`` и ``+7 (495) 1…`` совпадают."""
+
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) == 11 and digits[0] == "8":
+        digits = "7" + digits[1:]
+    elif len(digits) == 10:
+        digits = "7" + digits
+    return digits
 
 
 def parse_date(value: str, default_year: int | None = None) -> str | None:
@@ -672,15 +828,20 @@ def parse_date(value: str, default_year: int | None = None) -> str | None:
         except ValueError:
             pass
 
-    match = DATE_DOT_RE.search(text)
-    if match:
-        day, month, year = (int(part) for part in match.groups())
+    for match in DATE_DOT_RE.finditer(text):
+        day_text, _, month_text, year_text = match.groups()
+        # «1.2.10» — скорее номер версии/пункта, чем дата: для двузначного
+        # года требуем двузначные день и месяц.
+        if len(year_text) == 2 and (len(day_text) < 2 or len(month_text) < 2):
+            continue
+        day, month, year = int(day_text), int(month_text), int(year_text)
         if year < 100:
-            year += 2000
+            current_short = datetime.now(timezone.utc).year % 100
+            year += 2000 if year <= current_short + 1 else 1900
         try:
             return datetime(year, month, day).date().isoformat()
         except ValueError:
-            pass
+            continue
 
     match = DATE_RU_RE.search(text)
     if match:
@@ -694,16 +855,27 @@ def parse_date(value: str, default_year: int | None = None) -> str | None:
                 break
         if month is None:
             return None
+        guessed_year = False
         if year_text:
             year = int(year_text)
         elif default_year:
             year = default_year
         else:
             year = datetime.now(timezone.utc).year
+            guessed_year = True
         try:
-            return datetime(year, month, day).date().isoformat()
+            result = datetime(year, month, day).date()
         except ValueError:
             return None
+        if guessed_year:
+            # «15 декабря» в январской ленте — это прошлый год, а не будущее.
+            today = datetime.now(timezone.utc).date()
+            if (result - today).days > 31:
+                try:
+                    result = result.replace(year=year - 1)
+                except ValueError:
+                    return None
+        return result.isoformat()
     return None
 
 
@@ -711,14 +883,19 @@ def strip_name(value: str) -> str:
     """Убирает лишние подписи вокруг ФИО."""
 
     text = normalize_whitespace(value)
+    # Граница слова обязательна: «Ректорова Анна» — фамилия, а не «ректор».
     text = re.sub(
-        r"^(?:фио|руководитель|ректор|проректор|директор|декан)\s*[:\-–—]?\s*",
+        r"^(?:фио|руководитель|ректор|проректор|директор|декан)(?![А-ЯЁа-яё])\s*[:\-–—]?\s*",
         "",
         text,
         flags=re.I,
     )
     text = re.sub(r"\s*\((?:и\.?\s*о\.?|исполняющий обязанности)\)\s*", " ", text, flags=re.I)
-    return text.strip(" ,;:.-")
+    text = text.strip(" ,;:-")
+    # Точку инициала («Петров П. П.») сохраняем, остальные — убираем.
+    if not re.search(r"(?<![А-ЯЁа-яёA-Za-z])[А-ЯЁA-Z]\.$", text):
+        text = text.rstrip(".").strip(" ,;:-")
+    return text
 
 
 def looks_like_person_name(value: str) -> bool:
@@ -733,38 +910,26 @@ def looks_like_person_name(value: str) -> bool:
     lowered = text.lower()
     if any(
         bad in lowered
-        for bad in (
-            "неприменимо",
-            "вакансия",
-            "вакантно",
-            "отсутствует",
-            "нет данных",
-            "не указан",
-            "университет",
-            "институт",
-            "факультет",
-            "кафедра",
-            "департамент",
-            "управление",
-            "центр",
-            "отдел",
-            "совет",
-            "комиссия",
-            "лаборатория",
-            "программа",
-            "проект",
-        )
+        for bad in ("неприменимо", "вакансия", "вакантно", "отсутствует", "нет данных", "не указан")
     ):
         return False
 
     match = PERSON_NAME_RE.fullmatch(text)
-    if match:
-        tokens = [part for part in match.groups() if part]
-        if len(tokens) != 3:
+    initials = None if match else PERSON_INITIALS_RE.fullmatch(text)
+    if match or initials:
+        tokens = [part for part in (match or initials).groups() if part]
+        words = [token for token in tokens if len(token) >= 2]
+        if any(token.lower() in NAME_BLACKLIST for token in words):
             return False
-        if any(token.lower() in NAME_BLACKLIST for token in tokens):
+        # Слова-организации («Совет», «Центр») отсекаем только целиком:
+        # фамилия «Советов» или «Центров» остаётся допустимой, если у
+        # человека есть отчество.
+        has_patronymic = any(PATRONYMIC_RE.search(token) for token in words)
+        if not has_patronymic and any(_is_org_word(token) for token in words):
             return False
-        if not all(len(token) >= 2 for token in tokens):
+        # Полное русское ФИО из трёх слов содержит отчество: «Творчество
+        # Спорт Устойчивое» из меню — не человек.
+        if match and not has_patronymic:
             return False
         return True
 
@@ -778,17 +943,50 @@ def looks_like_person_name(value: str) -> bool:
     return False
 
 
+ORG_WORD_STEMS = (
+    "университет", "институт", "факультет", "кафедр", "департамент",
+    "управлени", "центр", "отдел", "совет", "комисси", "лаборатори",
+    "программ", "проект", "академи", "колледж", "филиал",
+)
+
+
+def _is_org_word(token: str) -> bool:
+    lowered = token.lower()
+    return any(
+        re.fullmatch(stem + r"[а-яё]{0,3}", lowered) for stem in ORG_WORD_STEMS
+    )
+
+
 def find_person_names(text: str) -> list[str]:
-    """Находит в тексте последовательности, похожие на ФИО."""
+    """Находит в тексте последовательности, похожие на ФИО.
+
+    Поиск идёт с перекрытием: в «Ректор Иванов Иван Иванович» сначала
+    встречается тройка «Ректор Иванов Иван», а настоящее ФИО — со сдвигом.
+    """
 
     if not text:
         return []
-    found = []
-    for match in PERSON_NAME_RE.finditer(text):
-        candidate = match.group(0)
+    found: list[tuple[int, str]] = []
+    covered_until = -1
+    tokens = list(re.finditer(rf"{_NAME_TOKEN}", text))
+    for index in range(len(tokens) - 2):
+        first, third = tokens[index], tokens[index + 2]
+        if first.start() < covered_until:
+            continue
+        candidate = text[first.start():third.end()]
+        if not re.fullmatch(rf"{_NAME_TOKEN}\s+{_NAME_TOKEN}\s+{_NAME_TOKEN}", candidate):
+            continue
         if looks_like_person_name(candidate):
-            found.append(strip_name(candidate))
-    return dedupe_preserve(found)
+            found.append((first.start(), strip_name(candidate)))
+            covered_until = third.end()
+    for match in PERSON_INITIALS_RE.finditer(text):
+        if any(start <= match.start() < start + len(name) for start, name in found):
+            continue
+        candidate = normalize_whitespace(match.group(0))
+        if looks_like_person_name(candidate):
+            found.append((match.start(), candidate))
+    found.sort(key=lambda item: item[0])
+    return dedupe_preserve(name for _, name in found)
 
 
 def contains_position(text: str) -> bool:
@@ -831,6 +1029,10 @@ def looks_like_block_page(html: str, status_code: int) -> bool:
     if not html or len(html) > 200_000:
         return False
     text = visible_text_from_html(html)
+    # Заглушки антибота короткие. Длинная страница, где просто упомянуты
+    # Cloudflare или капча (например, форма обратной связи), — обычный контент.
+    if len(text) > 3000:
+        return False
     markers = (
         "подтвердите, что вы не робот",
         "подтвердите что вы не робот",
@@ -846,8 +1048,16 @@ def looks_like_block_page(html: str, status_code: int) -> bool:
         "incapsula",
         "request blocked",
         "too many requests",
+        "что вы не бот",
+        "проверка браузера",
+        "checking your browser",
     )
     return any(marker in text for marker in markers)
+
+
+ROBOTS_AGENT = "VuzCardBot"
+ROBOTS_USER_AGENT = "VuzCardBot/1.0 (+research; contact: local)"
+MAX_RETRY_AFTER = 60.0
 
 
 class RateLimiter:
@@ -906,16 +1116,22 @@ class RobotsPolicy:
             get = self.session.get if self.session is not None else requests.get
             response = get(
                 robots_url,
-                headers={"User-Agent": "VuzCardBot/1.0 (+research; contact: local)"},
+                headers={"User-Agent": ROBOTS_USER_AGENT},
                 timeout=self.timeout,
             )
             if response.status_code == 200:
                 parser = RobotFileParser()
                 parser.set_url(robots_url)
                 parser.parse(response.text.splitlines())
-                delay = parser.crawl_delay("*")
+                delay = parser.crawl_delay(ROBOTS_AGENT) or parser.crawl_delay("*")
                 if delay:
-                    self._delays[host] = float(delay)
+                    self._delays[host] = min(float(delay), 30.0)
+            elif response.status_code >= 500:
+                # RFC 9309: сервер robots.txt недоступен — обход временно запрещён.
+                parser = RobotFileParser()
+                parser.set_url(robots_url)
+                parser.parse(["User-agent: *", "Disallow: /"])
+                LOGGER.warning("robots.txt вернул %s (%s), обход отложен", response.status_code, robots_url)
             elif response.status_code in {401, 403}:
                 # RFC 9309: доступ к robots.txt запрещён — обход запрещён.
                 parser = RobotFileParser()
@@ -939,7 +1155,7 @@ class RobotsPolicy:
         if parser is None:
             return True, 0.0
         host = urlparse(url).netloc.lower()
-        allowed = parser.can_fetch("*", url)
+        allowed = parser.can_fetch(ROBOTS_AGENT, url)
         return allowed, self._delays.get(host, 0.0)
 
 
@@ -950,7 +1166,8 @@ class HttpClient:
         self.settings = settings
         self.session = session if session is not None else requests.Session()
         self.limiter = RateLimiter(settings.request_delay, settings.delay_jitter)
-        self.robots = RobotsPolicy(timeout=min(settings.timeout, 15.0), session=session)
+        self.robots = RobotsPolicy(timeout=min(settings.timeout, 15.0), session=self.session)
+        self._counter_lock = threading.Lock()
         self._ua_index = 0
         self._ua_lock = threading.Lock()
         self._requests_made = 0
@@ -999,10 +1216,12 @@ class HttpClient:
 
         last_exception: Exception | None = None
         for attempt in range(1, self.settings.max_retries + 1):
-            if self._requests_made >= self.settings.max_total_requests:
-                self.last_error = "Достигнут лимит запросов на обход"
-                break
-            self._requests_made += 1
+            with self._counter_lock:
+                if self._requests_made >= self.settings.max_total_requests:
+                    self.last_error = "Достигнут лимит запросов на обход"
+                    break
+                self._requests_made += 1
+            is_last_attempt = attempt >= self.settings.max_retries
             self.limiter.wait(url)
             started = time.monotonic()
             response = None
@@ -1053,10 +1272,10 @@ class HttpClient:
                         attempt,
                         self.settings.max_retries,
                     )
-                    time.sleep(
-                        retry_after
-                        or _backoff_seconds(attempt, self.settings.backoff_factor)
-                    )
+                    if not is_last_attempt:
+                        time.sleep(
+                            min(retry_after or _backoff_seconds(attempt, self.settings.backoff_factor), MAX_RETRY_AFTER)
+                        )
                     continue
 
                 if response.status_code in {401, 403}:
@@ -1080,10 +1299,10 @@ class HttpClient:
                         if response.status_code == 503
                         else None
                     )
-                    time.sleep(
-                        retry_after
-                        or _backoff_seconds(attempt, self.settings.backoff_factor)
-                    )
+                    if not is_last_attempt:
+                        time.sleep(
+                            min(retry_after or _backoff_seconds(attempt, self.settings.backoff_factor), MAX_RETRY_AFTER)
+                        )
                     continue
 
                 if response.status_code >= 400:
@@ -1120,7 +1339,7 @@ class HttpClient:
                     url,
                     exc,
                 )
-                if attempt < self.settings.max_retries:
+                if not is_last_attempt:
                     time.sleep(
                         _backoff_seconds(attempt, self.settings.backoff_factor)
                     )
@@ -1156,8 +1375,11 @@ def pick_title(html_title: str | None, fallback: str = "") -> str:
     """Очищает ``<title>`` от названия сайта."""
 
     title = normalize_whitespace(html_title or "")
-    # Отрезаем хвост «| Название сайта», «— Сайт», « - Сайт».
-    title = re.sub(r"\s+[|—–-]\s+.*$", "", title).strip()
+    # Отрезаем только последний сегмент «| Название сайта»: в заголовке
+    # «Ректор — Иванов И. И. | ВШЭ» нужная часть стоит до последнего разделителя.
+    parts = re.split(r"\s+[|—–-]\s+", title)
+    if len(parts) > 1 and len(" ".join(parts[:-1])) >= 3:
+        title = re.sub(r"\s+[|—–-]\s+(?!.*\s[|—–-]\s).*$", "", title).strip()
     return title or fallback
 
 

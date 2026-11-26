@@ -27,35 +27,15 @@ from bs4.element import Tag
 
 if __package__ in (None, ""):  # запуск как `python backend/parser/main.py`
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from parser import aggregators, cleaner, config, models, news_search, official_site, stealth, store, utils  # type: ignore
+    import parser  # noqa: F401  - пакет нужен для относительных импортов
 
-    # Ниже используются обычные импорты (`from cleaner import ...`), чтобы
-    # модуль можно было запускать и как пакет, и как отдельный файл.
-    sys.modules.setdefault("aggregators", aggregators)
-    sys.modules.setdefault("cleaner", cleaner)
-    sys.modules.setdefault("config", config)
-    sys.modules.setdefault("models", models)
-    sys.modules.setdefault("news_search", news_search)
-    sys.modules.setdefault("official_site", official_site)
-    sys.modules.setdefault("stealth", stealth)
-    sys.modules.setdefault("store", store)
-    sys.modules.setdefault("utils", utils)
-else:
-    from . import aggregators, cleaner, config, models, news_search, official_site, stealth, store, utils
+    __package__ = "parser"
 
-    sys.modules.setdefault("aggregators", aggregators)
-    sys.modules.setdefault("cleaner", cleaner)
-    sys.modules.setdefault("config", config)
-    sys.modules.setdefault("models", models)
-    sys.modules.setdefault("news_search", news_search)
-    sys.modules.setdefault("official_site", official_site)
-    sys.modules.setdefault("stealth", stealth)
-    sys.modules.setdefault("store", store)
-    sys.modules.setdefault("utils", utils)
-
-from aggregators import AggregatorService, merge_passports
-from cleaner import HTMLCleaner
-from config import (
+from . import utils
+from .aggregators import AggregatorService, merge_passports
+from .cleaner import HTMLCleaner
+from .config import (
+    ALL_SECTIONS,
     DEFAULT_BATCH_PROFILES,
     DEFAULT_CONTENT_SELECTORS,
     DEFAULT_ITEM_SELECTORS,
@@ -68,7 +48,7 @@ from config import (
     Settings,
     UniversityProfile,
 )
-from models import (
+from .models import (
     Achievement,
     AggregatorPassport,
     ChangeReport,
@@ -82,16 +62,18 @@ from models import (
     Project,
     ResearchItem,
     SourceDocument,
+    Specialty,
     Unit,
     UniversityData,
     UniversityInfo,
     utc_now,
 )
-from news_search import NewsSearch
-from official_site import OfficialSiteDiscovery, resolve_official_site
-from stealth import StealthFetcher
-from store import CrawlCache, DocumentStore
-from utils import (
+from .news_search import NewsSearch
+from .official_site import OfficialSiteDiscovery, resolve_official_site
+from .specialties import cooperation_directions, dedupe_specialties, parse_specialties
+from .stealth import StealthFetcher
+from .store import CrawlCache, DocumentStore
+from .utils import (
     BlockedError,
     FetchResult,
     HttpClient,
@@ -175,6 +157,7 @@ OWNER_RANK = {
 SECTION_ORDER = {
     "leadership": 0,
     "contacts": 1,
+    "programs": 1,
     "projects": 2,
     "grants": 3,
     "partnerships": 4,
@@ -186,6 +169,36 @@ SECTION_ORDER = {
     "about": 9,
     "homepage": 10,
 }
+
+# Разделы официального сайта, которые собираются всегда, когда сайт известен:
+# руководство и контакты есть только там, и они должны быть актуальными.
+OFFICIAL_CORE_SECTIONS: tuple[str, ...] = ("about", "leadership", "contacts", "programs")
+
+# Основное руководство: ректор (0), президент (1), первый проректор (2),
+# проректоры (3), научный руководитель (4).
+KEY_LEADERSHIP_MAX_RANK = 4
+
+# Латинские фрагменты адресов разделов: ссылки из sitemap.xml не имеют
+# текста, и русские ключевые слова к ним не применимы.
+SECTION_URL_PATTERNS: dict[str, tuple[str, ...]] = {
+    "about": ("sveden/common", "about", "ob-universitete", "o-universitete", "ob-akademii", "obshchie-svedeniya"),
+    "leadership": ("sveden/struct", "rukovodstvo", "rectorat", "rektorat", "administration", "management", "leadership"),
+    "contacts": ("contacts", "kontakty", "contact"),
+    "programs": ("sveden/education", "napravleniya-podgotovki", "specialnosti", "obrazovatelnye-programmy", "education/programs"),
+    "projects": ("projects", "proekty", "priority2030", "prioritet-2030", "pish"),
+    "research": ("science", "nauka", "research", "laboratories", "laboratorii", "issledovaniya"),
+    "grants": ("grants", "granty", "konkursy", "competitions"),
+    "partnerships": ("partners", "partnery", "partnership", "cooperation", "sotrudnichestvo"),
+    "achievements": ("achievements", "dostizheniya", "nagrady", "awards"),
+    "news": ("news", "novosti", "press"),
+    "events": ("events", "anons", "announcements", "meropriyatiya", "afisha"),
+}
+
+SBER_RE = re.compile(r"(?<![а-яёa-z])(?:сбер|sber)", re.IGNORECASE)
+PROJECT_TITLE_RE = re.compile(
+    r"(?<![а-яё])(?:проект|грант|мегагрант|нир(?![а-яё])|ниокр|лаборатори|приоритет[- ]2030|передов[а-яё]+\s+инженерн|пиш(?![а-яё])|центр\s+компетенц|консорциум|стартап|научн[а-яё]+\s+центр|соглашени)",
+    re.IGNORECASE,
+)
 
 # Ссылки «Форумы ректоров», «Совет ректоров» ведут не к ректорату.
 LEADERSHIP_NOISE_RE = re.compile(
@@ -308,10 +321,15 @@ def _looks_like_table_name(value: str) -> bool:
         "филиал",
         "представительство",
     )
-    if any(word in lowered for word in org_words):
+    has_patronymic = any(utils.PATRONYMIC_RE.search(word) for word in text.split())
+    if not has_patronymic and any(word in lowered for word in org_words):
         return False
+    if utils.PERSON_INITIALS_RE.fullmatch(text) or utils.PERSON_INITIALS_RE.fullmatch(text + "."):
+        return looks_like_person_name(text)
     tokens = re.findall(r"[А-ЯЁA-Z][а-яёa-z\-]+", text)
     if not 2 <= len(tokens) <= 4:
+        return False
+    if not re.match(r"[А-ЯЁA-Z]", text):
         return False
     if any(token.lower() in utils.NAME_BLACKLIST for token in tokens):
         return False
@@ -322,11 +340,19 @@ def _is_rector_position(position: str) -> bool:
     """Должность ректора, в том числе с уточнением: «Ректор НГУ, ...»."""
 
     lowered = normalize_whitespace(position or "").lower()
-    if "проректор" in lowered:
-        return False
-    return lowered.startswith(
-        ("ректор", "и.о. ректор", "и. о. ректор", "и.о.ректор")
-    )
+    # «Председатель учёного совета, ректор» — тоже ректор; проверяем каждую
+    # часть должности, но не «проректор».
+    for part in re.split(r"[,;/]|\s+и\s+", lowered):
+        part = part.strip()
+        if part.startswith("проректор"):
+            continue
+        if re.match(
+            r"(?:и\.?\s*о\.?\s*|врио\s+|временно\s+исполняющ[а-яё]*\s+обязанност[а-яё]*\s+|"
+            r"исполняющ[а-яё]*\s+обязанност[а-яё]*\s+)?ректор(?:а|у|ом|е)?(?![а-яё])",
+            part,
+        ):
+            return True
+    return False
 
 
 def _position_rank(position: str) -> int:
@@ -356,10 +382,22 @@ def _position_rank(position: str) -> int:
     return 50
 
 
+def _keyword_hit(text: str, keyword: str) -> bool:
+    """Ключевое слово как начало слова: «нир» не находится в «планирование»,
+    «курс» — в «конкурсе»."""
+
+    return re.search(rf"(?<![а-яёa-z]){re.escape(keyword)}", text) is not None
+
+
+def _has_keyword(text: str, mapping: dict[str, tuple[str, ...]]) -> bool:
+    lowered = (text or "").lower()
+    return any(_keyword_hit(lowered, keyword) for keywords in mapping.values() for keyword in keywords)
+
+
 def _classify(text: str, mapping: dict[str, tuple[str, ...]], default: str) -> str:
     lowered = (text or "").lower()
     for label, keywords in mapping.items():
-        if any(keyword in lowered for keyword in keywords):
+        if any(_keyword_hit(lowered, keyword) for keyword in keywords):
             return label
     return default
 
@@ -468,10 +506,12 @@ FAX_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 # «каб. А308», «каб. A308», «кабинет 12», «office 5», «к. А308».
+# Номер кабинета обязательно содержит цифру: «к.т.н.» и «кабинет
+# руководителя» — не кабинеты. Подпись регистронезависима, номер — нет.
 OFFICE_RE = re.compile(
-    r"(?:каб(?:инет)?\.?|офис|office|room|к\.)\s*[:№]?\s*"
-    r"([А-ЯЁA-Z0-9][А-ЯЁA-Z0-9\-/]*)",
-    re.IGNORECASE,
+    r"(?<![А-ЯЁа-яёA-Za-z])(?i:каб(?:инет)?\.?|офис|office|room|ауд(?:итория)?\.?|к\.(?=\s*[А-ЯЁA-Z]?-?\d))"
+    r"\s*[:№]?\s*"
+    r"((?:[А-ЯЁA-Z]{1,2}-?)?\d[\dА-ЯЁA-Zа-яё\-/]*)"
 )
 CONTACT_LABEL_RE = re.compile(
     r"(?:^|\s)(?:"
@@ -535,7 +575,7 @@ def _contacts_from_contact_text(text: str) -> dict[str, str]:
     return values
 
 
-def _contact_chunks(doc: models.SourceDocument) -> list[str]:
+def _contact_chunks(doc: SourceDocument) -> list[str]:
     """Короткие текстовые блоки, похожие на контактную информацию."""
 
     raw: list[str] = [block.text for block in doc.blocks if block.text]
@@ -590,6 +630,22 @@ def _owner_from_row(row: dict[str, str], email_count: int) -> tuple[str, str]:
     ):
         return position, "office"
     return "ВУЗ", "organization"
+
+
+def _same_person(left: str, right: str) -> bool:
+    """«Илья Обабков» и «Обабков Илья Николаевич» — один человек."""
+
+    def tokens(value: str) -> set[str]:
+        return {
+            token.lower().replace("ё", "е")
+            for token in re.findall(r"[А-ЯЁа-яёA-Za-z\-]{2,}", strip_name(value))
+        }
+
+    a, b = tokens(left), tokens(right)
+    if not a or not b:
+        return False
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    return len(shorter) >= 2 and shorter <= longer
 
 
 def _name_key(value: str) -> str:
@@ -738,7 +794,8 @@ class SvedenTableParser:
         return rows
 
     def _parse_table(self, table: Tag) -> list[dict[str, str]]:
-        table_rows = table.find_all("tr")
+        # Строки вложенных таблиц разбираются отдельно (find_all вернёт и их).
+        table_rows = [row for row in table.find_all("tr") if row.find_parent("table") is table]
         if not table_rows:
             return []
 
@@ -778,19 +835,57 @@ class SvedenTableParser:
 
         parsed: list[dict[str, str]] = []
         seen_after_header = False
+        # Ячейки с rowspan/colspan раскладываются по сетке, чтобы колонки
+        # не сдвигались («Руководитель» под «Должностью» и т. п.).
+        pending: dict[int, tuple[Tag, int]] = {}
         for tr in table_rows:
             if tr is header_row:
                 seen_after_header = True
                 continue
             if not seen_after_header:
                 continue
-            cells = tr.find_all(["td", "th"], recursive=False)
-            if len(cells) < 2:
+            own_cells = tr.find_all(["td", "th"], recursive=False)
+            cells, pending = self._grid_row(own_cells, pending)
+            if len({id(cell) for cell in cells}) < 2:
+                # Подзаголовок-разделитель на всю ширину таблицы.
                 continue
             data = self._row_to_dict(cells, columns)
             if data.get("name") or data.get("position"):
                 parsed.append(data)
         return parsed
+
+    @staticmethod
+    def _grid_row(
+        own_cells: Sequence[Tag], pending: dict[int, tuple[Tag, int]]
+    ) -> tuple[list[Tag], dict[int, tuple[Tag, int]]]:
+        """Строка таблицы с учётом rowspan/colspan предыдущих строк."""
+
+        def span(cell: Tag, name: str, limit: int) -> int:
+            try:
+                return max(1, min(int(cell.get(name, "1") or 1), limit))
+            except (TypeError, ValueError):
+                return 1
+
+        cells: list[Tag] = []
+        next_pending: dict[int, tuple[Tag, int]] = {}
+        own = list(own_cells)
+        index = 0
+        while own or index in pending:
+            if index in pending:
+                cell, remaining = pending[index]
+                cells.append(cell)
+                if remaining > 1:
+                    next_pending[index] = (cell, remaining - 1)
+                index += 1
+                continue
+            cell = own.pop(0)
+            rows, cols = span(cell, "rowspan", 200), span(cell, "colspan", 20)
+            for offset in range(cols):
+                cells.append(cell)
+                if rows > 1:
+                    next_pending[index + offset] = (cell, rows - 1)
+            index += cols
+        return cells, next_pending
 
     @staticmethod
     def _map_columns(headers: Sequence[str]) -> dict[str, int]:
@@ -818,7 +913,12 @@ class SvedenTableParser:
             ):
                 columns.setdefault("address", index)
         if "unit" not in columns and len(headers) > 0:
-            columns["unit"] = 0
+            # Первая свободная колонка — подразделение, но не колонка ФИО.
+            used = set(columns.values())
+            for index in range(len(headers)):
+                if index not in used:
+                    columns["unit"] = index
+                    break
         return columns
 
     def _row_to_dict(
@@ -891,9 +991,9 @@ class UniversityParser:
         self.client = client or HttpClient(self.settings)
         self.logger = logging.getLogger("parser")
         self.profile: UniversityProfile | None = None
-        self._page_cache: dict[str, tuple[SourceDocument, BeautifulSoup]] = {}
+        self._page_cache: dict[tuple[str, str], tuple[SourceDocument, BeautifulSoup]] = {}
         self._failed_urls: set[str] = set()
-        self._documents: dict[str, SourceDocument] = {}
+        self._documents: dict[tuple[str, str], SourceDocument] = {}
         self._leadership: list[Leadership] = []
         self._rector_profile_url: str = ""
         self._broken_hosts: set[str] = set()
@@ -918,6 +1018,13 @@ class UniversityParser:
         self._official_domain: str = ""
         self._cache: CrawlCache | None = None
         self._store: DocumentStore | None = None
+        self._short_name: str = ""
+        self._contact_owners: dict[tuple[str, str], set[str]] = {}
+        self._raw_pages: dict[str, tuple[str, str, str, dict | None, bool]] = {}
+        self._fetcher: StealthFetcher | None = None
+        self._discovered_site: str = ""
+        self._specialties: list[Specialty] = []
+        self._rector_page_url: str = ""
 
     # ------------------------------------------------------------------
     # Публичный API
@@ -928,35 +1035,52 @@ class UniversityParser:
         name: str | None = None,
         profile: UniversityProfile | str | None = None,
         allowed_sections: Sequence[str] | None = None,
+        short_name: str | None = None,
     ) -> UniversityData:
-        """Собирает данные и возвращает валидированную карточку."""
+        """Собирает данные и возвращает валидированную карточку.
+
+        Достаточно названия вуза: официальный сайт найдётся автоматически.
+        Руководство и контакты берутся с официального сайта (раздел
+        «Сведения об образовательной организации»), паспорт — из
+        агрегаторов, сотрудничество со Сбером — из новостей.
+        """
 
         self._reset()
         profile_obj = self._resolve_profile(url, profile)
         self.profile = profile_obj
+        name = normalize_whitespace(name or "") or None
+        self._short_name = normalize_whitespace(
+            short_name
+            or (profile_obj.aliases[0] if profile_obj and profile_obj.aliases else "")
+        )
         base_url = (url or (profile_obj.url if profile_obj else "")).strip()
-        if not base_url and name:
-            short_name = (
-                profile_obj.aliases[0]
-                if profile_obj and profile_obj.aliases
-                else ""
-            )
-            LOGGER.info("Ищу официальный сайт по названию: %s", name)
+        if not base_url and (name or self._short_name):
+            LOGGER.info("Ищу официальный сайт по названию: %s", name or self._short_name)
             base_url = resolve_official_site(
-                name,
-                short_name=short_name,
+                name or self._short_name,
+                short_name=self._short_name,
                 timeout=min(self.settings.timeout, 25.0),
                 enable_playwright=self.settings.enable_playwright,
             )
             if base_url:
                 LOGGER.info("Официальный сайт найден: %s", base_url)
-        if not base_url and not self.settings.aggregators_only:
-            raise ValueError(
-                "Не удалось определить URL вуза: передайте URL или название"
+        if not base_url:
+            self._warnings.append(
+                "Официальный сайт вуза не найден: руководство и контакты "
+                "собраны только из агрегаторов и поиска"
             )
 
         self._base_url = base_url
-        self._university_name = name or (profile_obj.name if profile_obj else "")
+        self._university_name = (
+            name
+            or (profile_obj.name if profile_obj else "")
+            or (self._name_from_site(base_url) if base_url else "")
+        )
+        if not self._university_name:
+            self._warnings.append(
+                "Название вуза не задано и не найдено на сайте: агрегаторы и "
+                "поиск новостей пропущены"
+            )
         self._official_domain = (
             utils.urlparse(base_url).netloc.lower().split(":")[0]
             if base_url
@@ -979,8 +1103,13 @@ class UniversityParser:
             base_url,
         )
 
-        if self.settings.aggregators_only and allowed_sections is None:
-            LOGGER.info("Режим: только агрегаторы (без обхода сайта вуза)")
+        if allowed_sections is None:
+            # Агрегаторы и официальный сайт используются вместе всегда:
+            # руководство, контакты и специальности — с сайта, паспорт — из
+            # агрегаторов. Набор разделов сайта задаётся настройкой.
+            allowed_sections = tuple(self.settings.sections)
+        if not base_url:
+            LOGGER.info("Официальный сайт не найден: только агрегаторы и поиск")
             self._enrich_aggregators(base_url)
             self._enrich_rector_from_web()
             self._enrich_news_mentions()
@@ -1033,8 +1162,9 @@ class UniversityParser:
                 LOGGER.exception(message)
                 self._errors.append(message)
 
-        self._enrich_bios()
         self._enrich_rector_from_web()
+        self._enrich_rectorate()
+        self._enrich_bios()
         self._enrich_aggregators(base_url)
         self._enrich_news_mentions()
         card = self._build_card(base_url, name, profile_obj, homepage_doc)
@@ -1050,6 +1180,9 @@ class UniversityParser:
         if self._store is not None:
             self._store.close()
             self._store = None
+        if self._fetcher is not None:
+            self._fetcher.close()
+            self._fetcher = None
         self.client.close()
 
     # ------------------------------------------------------------------
@@ -1082,6 +1215,36 @@ class UniversityParser:
         self._detail_urls.clear()
         self._about = ""
         self._about_doc = None
+        # Состояние предыдущего вуза не должно влиять на следующий.
+        self._base_url = ""
+        self._university_name = ""
+        self._official_domain = ""
+        self._short_name = ""
+        self._rector_profile_url = ""
+        self._broken_hosts.clear()
+        self._contact_owners.clear()
+        self._raw_pages.clear()
+        self._discovered_site = ""
+        self._specialties = []
+        self._rector_page_url = ""
+
+    def _name_from_site(self, base_url: str) -> str:
+        """Название вуза с главной страницы (og:site_name или <title>)."""
+
+        result = self.client.get(base_url) if base_url else None
+        if result is None or not getattr(result, "text", ""):
+            return ""
+        soup = _make_soup(result.text)
+        meta = soup.find("meta", attrs={"property": "og:site_name"})
+        candidates = [str(meta.get("content") or "") if meta else ""]
+        if soup.title and soup.title.string:
+            title = normalize_whitespace(soup.title.string)
+            candidates.extend(reversed(re.split(r"\s+[|—–-]\s+", title)))
+        for value in candidates:
+            value = normalize_whitespace(value)
+            if re.search(r"университет|институт|академи|университета|колледж|школа|консерватори", value, re.I):
+                return value
+        return ""
 
     @staticmethod
     def _resolve_profile(
@@ -1184,6 +1347,11 @@ class UniversityParser:
                 for pattern in patterns:
                     if pattern in haystack:
                         score += len(pattern)
+                path = utils.urlparse(absolute).path.lower().strip("/")
+                for pattern in SECTION_URL_PATTERNS.get(section_name, ()):
+                    if re.search(rf"(?:^|/){re.escape(pattern)}(?:/|$|-|_)", path):
+                        # Совпадение по сегменту пути: «/news/», «/sveden/struct/».
+                        score += len(pattern) + (4 if path.count("/") <= 1 else 0)
                 if not score:
                     continue
                 # Поощряем короткие «раздельные» URL и штрафуем новости.
@@ -1193,8 +1361,9 @@ class UniversityParser:
             if not candidates:
                 continue
             candidates.sort(key=lambda item: (-item[0], len(item[1])))
-            url = candidates[0][1]
-            if url in used_urls:
+            # Лучший кандидат уже занят другим разделом — берём следующий.
+            url = next((candidate for _, candidate in candidates if candidate not in used_urls), "")
+            if not url:
                 continue
             used_urls.add(url)
             sections.append(
@@ -1222,6 +1391,10 @@ class UniversityParser:
             parsed = utils.urlparse(base_url)
             standard = f"{parsed.scheme}://{parsed.netloc}{SVEDEN_SECTIONS['leadership']}"
             sections.append(SectionSpec(name="leadership", url=standard))
+        if not any(section.name == "programs" for section in sections):
+            parsed = utils.urlparse(base_url)
+            standard = f"{parsed.scheme}://{parsed.netloc}{SVEDEN_SECTIONS['programs']}"
+            sections.append(SectionSpec(name="programs", url=standard))
         if not any(section.name == "contacts" for section in sections):
             parsed = utils.urlparse(base_url)
             standard = f"{parsed.scheme}://{parsed.netloc}{SVEDEN_SECTIONS['contacts']}"
@@ -1324,6 +1497,8 @@ class UniversityParser:
             self._parse_leadership(doc, soup)
         elif section.name == "contacts":
             self._parse_contacts(doc, soup)
+        elif section.name == "programs":
+            self._parse_programs(doc, soup)
         elif section.name == "projects":
             self._parse_projects(doc, soup, section)
         elif section.name in {"research", "grants", "partnerships", "achievements"}:
@@ -1336,28 +1511,61 @@ class UniversityParser:
     # ------------------------------------------------------------------
     # Загрузка и очистка
     # ------------------------------------------------------------------
+    def _public_only(self) -> bool:
+        """Клиент работает только с публичной сетью (запрос из API)."""
+
+        session = getattr(self.client, "session", None)
+        return getattr(session, "public_only", False) is True
+
+    def _stealth(self) -> StealthFetcher:
+        """Общий браузерный загрузчик: один браузер на весь запуск."""
+
+        if self._fetcher is None:
+            self._fetcher = StealthFetcher(
+                timeout=min(self.settings.timeout, 30.0),
+                enable_playwright=True,
+                min_delay=max(1.0, self.settings.request_delay),
+                public_only=self._public_only(),
+                max_bytes=self.settings.max_response_bytes,
+            )
+        return self._fetcher
+
+    def _spend_request(self) -> bool:
+        """Резервная загрузка тратит общий лимит запросов на обход."""
+
+        made = getattr(self.client, "_requests_made", 0)
+        if not isinstance(made, int):
+            return True
+        if made >= self.settings.max_total_requests:
+            return False
+        self.client._requests_made = made + 1
+        return True
+
     def _fallback_fetch(self, url: str, section: str) -> FetchResult | None:
         """Fallback на curl_cffi/Playwright, если requests не смог загрузить.
 
-        Включается через ``--with-official-site`` (CLI) или CRM-коллектор:
+        Включается флагом ``--playwright`` (CLI) или в CRM-коллекторе:
         без браузерного транспорта сайты вроде msu.ru отдают 0 документов.
+        Ответы 4xx/5xx и заглушки антибота не считаются страницей.
         """
 
         if not self.settings.enable_playwright:
+            return None
+        error_code = getattr(self.client, "last_error_code", "")
+        last_error = str(getattr(self.client, "last_error", "") or "")
+        # 404, запрет robots.txt и лимит запросов браузер не обходит.
+        if error_code == "response_too_large" or re.search(
+            r"HTTP 4\d\d|robots\.txt|лимит запросов|Public website required", last_error
+        ):
             return None
         if self.settings.respect_robots:
             allowed, _ = self.client.robots.can_fetch(url)
             if not allowed:
                 return None
-        fetcher = StealthFetcher(
-            timeout=min(self.settings.timeout, 30.0),
-            enable_playwright=True,
-        )
-        try:
-            response = fetcher.get(url)
-        finally:
-            fetcher.close()
-        if not response.text:
+        if not self._spend_request():
+            return None
+        response = self._stealth().get(url)
+        if not response.ok or StealthFetcher.looks_blocked(response.status_code, response.text):
             return None
         LOGGER.info(
             "%s: requests недоступен, загружено через %s (%s)",
@@ -1368,22 +1576,14 @@ class UniversityParser:
         return FetchResult(
             url=url,
             final_url=response.final_url or url,
-            status_code=response.status_code or 200,
+            status_code=response.status_code,
             text=response.text,
             content_type=response.content_type,
         )
 
-    def _get_page(
-        self,
-        url: str,
-        section: str,
-        content_selectors: Sequence[str] = (),
-    ) -> tuple[SourceDocument | None, BeautifulSoup | None]:
-        canonical = canonical_url(url)
-        if canonical in self._page_cache:
-            return self._page_cache[canonical]
-        if canonical in self._failed_urls:
-            return None, None
+    def _fetch_raw(self, canonical: str, section: str) -> tuple[str, str, str, dict | None, bool] | None:
+        """HTML страницы из кэша или сети: (html, final_url, content_type, запись кэша, свежая ли)."""
+
         if self._cache is not None:
             failure = self._cache.get_failure(canonical)
             if failure is not None and not self.settings.enable_playwright:
@@ -1391,8 +1591,7 @@ class UniversityParser:
                     f"{section}: пропущено после недавней ошибки "
                     f"({failure.get('error')}): {canonical}"
                 )
-                self._failed_urls.add(canonical)
-                return None, None
+                return None
             if failure is not None:
                 # Прошлая ошибка (SSL, 403) может быть обойдена браузером.
                 LOGGER.info(
@@ -1402,92 +1601,112 @@ class UniversityParser:
                     canonical,
                 )
 
-        html = ""
-        final_url = canonical
-        content_type = "text/html"
         cached = self._cache.get_page(canonical) if self._cache else None
-        cache_entry = cached
         if cached is not None:
-            html = str(cached.get("html") or "")
-            final_url = str(cached.get("final_url") or canonical)
-            content_type = str(cached.get("content_type") or "text/html")
             LOGGER.info("CACHE %s", canonical)
-        else:
-            host = utils.urlparse(canonical).netloc.lower()
-            if host in self._broken_hosts and self.settings.enable_playwright:
-                # Хост уже не отдался обычному HTTP-клиенту: не тратим
-                # таймаут на каждую страницу, сразу идём через браузер.
-                result = self._fallback_fetch(canonical, section)
-            else:
-                result = self.client.get(canonical)
-                if result is None:
-                    if "SSL" in (self.client.last_error or ""):
-                        self._broken_hosts.add(host)
-                    result = self._fallback_fetch(canonical, section)
-            if result is None:
-                message = (
-                    f"{section}: {self.client.last_error or 'не удалось загрузить'} "
-                    f"({canonical})"
-                )
-                if self._cache is not None:
-                    self._cache.set_failure(canonical, None, self.client.last_error)
-                if self._store is not None:
-                    self._store.record_status(
-                        canonical, None, self.client.last_error
-                    )
-                stale = (
-                    self._cache.get_page(canonical, allow_stale=True)
-                    if self._cache is not None
-                    else None
-                )
-                if stale is not None:
-                    cache_entry = stale
-                    html = str(stale.get("html") or "")
-                    final_url = str(stale.get("final_url") or canonical)
-                    content_type = str(stale.get("content_type") or "text/html")
-                    self._warnings.append(
-                        message + " — использую устаревшую копию из кэша"
-                    )
-                else:
-                    self._warnings.append(message)
-                    self._failed_urls.add(canonical)
-                    return None, None
-            else:
-                if result.final_url and not is_same_domain(
-                    result.final_url, canonical
-                ):
-                    self._warnings.append(
-                        f"{section}: редирект на сторонний домен "
-                        f"{result.final_url} ({canonical}) — пропущено"
-                    )
-                    self._failed_urls.add(canonical)
-                    return None, None
-                if result.content_type and not any(
-                    marker in result.content_type.lower()
-                    for marker in ("html", "xml", "text")
-                ):
-                    self._warnings.append(
-                        f"{section}: пропущен не-HTML документ "
-                        f"{result.content_type}: {canonical}"
-                    )
-                    if self._store is not None:
-                        self._store.record_status(
-                            canonical,
-                            result.status_code,
-                            f"пропущен не-HTML документ: {result.content_type}",
-                        )
-                    self._failed_urls.add(canonical)
-                    return None, None
+            return (
+                str(cached.get("html") or ""),
+                str(cached.get("final_url") or canonical),
+                str(cached.get("content_type") or "text/html"),
+                cached,
+                True,
+            )
 
-                html = result.text
-                final_url = result.final_url or canonical
-                content_type = result.content_type or "text/html"
-                if self._cache is not None:
-                    self._cache.set_page(
-                        canonical, html, final_url, content_type, result.status_code
-                    )
-                if self._store is not None:
-                    self._store.record_status(canonical, result.status_code, "")
+        host = utils.urlparse(canonical).netloc.lower()
+        if host in self._broken_hosts and self.settings.enable_playwright:
+            # Хост уже не отдался обычному HTTP-клиенту: не тратим
+            # таймаут на каждую страницу, сразу идём через браузер.
+            result = self._fallback_fetch(canonical, section)
+        else:
+            result = self.client.get(canonical)
+            if result is None:
+                if "SSL" in (self.client.last_error or ""):
+                    self._broken_hosts.add(host)
+                result = self._fallback_fetch(canonical, section)
+        if result is None:
+            message = (
+                f"{section}: {self.client.last_error or 'не удалось загрузить'} "
+                f"({canonical})"
+            )
+            if self._cache is not None:
+                self._cache.set_failure(canonical, None, self.client.last_error)
+            if self._store is not None:
+                self._store.record_status(canonical, None, self.client.last_error)
+            stale = (
+                self._cache.get_page(canonical, allow_stale=True)
+                if self._cache is not None
+                else None
+            )
+            if stale is None:
+                self._warnings.append(message)
+                return None
+            self._warnings.append(message + " — использую устаревшую копию из кэша")
+            return (
+                str(stale.get("html") or ""),
+                str(stale.get("final_url") or canonical),
+                str(stale.get("content_type") or "text/html"),
+                stale,
+                False,
+            )
+
+        if result.final_url and not is_same_domain(result.final_url, canonical):
+            self._warnings.append(
+                f"{section}: редирект на сторонний домен "
+                f"{result.final_url} ({canonical}) — пропущено"
+            )
+            return None
+        if result.content_type and not any(
+            marker in result.content_type.lower()
+            for marker in ("html", "xml", "text")
+        ):
+            self._warnings.append(
+                f"{section}: пропущен не-HTML документ "
+                f"{result.content_type}: {canonical}"
+            )
+            if self._store is not None:
+                self._store.record_status(
+                    canonical,
+                    result.status_code,
+                    f"пропущен не-HTML документ: {result.content_type}",
+                )
+            return None
+
+        final_url = result.final_url or canonical
+        content_type = result.content_type or "text/html"
+        if self._cache is not None:
+            self._cache.set_page(
+                canonical, result.text, final_url, content_type, result.status_code
+            )
+        if self._store is not None:
+            self._store.record_status(canonical, result.status_code, "")
+        return result.text, final_url, content_type, None, False
+
+    def _get_page(
+        self,
+        url: str,
+        section: str,
+        content_selectors: Sequence[str] = (),
+    ) -> tuple[SourceDocument | None, BeautifulSoup | None]:
+        canonical = canonical_url(url)
+        key = (canonical, section)
+        if key in self._page_cache:
+            return self._page_cache[key]
+        if canonical in self._failed_urls:
+            return None, None
+        if not utils.urlparse(canonical).netloc:
+            self._failed_urls.add(canonical)
+            return None, None
+
+        # Одна страница может служить двум разделам (руководство и контакты
+        # на /sveden/struct/): скачиваем один раз, а размечаем для каждого
+        # раздела отдельно.
+        raw = self._raw_pages.get(canonical)
+        if raw is None:
+            raw = self._fetch_raw(canonical, section)
+            if raw is None:
+                self._failed_urls.add(canonical)
+                return None, None
+        html, final_url, content_type, cache_entry, fresh_cache = raw
 
         if not html:
             self._warnings.append(f"{section}: пустой ответ ({canonical})")
@@ -1510,7 +1729,7 @@ class UniversityParser:
 
         # Если HTML не содержит контента (SPA/JS), пробуем браузерный
         # рендеринг — только если он явно разрешён настройкой.
-        if len(doc.text) < 200 and self.settings.enable_playwright:
+        if len(doc.text) < 200 and self.settings.enable_playwright and canonical not in self._raw_pages:
             rendered = self._render_with_playwright(canonical)
             if rendered and rendered != html:
                 cache_entry = None
@@ -1526,6 +1745,7 @@ class UniversityParser:
                     self._cache.set_page(
                         canonical, html, final_url, content_type, 200
                     )
+        self._raw_pages[canonical] = (html, final_url, content_type, cache_entry, fresh_cache)
 
         if cache_entry is not None:
             # Reprocessing a saved page is not a successful check of the website.
@@ -1540,7 +1760,7 @@ class UniversityParser:
                 self._failed_urls.add(canonical)
                 return None, None
             doc.retrieved_at = retrieved_at
-            doc.metadata["cache_status"] = "cached" if cached is not None else "stale"
+            doc.metadata["cache_status"] = "cached" if fresh_cache else "stale"
 
         if not doc.text:
             self._warnings.append(
@@ -1555,39 +1775,32 @@ class UniversityParser:
                 self._store.save_document(
                     doc, self._university_name, self._official_domain
                 )
-        self._page_cache[canonical] = (doc, soup)
-        self._documents[canonical] = doc
+        self._page_cache[key] = (doc, soup)
+        self._documents[key] = doc
         return doc, soup
 
     def _render_with_playwright(self, url: str) -> str:
-        """Опциональный рендеринг JS-страницы через Playwright."""
+        """Опциональный рендеринг JS-страницы через общий браузер.
+
+        Рендеринг идёт через тот же загрузчик, что и резервная загрузка:
+        один браузер на запуск, учёт лимита запросов и (в API) запрет
+        обращений к внутренней сети.
+        """
 
         try:
-            from playwright.sync_api import sync_playwright  # type: ignore
+            import playwright.sync_api  # type: ignore  # noqa: F401
         except ImportError:
             LOGGER.info("Playwright не установлен, рендеринг пропущен: %s", url)
             return ""
-        try:
-            with sync_playwright() as runtime:
-                browser = runtime.chromium.launch(headless=True)
-                page = browser.new_page(locale="ru-RU")
-                timeout_ms = int(max(self.settings.timeout, 45.0) * 1000)
-                try:
-                    page.goto(
-                        url, timeout=timeout_ms, wait_until="networkidle"
-                    )
-                except Exception:
-                    page.goto(
-                        url, timeout=timeout_ms, wait_until="domcontentloaded"
-                    )
-                page.wait_for_timeout(2000)
-                html = page.content()
-                browser.close()
-            LOGGER.info("Playwright отрендерил %s (%s символов)", url, len(html))
-            return html
-        except Exception as exc:  # noqa: BLE001 - рендеринг не должен ронять сбор
-            LOGGER.warning("Playwright не смог отрендерить %s: %s", url, exc)
+        if not self._spend_request():
             return ""
+        response = self._stealth()._playwright_get(url, max(self.settings.timeout, 45.0))
+        if not response.ok or StealthFetcher.looks_blocked(response.status_code, response.text):
+            return ""
+        if response.final_url and not is_same_domain(response.final_url, url):
+            return ""
+        LOGGER.info("Playwright отрендерил %s (%s символов)", url, len(response.text))
+        return response.text
 
     # ------------------------------------------------------------------
     # Руководство
@@ -1611,11 +1824,12 @@ class UniversityParser:
     def _base_domain_url(url: str) -> str:
         """Стандартная страница структуры на основном домене вуза."""
 
-        host = utils.urlparse(url).netloc.lower()
-        parts = host.split(".")
-        if len(parts) > 2 and parts[0] not in {"www", "m"}:
-            host = ".".join(parts[-2:])
-        return f"https://{host}/sveden/struct/"
+        parsed = utils.urlparse(url)
+        host = parsed.netloc.lower().split(":")[0]
+        root = utils.registrable_domain(host)
+        if host.startswith("www.") and host[4:] == root:
+            root = host
+        return f"{parsed.scheme or 'https'}://{root}/sveden/struct/"
 
     def _better_leadership_source(
         self, doc: SourceDocument, soup: BeautifulSoup
@@ -1723,9 +1937,8 @@ class UniversityParser:
                 and position_rank <= 1
                 and _mailbox(email) in GENERIC_MAILBOXES
             )
-            position_rank = _position_rank(position)
             is_acting = bool(
-                re.search(r"\bи\.?\s*о\.?\b|исполняющ", position, re.IGNORECASE)
+                re.search(r"\bи\.?\s*о\.?\b|исполняющ|врио|временно", position, re.IGNORECASE)
             )
             leader = Leadership(
                 full_name=name,
@@ -1855,6 +2068,102 @@ class UniversityParser:
             len(rows),
         )
 
+    def _enrich_rectorate(self) -> None:
+        """Проректоры со страницы «Ректорат»/«Руководство».
+
+        На многих сайтах (например, УрФУ) в «Структуре и органах управления»
+        перечислены только руководители подразделений, а проректоры — на
+        отдельной странице ректората. Ищем её по ссылкам главной страницы,
+        страницы ректора и раздела руководства.
+        """
+
+        if not self._base_url:
+            return
+        if any(1 <= _position_rank(leader.position) <= 3 for leader in self._leadership):
+            return
+        pages = [self._base_url, self._rector_page_url, self._rector_profile_url]
+        pages += [url for (url, section) in list(self._page_cache) if section == "leadership"]
+        candidates: list[tuple[int, str]] = []
+        for page in dict.fromkeys(url for url in pages if url):
+            _, soup = self._get_page(page, section="leadership" if page != self._base_url else "homepage")
+            if soup is None:
+                continue
+            for anchor in soup.select("a[href]"):
+                text = normalize_whitespace(anchor.get_text(" ", strip=True)).lower()
+                href = (anchor.get("href") or "").lower()
+                if re.fullmatch(r"ректорат|руководство(?:\s+университета|\s+вуза)?|ректор и проректоры|проректоры|администрация", text):
+                    priority = 0
+                elif re.search(r"/(?:rectorate|rektorat|rectorat|administration|rukovodstvo|prorectors?)/?$", href):
+                    priority = 1
+                else:
+                    continue
+                url = canonical_url(anchor["href"], page)
+                if is_same_domain(url, self._base_url):
+                    candidates.append((priority, url))
+        seen: set[str] = set()
+        for _, url in sorted(candidates):
+            if url in seen or len(seen) >= 3:
+                continue
+            seen.add(url)
+            doc, _ = self._get_page(url, section="leadership")
+            if doc is None:
+                continue
+            found = [
+                leader
+                for leader in self._leadership_from_cards(doc)
+                if _position_rank(leader.position) <= KEY_LEADERSHIP_MAX_RANK
+            ]
+            if not any(1 <= _position_rank(leader.position) <= 3 for leader in found):
+                continue
+            known = {_name_key(leader.full_name): leader for leader in self._leadership}
+            for leader in found:
+                existing = known.get(_name_key(leader.full_name))
+                if existing is not None:
+                    existing.email = existing.email or leader.email
+                    existing.phone = existing.phone or leader.phone
+                    existing.office_phone = existing.office_phone or leader.office_phone
+                    existing.office_number = existing.office_number or leader.office_number
+                    continue
+                self._leadership.append(leader)
+                for contact_type, value in (("email", leader.email), ("phone", leader.office_phone)):
+                    if value:
+                        self._add_contact(Contact(type=contact_type, value=value, owner=leader.full_name,
+                                                  owner_kind="person", source_url=doc.url, context=leader.position))
+            LOGGER.info("Ректорат: %s записей со страницы %s", len(found), url)
+            return
+
+    def _leadership_from_cards(self, doc: SourceDocument) -> list[Leadership]:
+        """Карточки «ФИО → должность → контакты» (страницы ректората)."""
+
+        leaders: list[Leadership] = []
+        current: Leadership | None = None
+        for block in doc.blocks:
+            text = normalize_whitespace(block.text)
+            if not text:
+                continue
+            if len(text) <= 60 and looks_like_person_name(text):
+                current = Leadership(full_name=strip_name(text), source_url=doc.url)
+                leaders.append(current)
+                continue
+            if current is None:
+                continue
+            if not current.position and len(text) <= 160 and POSITION_START_RE.match(text):
+                current.position = _clean_position(text)
+                current.is_acting = bool(re.search(r"\bи\.?\s*о\.?\b|исполняющ|врио", text, re.IGNORECASE))
+                continue
+            values = _contacts_from_contact_text(text)
+            if values.get("office_phone") and not current.office_phone:
+                current.office_phone = values["office_phone"]
+                current.phone = current.phone or values["office_phone"]
+            if values.get("office_number") and not current.office_number:
+                current.office_number = values["office_number"]
+            emails = extract_emails(text)
+            if emails and not current.email and (
+                _email_matches_name(emails[0], current.full_name) or not _is_generic_email(emails[0])
+            ):
+                current.email = emails[0]
+        return [leader for leader in leaders if leader.position]
+
     def _leadership_from_text(self, doc: SourceDocument) -> list[Leadership]:
         """Fallback для сайтов без стандартной таблицы."""
 
@@ -1901,6 +2210,32 @@ class UniversityParser:
     # ------------------------------------------------------------------
     # Контакты
     # ------------------------------------------------------------------
+    def _parse_programs(self, doc: SourceDocument, soup: BeautifulSoup) -> None:
+        """Специальности из раздела «Образование» (/sveden/education/)."""
+
+        found = parse_specialties(soup, doc.url)
+        if not found:
+            # Часто сам раздел — оглавление, а таблица программ на подстранице.
+            for anchor in soup.select("a[href]"):
+                href = (anchor.get("href") or "").lower()
+                text = normalize_whitespace(anchor.get_text(" ", strip=True)).lower()
+                if not (
+                    re.search(r"eduop|education/(?:op|programs|napr)|obrazovatelnye-programmy", href)
+                    or "реализуемых образовательных программ" in text
+                    or text.startswith("образовательные программы")
+                ):
+                    continue
+                url = canonical_url(anchor["href"], doc.url)
+                if not is_same_domain(url, doc.url) or url == doc.url:
+                    continue
+                sub_doc, sub_soup = self._get_page(url, section="programs")
+                if sub_soup is not None:
+                    found = parse_specialties(sub_soup, sub_doc.url)
+                if found:
+                    break
+        self._specialties = dedupe_specialties([*self._specialties, *found])
+        LOGGER.info("Специальности: %s", len(self._specialties))
+
     def _parse_contacts(self, doc: SourceDocument, soup: BeautifulSoup) -> None:
         # Структурированные контакты из фрагментов (email/phone + владелец).
         for fragment in doc.fragments:
@@ -1982,8 +2317,22 @@ class UniversityParser:
                         )
                     )
 
+    @staticmethod
+    def _contact_key(contact_type: str, value: str) -> tuple[str, str]:
+        if contact_type == "phone":
+            digits = utils.phone_key(value)
+            if len(digits) >= 10:
+                # «8 (495) …» из текста и «+7 (495) …» из таблицы — один номер.
+                return contact_type, digits
+        return contact_type, normalize_whitespace(value).lower()
+
     def _add_contact(self, contact: Contact) -> None:
-        key = (contact.type, contact.value.lower())
+        if contact.type == "phone":
+            normalized = clean_phone(contact.value)
+            if normalized and len(re.sub(r"\D", "", contact.value)) <= 11:
+                contact.value = normalized
+        key = self._contact_key(contact.type, contact.value)
+        self._contact_owners.setdefault(key, set()).add(contact.owner or "ВУЗ")
         existing = self._contact_index.get(key)
         if existing is None:
             self._contact_index[key] = contact
@@ -2008,11 +2357,7 @@ class UniversityParser:
             items = [
                 item
                 for item in items
-                if any(
-                    keyword in f"{item['title']} {item['description']}".lower()
-                    for keywords in PROJECT_TYPE_KEYWORDS.values()
-                    for keyword in keywords
-                )
+                if _has_keyword(f"{item['title']} {item['description']}", PROJECT_TYPE_KEYWORDS)
             ]
         items = self._enrich_items_with_pages(items, "projects")
         for item in items:
@@ -2036,18 +2381,23 @@ class UniversityParser:
         items = [item for item in items if not self._is_old_news(item["date"])]
         for item in items:
             haystack = f"{item['title']} {item['description']}".lower()
-            if any(
-                keyword in haystack
-                for keywords in PROJECT_TYPE_KEYWORDS.values()
-                for keyword in keywords
-            ):
+            # Новость становится проектом, только если о проекте говорит её
+            # заголовок: иначе любая новость с «исследованием» — «проект».
+            if PROJECT_TITLE_RE.search(item["title"]):
                 self._projects.append(self._project_from_item(item, doc))
-            title_haystack = item["title"].lower()
-            if any(
-                keyword in title_haystack
-                for keywords in EVENT_TYPE_KEYWORDS.values()
-                for keyword in keywords
-            ) and item["date"]:
+            if SBER_RE.search(haystack):
+                # Сотрудничество со Сбером из новостей официального сайта.
+                self._news_mentions.append(
+                    NewsMention(
+                        title=item["title"],
+                        url=item["url"] or doc.url,
+                        snippet=truncate_text(item["description"], 300),
+                        date=item["date"] or None,
+                        source="official_site",
+                        query="",
+                    )
+                )
+            if _has_keyword(item["title"], EVENT_TYPE_KEYWORDS) and item["date"]:
                 # Событие из новости засчитываем только при наличии даты
                 # и ключевого слова в заголовке: так отсекаются новости
                 # и навигационные ссылки, не являющиеся мероприятиями.
@@ -2511,14 +2861,23 @@ class UniversityParser:
         """Наименьший родитель, в котором есть текст помимо заголовка ссылки."""
 
         title_len = len(normalize_whitespace(anchor.get_text(" ", strip=True)))
+        own_href = (anchor.get("href") or "").split("#")[0]
         current = anchor.parent
         best = None
         while isinstance(current, Tag) and current.name not in {"body", "html"}:
             text = normalize_whitespace(current.get_text(" ", strip=True))
-            if len(text) <= max(1200, title_len + 500):
-                best = current
-            else:
+            if len(text) > max(1200, title_len + 500):
                 break
+            # Родитель, в котором есть ссылки на другие публикации, — уже
+            # список, а не карточка: дата и описание будут чужими.
+            other_items = {
+                (link.get("href") or "").split("#")[0]
+                for link in current.find_all("a", href=True)
+                if len(normalize_whitespace(link.get_text(" ", strip=True))) >= 8
+            } - {own_href}
+            if other_items:
+                break
+            best = current
             current = current.parent
         return best
 
@@ -2528,15 +2887,13 @@ class UniversityParser:
     ) -> list[dict[str, str]]:
         """Fallback: абзацы с ключевыми словами проекта/мероприятия."""
 
-        all_keywords = [keyword for values in keywords.values() for keyword in values]
         items: list[dict[str, str]] = []
         seen: set[str] = set()
         for block in doc.blocks:
             text = block.text
             if len(text) < 30 or len(text) > 800:
                 continue
-            lowered = text.lower()
-            if not any(keyword in lowered for keyword in all_keywords):
+            if not _has_keyword(text, keywords):
                 continue
             if _is_navigation_like(text):
                 continue
@@ -2642,10 +2999,16 @@ class UniversityParser:
                 if not 200 <= len(text) <= 8000:
                     continue
                 lowered = text.lower()
+                # «инн» как отдельное слово: не «инновационный».
                 markers = sum(
                     1
-                    for marker in ("полное наименование", "инн", "огрн", "адрес")
-                    if marker in lowered
+                    for marker in (
+                        r"полное\s+наименование",
+                        r"(?<![а-яё])инн(?![а-яё])",
+                        r"(?<![а-яё])огрн(?![а-яё])",
+                        r"(?<![а-яё])адрес(?![а-яё])",
+                    )
+                    if re.search(marker, lowered)
                 )
                 if markers >= 2:
                     candidates.append((len(text), node))
@@ -2750,11 +3113,9 @@ class UniversityParser:
             timeout=min(self.settings.timeout, 20.0),
             enable_playwright=self.settings.enable_playwright,
         )
-        short_name = (
-            self.profile.aliases[0]
-            if self.profile and self.profile.aliases
-            else ""
-        )
+        if not self._university_name and not self._short_name:
+            return
+        short_name = self._short_name
         city = self.profile.city if self.profile else ""
         passports: list[AggregatorPassport] = []
         try:
@@ -2812,6 +3173,7 @@ class UniversityParser:
         fetcher = StealthFetcher(
             timeout=min(self.settings.timeout, 25.0),
             enable_playwright=self.settings.enable_playwright,
+            public_only=self._public_only(),
         )
         try:
             profile = OfficialSiteDiscovery(fetcher).extract_rector(
@@ -2824,7 +3186,7 @@ class UniversityParser:
             fetcher.close()
         if profile is None:
             return
-        if _name_key(profile.full_name) != _name_key(rector.full_name):
+        if not _same_person(profile.full_name, rector.full_name):
             LOGGER.info(
                 "Профиль %s не совпал с ректором %s",
                 profile.full_name,
@@ -2863,18 +3225,18 @@ class UniversityParser:
                 self._enrich_rector_photo(parsed_rector)
                 if parsed_rector.photo_url:
                     return
+        if not self._base_url and not self._university_name and not self._short_name:
+            return
         fetcher = StealthFetcher(
             timeout=min(self.settings.timeout, 25.0),
             enable_playwright=self.settings.enable_playwright,
-        )
-        short_name = (
-            self.profile.aliases[0]
-            if self.profile and self.profile.aliases
-            else ""
+            public_only=self._public_only(),
         )
         try:
+            # Известный официальный сайт не ищем заново: поиск может вернуть
+            # чужой сайт и подменить им домен вуза.
             leader, site_url, rector_url = OfficialSiteDiscovery(fetcher).discover(
-                self._university_name, short_name=short_name
+                self._university_name, short_name=self._short_name, site_url=self._base_url
             )
         except Exception as exc:  # noqa: BLE001 - поиск не должен ронять сбор
             LOGGER.warning("Автопоиск ректора не удался: %s", exc)
@@ -2882,9 +3244,28 @@ class UniversityParser:
         finally:
             fetcher.close()
 
+        if rector_url:
+            self._rector_page_url = rector_url
+        if site_url and not self._base_url:
+            self._discovered_site = site_url
         if not leader:
             self._warnings.append(
                 "Не удалось автоматически найти страницу ректора и фото"
+            )
+            return
+        if parsed_rector is not None and _same_person(parsed_rector.full_name, leader.full_name):
+            # Тот же человек: ФИО и должность — из официальной структуры,
+            # фото, биография и контакты — со страницы ректора.
+            leader.full_name = parsed_rector.full_name
+            leader.position = parsed_rector.position or leader.position
+            leader.is_acting = parsed_rector.is_acting or leader.is_acting
+        elif parsed_rector is not None:
+            # Официальная таблица руководства надёжнее найденной страницы:
+            # расхождение фиксируем, но ректора не подменяем.
+            self._warnings.append(
+                f"Ректор на странице {rector_url} ({leader.full_name}) не совпал с "
+                f"«Структурой и органами управления» ({parsed_rector.full_name}); "
+                "оставлен ректор из официальной структуры"
             )
             return
 
@@ -2910,11 +3291,11 @@ class UniversityParser:
             item for item in self._leadership if _name_key(item.full_name) != key
         ]
         self._leadership = [leader, *others]
-        if site_url:
+        if site_url and not self._official_domain:
             host = utils.urlparse(site_url).netloc.lower().split(":")[0]
             if host.startswith("www."):
                 host = host[4:]
-            self._official_domain = host or self._official_domain
+            self._official_domain = host
         for contact_type, value in (
             ("phone", leader.reception_phone or leader.phone),
             ("email", leader.reception_email or leader.email),
@@ -2939,9 +3320,9 @@ class UniversityParser:
     def _enrich_news_mentions(self) -> None:
         if not self.settings.use_news_search:
             return
-        short_name = ""
-        if self.profile and self.profile.aliases:
-            short_name = self.profile.aliases[0]
+        if not self._university_name and not self._short_name:
+            # Без названия фильтр релевантности пропустил бы любые новости о Сбере.
+            return
         fetcher = StealthFetcher(
             timeout=self.settings.timeout,
             enable_playwright=self.settings.enable_playwright,
@@ -2951,12 +3332,32 @@ class UniversityParser:
                 fetcher,
                 engine=self.settings.search_engine,
                 timeout=self.settings.timeout,
+                max_age_months=self.settings.news_window_months,
             )
-            self._news_mentions = search.search(
-                self._university_name,
-                short_name=short_name,
+            found = search.search(
+                self._university_name or self._short_name,
+                short_name=self._short_name,
                 max_results=self.settings.max_news,
             )
+            # Новости с официального сайта (если обходился раздел новостей)
+            # идут первыми: это первоисточник.
+            merged: list[NewsMention] = []
+            seen_urls: set[str] = set()
+            for mention in [*self._news_mentions, *found]:
+                key = mention.url.split("#")[0].rstrip("/")
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                merged.append(mention)
+            merged.sort(key=lambda item: item.date or "", reverse=True)
+            self._news_mentions = merged[: max(self.settings.max_news, len(self._news_mentions))]
+            if not self._news_mentions and search.outdated:
+                latest = search.outdated[0]
+                self._warnings.append(
+                    f"Новостей о сотрудничестве со Сбером за последние "
+                    f"{self.settings.news_window_months} мес. не найдено; последняя "
+                    f"публикация: {latest.date} «{latest.title}» ({latest.url})"
+                )
         except Exception as exc:  # noqa: BLE001 - поиск не должен ронять сбор
             LOGGER.warning("Поиск новостей о Сбере не удался: %s", exc)
             self._warnings.append(f"Поиск новостей о Сбере: {exc}")
@@ -3015,97 +3416,7 @@ class UniversityParser:
     ) -> str:
         """Ищет качественное фото человека в HTML страницы."""
 
-        tokens = [
-            token.lower()
-            for token in re.findall(r"[А-ЯЁA-Zа-яёa-z\-]{4,}", full_name)
-        ]
-        candidates: list[tuple[int, str]] = []
-
-        def add(src: str, alt: str, attrs: str, width: str, height: str) -> None:
-            src = normalize_whitespace(src)
-            if not src or src.lower().startswith("data:"):
-                return
-            lowered = f"{src} {alt} {attrs}".lower()
-            if any(
-                marker in lowered
-                for marker in (
-                    "logo",
-                    "icon",
-                    "sprite",
-                    "placeholder",
-                    "blank",
-                    "spacer",
-                    "social",
-                    "favicon",
-                )
-            ):
-                return
-            if src.lower().endswith((".svg", ".gif")):
-                return
-            score = 0
-            if any(token in lowered for token in tokens):
-                score += 6
-            if any(
-                marker in lowered
-                for marker in ("rector", "ректор", "photo", "avatar", "person", "staff")
-            ):
-                score += 4
-            try:
-                if int(width or 0) >= 100 and int(height or 0) >= 100:
-                    score += 2
-            except ValueError:
-                pass
-            if any(
-                marker in lowered
-                for marker in ("900", "1200", "1600", "original", "large")
-            ):
-                score += 2
-            if score:
-                candidates.append((score, canonical_url(src, base_url)))
-
-        for image in soup.find_all("img"):
-            add(
-                str(
-                    image.get("data-src")
-                    or image.get("data-original")
-                    or image.get("src")
-                    or ""
-                ),
-                str(image.get("alt") or ""),
-                f"{image.get('class') or ''} {image.get('id') or ''}",
-                str(image.get("width") or ""),
-                str(image.get("height") or ""),
-            )
-
-        # Фото ректора часто лежит в CSS background-image, а не в <img>.
-        for node in soup.find_all(style=True):
-            for value in re.findall(
-                r"url\(([^)]+)\)", str(node.get("style") or "")
-            ):
-                add(value.strip("'\" "), "", "background", "", "")
-        for style in soup.find_all("style"):
-            for value in re.findall(
-                r"url\(([^)]+)\)", style.get_text(" ", strip=True)
-            ):
-                add(value.strip("'\" "), "", "background", "", "")
-
-        for meta in soup.find_all("meta"):
-            if meta.get("property") in {"og:image", "twitter:image"}:
-                add(
-                    str(meta.get("content") or ""),
-                    str(meta.get("property") or ""),
-                    "meta",
-                    "",
-                    "",
-                )
-        for link in soup.find_all("link"):
-            if "image_src" in (link.get("rel") or []):
-                add(str(link.get("href") or ""), "image_src", "link", "", "")
-
-        if not candidates:
-            return ""
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return candidates[0][1]
+        return utils.find_photo(soup, base_url, full_name)
 
     @staticmethod
     def _extract_bio_text(
@@ -3208,7 +3519,7 @@ class UniversityParser:
         phone = merged.get("office_phone")
         if phone:
             leader.office_phone = phone
-            leader.phone = phone
+            leader.phone = leader.phone or phone
 
         fax = merged.get("fax")
         if fax:
@@ -3230,8 +3541,17 @@ class UniversityParser:
             # Служебный адрес (office@, info@) не должен выдаваться за личный.
             leader.email = None
 
-        leader.reception_phone = leader.reception_phone or leader.office_phone or leader.phone
-        leader.reception_email = leader.reception_email or leader.email
+        # Приёмная — только если телефон подписан как приёмная/секретарь;
+        # личный рабочий телефон приёмной не является.
+        for chunk in _contact_chunks(doc):
+            if re.search(r"при[её]мн(?!ая\s+комисс|ой\s+комисс)|секретар|канцеляр", chunk, re.IGNORECASE):
+                reception = clean_phone(chunk)
+                if reception:
+                    leader.reception_phone = leader.reception_phone or reception
+                emails = [e for e in extract_emails(chunk)]
+                if emails:
+                    leader.reception_email = leader.reception_email or emails[0]
+                break
 
         LOGGER.debug(
             "Контакты из биографии %s: телефон=%s, факс=%s, кабинет=%s, email=%s",
@@ -3266,15 +3586,21 @@ class UniversityParser:
         if not self._about and about_doc is not None:
             self._about = truncate_text(about_doc.text, 1200)
 
+        if not base_url and self._discovered_site:
+            base_url = self._discovered_site
         card_name = first_non_empty(
             [
                 name,
                 profile.name if profile else "",
+                self._university_name,
                 homepage_doc.title if homepage_doc else "",
                 self._title_from_url(base_url),
             ]
         )
-        address = self._extract_field(r"адрес(?:\s+места\s+нахождения)?\s*[:\-–—]?\s*([^\n]{10,250})")
+        address = self._extract_field(
+            r"(?<![а-яё])адрес(?!\s+(?:электронн|эл\.|e-?mail|сайт|официальн|в\s+сети|страниц))"
+            r"(?:\s+места\s+нахождения)?(?:\s+образовательной\s+организации)?\s*[:\-–—]?\s*([^\n]{10,250})"
+        )
         address = re.split(
             r"\s+(?:режим|график работы|телефон|факс|e-?mail|электронная почта)\b",
             address,
@@ -3311,13 +3637,11 @@ class UniversityParser:
             ogrn=ogrn or None,
             address=address or None,
             region=self._extract_region(address) or None,
-            city=(self._passport.city if self._passport else None),
-            status=(self._passport.status if self._passport else None),
-            avg_ege=(self._passport.avg_ege if self._passport else None),
-            budget_places=(
-                self._passport.budget_places if self._passport else None
+            city=(
+                (self._passport.city if self._passport else None)
+                or (profile.city if profile and profile.city else None)
             ),
-            paid_places=(self._passport.paid_places if self._passport else None),
+            status=(self._passport.status if self._passport else None),
             dormitory=(self._passport.dormitory if self._passport else None),
             military_department=(
                 self._passport.military_department if self._passport else None
@@ -3329,24 +3653,33 @@ class UniversityParser:
             phone=org_phone or None,
         )
 
-        if not self._leadership and not self.settings.aggregators_only:
+        if not self._leadership and base_url:
             self._warnings.append(
                 "Руководство не найдено. Проверьте /sveden/struct/ или селекторы "
                 "в config.py; возможно, контент рендерится JavaScript."
             )
-        if not self._documents and not self.settings.aggregators_only:
+        if not self._documents and base_url:
             self._errors.append("Не удалось получить ни одного документа источника")
 
-        ordered_contacts = sorted(
-            self._contacts,
-            key=lambda contact: OWNER_RANK.get(contact.owner_kind, 0),
-            reverse=True,
+        leadership = self._key_leadership()
+        contacts = self._key_contacts(leadership)
+        specialties = self._specialties or (self._passport.specialties if self._passport else [])
+        if not specialties:
+            self._warnings.append(
+                "Специальности не найдены ни в разделе «Образование» сайта, ни в агрегаторах"
+            )
+        directions = cooperation_directions(
+            specialties,
+            [item.name for item in self._research],
+            self._news_mentions,
         )
         return UniversityData(
             university=university,
             about=self._about,
-            leadership=self._leadership,
-            contacts=ordered_contacts[:300],
+            leadership=leadership,
+            contacts=contacts,
+            specialties=specialties,
+            cooperation_directions=directions,
             projects=self._projects,
             grants=sorted(
                 self._grants,
@@ -3354,7 +3687,7 @@ class UniversityParser:
                 reverse=True,
             )[:40],
             research=self._research[:40],
-            units=self._build_units(),
+            units=self._build_units(leadership),
             partnerships=self._partnerships[:40],
             achievements=self._achievements[:40],
             events=self._events,
@@ -3371,12 +3704,13 @@ class UniversityParser:
     def _collect_conflicts(self) -> list[str]:
         """Фиксирует контакты, приписанные нескольким владельцам."""
 
-        owners: dict[tuple[str, str], set[str]] = {}
-        for contact in self._contacts:
-            key = (contact.type, contact.value.lower())
-            owners.setdefault(key, set()).add(contact.owner or "ВУЗ")
+        # _contacts хранит один владелец на контакт, поэтому все заявленные
+        # владельцы копятся отдельно в _contact_owners.
         conflicts: list[str] = []
-        for (contact_type, value), labels in owners.items():
+        values = {self._contact_key(c.type, c.value): c.value for c in self._contacts}
+        for key, labels in self._contact_owners.items():
+            contact_type = key[0]
+            value = values.get(key, key[1])
             if len(labels) <= 1:
                 continue
             conflicts.append(
@@ -3385,11 +3719,50 @@ class UniversityParser:
             )
         return conflicts[:50]
 
-    def _build_units(self) -> list[Unit]:
+    def _key_leadership(self) -> list[Leadership]:
+        """Основное руководство для связи: ректор, президент, проректоры.
+
+        Все найденные данные проверяются вручную перед презентацией, поэтому
+        директоров центров, деканов и заведующих в карточку не включаем.
+        """
+
+        key = [
+            leader
+            for leader in self._leadership
+            if _position_rank(leader.position) <= KEY_LEADERSHIP_MAX_RANK
+            or _is_rector_position(leader.position or "")
+        ]
+        key.sort(key=lambda item: (_position_rank(item.position), item.full_name))
+        if len(self._leadership) > len(key):
+            LOGGER.info(
+                "Руководство: оставлено %s основных из %s", len(key), len(self._leadership)
+            )
+        return key[: self.settings.max_leadership]
+
+    def _key_contacts(self, leadership: list[Leadership]) -> list[Contact]:
+        """Контакты вуза, приёмной и основного руководства (без подразделений)."""
+
+        names = {_name_key(leader.full_name) for leader in leadership}
+        positions = {normalize_whitespace(leader.position).lower() for leader in leadership if leader.position}
+        result = []
+        for contact in self._contacts:
+            if contact.owner_kind == "organization" or contact.type == "address":
+                result.append(contact)
+            elif contact.owner_kind == "person" and _name_key(contact.owner) in names:
+                result.append(contact)
+            elif contact.owner_kind == "office" and (
+                re.search(r"ректор|при[её]мн(?![а-яё]*\s+комисс)|канцеляр|общ[ийая]+\s+отдел", contact.owner, re.IGNORECASE)
+                or normalize_whitespace(contact.owner).lower() in positions
+            ):
+                result.append(contact)
+        result.sort(key=lambda contact: OWNER_RANK.get(contact.owner_kind, 0), reverse=True)
+        return result[:40]
+
+    def _build_units(self, leadership: list[Leadership] | None = None) -> list[Unit]:
         """Собирает подразделения из записей руководства."""
 
         groups: dict[str, list[Leadership]] = {}
-        for leader in self._leadership:
+        for leader in leadership if leadership is not None else self._leadership:
             name = normalize_whitespace(leader.unit or "")
             if len(name) < 3:
                 continue
@@ -3433,7 +3806,11 @@ class UniversityParser:
         return candidates[0].value if candidates else ""
 
     def _extract_field(self, pattern: str) -> str:
-        haystack = self._about or ""
+        # Сначала краткое описание, затем полный текст страницы «Основные
+        # сведения»: реквизиты часто стоят дальше первых 1500 символов.
+        haystack = "\n".join(
+            part for part in (self._about, self._about_doc.text if self._about_doc else "") if part
+        )
         match = re.search(pattern, haystack, re.IGNORECASE)
         if match:
             return normalize_whitespace(match.group(1))
@@ -3637,7 +4014,14 @@ def save_results(
             "documents": document_records,
         },
     )
-    utils.atomic_write_json(latest_path, card.to_json_dict())
+    failed_run = bool(card.errors) and not card.leadership and not card.documents and not card.passports
+    if failed_run and previous:
+        # Неудачный запуск (сеть, блокировка) не должен затирать последний
+        # хороший снимок: иначе следующее сравнение покажет ложные изменения.
+        LOGGER.warning("Запуск без данных: %s не перезаписан", latest_path)
+        change_report = None
+    else:
+        utils.atomic_write_json(latest_path, card.to_json_dict())
 
     paths = {
         "card": card_path,
@@ -3764,14 +4148,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Не запрашивать паспорт из Вузопедии/Поступи.Онлайн.",
     )
     parser.add_argument(
-        "--with-official-site",
-        action="store_true",
-        help="Дополнительно обходить официальный сайт вуза (по умолчанию выключено).",
+        "--sections",
+        default=None,
+        help="Разделы сайта через запятую (по умолчанию: " + ",".join(Settings().sections) + ").",
     )
     parser.add_argument(
-        "--aggregators-only",
+        "--full-site",
         action="store_true",
-        help="Только агрегаторы, без официального сайта (по умолчанию).",
+        help="Обойти все найденные разделы сайта (гранты, мероприятия, достижения и т. д.).",
     )
     parser.add_argument(
         "--no-news-search",
@@ -3858,15 +4242,12 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         settings.aggregator_url = args.aggregator_url
     if args.no_aggregators:
         settings.use_aggregators = False
-    if args.with_official_site:
-        settings.aggregators_only = False
-        # Обход сайта вуза без браузера бесполезен: МГУ и другие SPA-сайты
-        # отдают пустую HTML-оболочку, а requests падает по SSL.
-        settings.enable_playwright = True
     if args.no_playwright:
         settings.enable_playwright = False
-    if args.aggregators_only:
-        settings.aggregators_only = True
+    if args.sections:
+        settings.sections = tuple(part.strip() for part in args.sections.split(",") if part.strip())
+    if args.full_site:
+        settings.sections = ALL_SECTIONS
     if args.no_news_search:
         settings.use_news_search = False
     if args.no_rector_lookup:

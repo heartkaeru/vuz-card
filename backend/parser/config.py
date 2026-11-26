@@ -7,7 +7,8 @@
 * ``PARSER_TIMEOUT`` — таймаут запроса, секунды;
 * ``PARSER_RETRIES`` — число попыток;
 * ``PARSER_OUTPUT_DIR`` — каталог результатов;
-* ``PARSER_NO_ROBOTS=1`` — отключить проверку robots.txt (не рекомендуется);
+* ``PARSER_ROBOTS=0`` (или ``PARSER_NO_ROBOTS=1``) — отключить проверку
+  robots.txt (не рекомендуется);
 * ``PARSER_WITH_BIOS=0`` — не загружать биографии руководителей.
 """
 
@@ -80,7 +81,20 @@ class Settings:
     max_item_documents: int = 8
     news_window_months: int = 24
     use_aggregators: bool = True
-    aggregators_only: bool = True
+    # Разделы официального сайта для сбора. Агрегаторы и поиск новостей
+    # используются всегда вместе с сайтом.
+    sections: tuple[str, ...] = (
+        "about",
+        "leadership",
+        "contacts",
+        "programs",
+        "research",
+        "projects",
+        "partnerships",
+        "news",
+    )
+    # Сколько человек основного руководства оставлять в карточке.
+    max_leadership: int = 20
     aggregator_sources: str = "vuzopedia,postupi"
     aggregator_url: str = ""
     use_news_search: bool = True
@@ -104,7 +118,8 @@ class Settings:
             timeout=max(5.0, _env_float("PARSER_TIMEOUT", 30.0)),
             max_retries=max(1, _env_int("PARSER_RETRIES", 3)),
             backoff_factor=max(1.0, _env_float("PARSER_BACKOFF", 3.0)),
-            respect_robots=_env_bool("PARSER_ROBOTS", True),
+            respect_robots=_env_bool("PARSER_ROBOTS", True)
+            and not _env_bool("PARSER_NO_ROBOTS", False),
             max_items_per_section=max(1, _env_int("PARSER_MAX_ITEMS", 30)),
             max_pages_per_section=max(1, _env_int("PARSER_MAX_PAGES", 1)),
             max_document_chars=max(10_000, _env_int("PARSER_MAX_DOC_CHARS", 120_000)),
@@ -118,7 +133,12 @@ class Settings:
             max_item_documents=max(0, _env_int("PARSER_MAX_ITEM_DOCS", 8)),
             news_window_months=max(0, _env_int("PARSER_NEWS_MONTHS", 24)),
             use_aggregators=_env_bool("PARSER_AGGREGATORS", True),
-            aggregators_only=_env_bool("PARSER_AGGREGATORS_ONLY", True),
+            sections=tuple(
+                part.strip()
+                for part in os.getenv("PARSER_SECTIONS", ",".join(cls.sections)).split(",")
+                if part.strip()
+            ),
+            max_leadership=max(1, _env_int("PARSER_MAX_LEADERSHIP", 20)),
             aggregator_sources=os.getenv(
                 "PARSER_AGGREGATOR_SOURCES", "vuzopedia,postupi"
             ),
@@ -197,7 +217,6 @@ DEFAULT_ITEM_SELECTORS: tuple[str, ...] = (
     ".views-row",
     ".card",
     ".pk-event-card",
-    "li",
 )
 
 
@@ -439,6 +458,12 @@ UNIVERSITY_PROFILES: dict[str, UniversityProfile] = {
 # автоматического прогона, пока не подключён браузерный рендеринг.
 DEFAULT_BATCH_PROFILES: tuple[str, ...] = ("spbu", "hse", "rsuh")
 
+# Все разделы, которые умеет разбирать парсер (``--full-site``).
+ALL_SECTIONS: tuple[str, ...] = (
+    "about", "leadership", "contacts", "programs", "research", "projects",
+    "grants", "partnerships", "achievements", "news", "events",
+)
+
 # Ключевые слова для автоматического поиска разделов на незнакомых сайтах.
 SECTION_LINK_PATTERNS: dict[str, tuple[str, ...]] = {
     "about": (
@@ -459,6 +484,11 @@ SECTION_LINK_PATTERNS: dict[str, tuple[str, ...]] = {
         "органы управления",
         "администрация",
         "университет в лицах",
+    ),
+    "programs": (
+        "образовательные программы",
+        "направления подготовки",
+        "специальности",
     ),
     "contacts": (
         "контакты",
@@ -531,6 +561,7 @@ SECTION_LINK_PATTERNS: dict[str, tuple[str, ...]] = {
 # организации» (Приказ Минобрнауки № 785). Используются как fallback.
 SVEDEN_SECTIONS: dict[str, str] = {
     "about": "/sveden/common/",
+    "programs": "/sveden/education/",
     "leadership": "/sveden/struct/",
     "contacts": "/sveden/struct/",
 }
@@ -556,6 +587,7 @@ SECTION_TO_CATEGORY: dict[str, str] = {
     "leadership": "leadership",
     "bio": "leadership",
     "contacts": "contacts",
+    "programs": "organization",
     "research": "research",
     "projects": "projects",
     "grants": "grants",
@@ -640,13 +672,17 @@ PROJECT_TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "приоритет 2030",
         "передовая инженерная школа",
         "передовые инженерные школы",
-        "федеральн",
-        "национальн",
+        "федеральный проект",
+        "федерального проекта",
+        "национальный проект",
+        "национального проекта",
+        "национальных проектов",
+        "нацпроект",
         "минобрнауки",
         "мегагрант",
         "рнф",
         "российский научный фонд",
-        "грант",
+        "госзадани",
     ),
     "региональный": (
         "региональн",
@@ -658,7 +694,7 @@ PROJECT_TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "нир",
         "ниокр",
         "научно-исследовательск",
-        "исследовательск",
+        "грант",
         "лаборатор",
     ),
     "международный": (
@@ -667,7 +703,7 @@ PROJECT_TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "европейск",
         "brics",
         "брикс",
-        "шос",
+        "шанхайск",
     ),
 }
 
@@ -683,6 +719,7 @@ EVENT_TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "школ",
         "олимпиад",
         "вебинар",
+        "хакатон",
     ),
     "студенческое": (
         "студенческ",
@@ -694,6 +731,6 @@ EVENT_TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
     ),
     "карьерное": ("карьер", "стажиров", "ярмарка вакансий", "работодател"),
     "научное": ("научн", "исследован", "круглый стол", "диспут"),
-    "спортивное": ("спорт", "турнир", "соревнован", "олимпиад"),
+    "спортивное": ("спорт", "турнир", "соревнован", "спартакиад"),
     "культурное": ("концерт", "выставк", "театр", "фестивал", "экскурс"),
 }

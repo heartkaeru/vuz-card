@@ -14,7 +14,8 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from bs4 import BeautifulSoup
 
-from .models import AggregatorPassport
+from .models import AggregatorPassport, Specialty
+from .specialties import dedupe_specialties, parse_specialties
 from .stealth import StealthFetcher
 from .utils import canonical_url, normalize_whitespace
 
@@ -36,33 +37,105 @@ def name_match_score(query: str, title: str) -> float:
     («... университет спорта и туризма»).
     """
 
-    q = normalize_whitespace(query).lower().strip(" .,;:-")
-    t = normalize_whitespace(title).lower().strip(" .,;:-")
+    q = _fold(query)
+    t = _fold(title)
     if not q or not t:
         return 0.0
     if q == t:
         return 100.0
     if t.startswith(q):
         remainder = t[len(q):].lstrip(" .,;:-")
-        if remainder.startswith(NAME_SUFFIX_MARKERS):
-            # «имени ...» уточняет название, а не меняет вуз.
+        if not remainder or remainder.startswith(NAME_SUFFIX_MARKERS) or remainder.startswith("("):
+            # «имени ...» или «(СПбГУ)» уточняет название, а не меняет вуз.
             return 95.0 - min(len(remainder), 40) * 0.05
-        return 60.0 - min(len(remainder), 60) * 0.1
-    q_tokens = q.split()
-    t_tokens = set(t.split())
-    if q_tokens and all(token in t_tokens for token in q_tokens):
-        return 45.0
+        # «... университет спорта и туризма» — другой вуз (МГУСиТ, а не МГУ).
+        return 35.0 - min(len(remainder), 60) * 0.1
+    if q.startswith(t):
+        # Агрегатор показывает сокращённое название без «имени ...».
+        remainder = q[len(t):].lstrip(" .,;:-")
+        if remainder.startswith(NAME_SUFFIX_MARKERS) or remainder.startswith("("):
+            return 90.0
+    q_tokens = set(_significant_tokens(q))
+    t_tokens = set(_significant_tokens(t))
+    if q_tokens and q_tokens == t_tokens:
+        return 90.0
+    if q_tokens and q_tokens <= t_tokens:
+        # Все слова запроса есть, но в названии есть и другие значимые слова:
+        # «Российский государственный университет» ≠ «… гуманитарный университет».
+        return 35.0
     return 30.0 * SequenceMatcher(None, t, q).ratio()
+
+
+_FOLD_RE = re.compile(r"[«»\"'“”„]")
+_NAME_STOPWORDS = {"и", "в", "на", "по", "им", "имени", "федеральное", "государственное",
+                   "бюджетное", "автономное", "образовательное", "учреждение", "высшего",
+                   "образования", "фгбоу", "фгаоу", "во", "гоу", "ано", "чоу"}
+
+
+def _fold(value: str) -> str:
+    value = _FOLD_RE.sub("", normalize_whitespace(value or "")).lower().replace("ё", "е")
+    return value.strip(" .,;:-")
+
+
+def _significant_tokens(value: str) -> list[str]:
+    tokens = re.findall(r"[a-zа-я0-9]+", _fold(value))
+    result = []
+    for token in tokens:
+        if token in _NAME_STOPWORDS:
+            continue
+        if token in NAME_SUFFIX_MARKERS or token == "им":
+            break  # всё после «имени» — уточнение, а не другой вуз
+        result.append(token)
+    return result
+
+
+def abbreviation(title: str) -> str:
+    """Аббревиатура названия: «Уральский федеральный университет» → «УФУ»."""
+
+    letters = []
+    for word in re.findall(r"[А-ЯЁA-Zа-яёa-z][А-ЯЁA-Zа-яёa-z\-]*", normalize_whitespace(title)):
+        lowered = word.lower()
+        if lowered in NAME_SUFFIX_MARKERS or lowered == "им":
+            break
+        if lowered in _NAME_STOPWORDS or len(word) < 2:
+            continue
+        for part in word.split("-"):
+            if part:
+                letters.append(part[0].upper())
+    return "".join(letters).replace("Ё", "Е")
+
+
+def short_name_matches(query: str, title: str) -> bool:
+    """Короткое название («МГУ», «СПбГУ», «НИУ ВШЭ») соответствует полному."""
+
+    q = normalize_whitespace(query)
+    if not q or not title:
+        return False
+    folded_title = _fold(title)
+    if re.search(rf"(?<![а-яa-z0-9]){re.escape(_fold(q))}(?![а-яa-z0-9])", folded_title):
+        return True
+    capitals = re.sub(r"[^А-ЯЁA-Z]", "", q).replace("Ё", "Е")
+    if len(capitals) < 2:
+        return False
+    abbr = abbreviation(title)
+    return capitals == abbr or (len(capitals) >= 3 and abbr.endswith(capitals))
 
 
 def _query_is_specific(query: str) -> bool:
     return len(normalize_whitespace(query).split()) >= 3
 
 
-def _passport_matches(query: str, title: str) -> bool:
+def _passport_matches(query: str, title: str, short_name: str = "") -> bool:
+    if not normalize_whitespace(query) or not normalize_whitespace(title):
+        # Пустой запрос не может подтвердить, что это тот самый вуз.
+        return False
     if not _query_is_specific(query):
+        return short_name_matches(query, title)
+    if name_match_score(query, title) >= NAME_MATCH_THRESHOLD:
         return True
-    return name_match_score(query, title) >= NAME_MATCH_THRESHOLD
+    return bool(short_name) and short_name_matches(short_name, title) and (
+        name_match_score(query, title) >= 25.0
+    )
 
 CITY_BY_SUBDOMAIN = {
     "msk": "Москва",
@@ -134,6 +207,69 @@ def _decode_ddg_url(href: str) -> str:
     return href
 
 
+def _decode_search_url(href: str) -> str:
+    """Прямая ссылка из редиректа DuckDuckGo или Bing."""
+
+    from .news_search import _clean_url
+
+    return _clean_url(_decode_ddg_url(href))
+
+
+def _ok(response) -> bool:
+    """Страница получена: код 2xx/3xx и непустой текст (404 и капча — нет)."""
+
+    status = getattr(response, "status_code", 200) or 0
+    return bool(response.text) and 200 <= status < 400
+
+
+def _card_text(soup: BeautifulSoup) -> str:
+    """Текст карточки вуза вокруг заголовка, без блоков «похожие вузы»."""
+
+    soup = BeautifulSoup(str(soup), "lxml")  # копия: исходный документ ещё нужен
+    for selector in ("aside", "footer", "nav", "header", "[class*=similar]", "[class*=related]",
+                     "[class*=recommend]", "[class*=other-vuz]", "[class*=otherVuz]"):
+        for node in soup.select(selector):
+            node.decompose()
+    heading = soup.find("h1")
+    if heading is not None:
+        node = heading
+        for _ in range(6):
+            parent = node.parent
+            if parent is None or parent.name in {"body", "html", "[document]"}:
+                break
+            node = parent
+            if len(_text(node)) >= 600:
+                break
+        text = _text(node)
+        if len(text) >= 200:
+            return text[:6000]
+    return _text(soup)[:6000]
+
+
+def _status_from_text(text: str) -> str:
+    lowered = (text or "").lower()
+    if re.search(r"негосударственн|частн(?:ый|ое)\s+(?:вуз|университет|учреждени|институт)|^частный|[,\s]частный[,\s]", lowered):
+        return "частный"
+    if "государственн" in lowered:
+        return "государственный"
+    return ""
+
+
+def _specialties_from_pages(fetcher: StealthFetcher, urls: list[str]) -> list[Specialty]:
+    """Специальности со страниц программ агрегатора (код + название)."""
+
+    found: list[Specialty] = []
+    for page_url in urls:
+        response = fetcher.get(page_url)
+        if not _ok(response):
+            continue
+        found.extend(parse_specialties(response.text, page_url))
+    return dedupe_specialties(found)
+
+
+FACULTY_MARKERS = ("факультет", "институт", "школа", "центр", "кафедра", "колледж", "академия")
+
+
 class VuzopediaParser:
     """Парсер карточки вуза на Вузопедии."""
 
@@ -144,39 +280,58 @@ class VuzopediaParser:
         query = quote(name)
         url = f"{VUZOPEDIA_BASE}/search/results?q={query}&search_type=all"
         response = self.fetcher.get(url)
-        if not response.text:
+        if not _ok(response):
             return []
         soup = BeautifulSoup(response.text, "lxml")
         results: list[dict[str, str]] = []
         for card in soup.select("article.ps-result-card"):
-            anchor = card.select_one("a.ps-result-title") or card.select_one(
-                "h3 a"
-            )
+            anchor = card.select_one("a.ps-result-title") or card.select_one("h3 a")
             if not anchor:
                 continue
             href = anchor.get("href", "")
-            if not href.startswith("/vuz/"):
+            path = urlparse(canonical_url(href, VUZOPEDIA_BASE))
+            if "vuzopedia.ru" not in path.netloc or not path.path.startswith("/vuz/"):
                 continue
             tags = [
                 _text(tag)
                 for tag in card.select(".ps-catalog-card__tags span")
                 if _text(tag)
             ]
+            city = next((tag for tag in tags if tag in CITY_BY_SUBDOMAIN.values()), "")
             results.append(
                 {
                     "title": _text(anchor),
                     "url": canonical_url(href, VUZOPEDIA_BASE),
-                    "city": tags[1] if len(tags) > 1 else "",
+                    "city": city or (tags[1] if len(tags) > 1 else ""),
                 }
             )
         return results
 
-    def best_match(self, name: str) -> dict[str, str] | None:
+    def best_match(self, name: str, short_name: str = "", city: str = "") -> dict[str, str] | None:
+        if not normalize_whitespace(name):
+            return None
         results = self.search(name)
+        if not results and short_name:
+            results = self.search(short_name)
         if not results:
             return None
-        best = max(results, key=lambda item: name_match_score(name, item["title"]))
-        if not _passport_matches(name, best["title"]):
+        specific = _query_is_specific(name)
+
+        def rank(pair: tuple[int, dict[str, str]]) -> tuple[float, int, int]:
+            index, item = pair
+            if specific:
+                score = name_match_score(name, item["title"])
+            else:
+                # Аббревиатура неоднозначна («МГУ» — и Мурманский): доверяем
+                # порядку выдачи и городу, а не сходству строк.
+                score = 50.0 if short_name_matches(name, item["title"]) else 0.0
+            if short_name and short_name_matches(short_name, item["title"]):
+                score += 5
+            city_match = int(bool(city) and city.lower() in (item.get("city") or "").lower())
+            return score, city_match, -index
+
+        _, best = max(enumerate(results), key=rank)
+        if not _passport_matches(name, best["title"], short_name):
             LOGGER.info(
                 "Агрегатор: нет подходящего совпадения для %s (лучшее: %s)",
                 name,
@@ -187,36 +342,31 @@ class VuzopediaParser:
 
     def parse(self, url: str, city: str = "") -> AggregatorPassport:
         response = self.fetcher.get(url)
-        if not response.text:
-            source = "vuzopedia" if "Vuzopedia" in type(self).__name__ else "postupi"
-            return AggregatorPassport(source=source, url=url)
+        if not _ok(response):
+            return AggregatorPassport(source="vuzopedia", url=url)
         soup = BeautifulSoup(response.text, "lxml")
         name = _text(soup.find("h1"))
-        text = _text(soup)
+        # Статус и т. п. ищем в карточке вуза, а не во всей странице:
+        # в блоках «похожие вузы» встречаются чужие признаки.
+        text = _card_text(soup)
 
         city_value = city
         if not city_value:
             city_link = soup.select_one("a[href^='/region/city/']")
             city_value = _text(city_link)
 
-        status = ""
-        status_match = re.search(
-            r"учредител[ья]\s*(гос|негос|частн)", text, re.IGNORECASE
-        )
+        status_match = re.search(r"учредител[ья]\s*(гос|негос|частн)", text, re.IGNORECASE)
         if status_match:
             status = (
                 "государственный"
                 if status_match.group(1).lower().startswith("гос")
                 else "частный"
             )
-        elif "негосударственн" in text.lower() or "частный" in text.lower():
-            status = "частный"
-        elif "государственный" in text.lower():
-            status = "государственный"
+        else:
+            status = _status_from_text(text)
 
-        dormitory = _yes_no(
-            (re.search(r"общежитие\s+(есть|нет)", text, re.IGNORECASE) or [""])[0]
-        )
+        dormitory_match = re.search(r"общежити[ея]\s+(есть|нет)", text, re.IGNORECASE)
+        dormitory = _yes_no(dormitory_match.group(0)) if dormitory_match else None
         military_match = re.search(
             r"(?:воен\.?\s*уч\.?\s*центр|военная\s+кафедра)\s+(есть|нет)",
             text,
@@ -224,89 +374,37 @@ class VuzopediaParser:
         )
         military = _yes_no(military_match.group(0)) if military_match else None
 
-        budget_places = paid_places = None
-        avg_ege = None
-        for card in soup.select(".vxStatCard"):
-            label = _text(card.select_one(".vxStatCard__label")).lower()
-            value = _text(card.select_one(".vxStatCard__value"))
-            if "бюджетных мест" in label:
-                budget_places = _int(value)
-            elif "платных мест" in label:
-                paid_places = _int(value)
-            elif "средний балл" in label:
-                avg_ege = _float(value)
-
-        if avg_ege is None:
-            match = re.search(
-                r"средний\s+балл[^0-9]{0,80}(\d{2}[.,]\d+)",
-                text,
-                re.IGNORECASE,
-            )
-            if match:
-                avg_ege = _float(match.group(1))
-
-        faculties = self.parse_faculties(url)
         return AggregatorPassport(
             source="vuzopedia",
             url=url,
             name=name,
             city=city_value,
             status=status,
-            avg_ege=avg_ege,
-            budget_places=budget_places,
-            paid_places=paid_places,
             dormitory=dormitory,
             military_department=military,
-            faculties=faculties,
+            faculties=self.parse_faculties(url),
+            specialties=self.parse_specialties(url),
+        )
+
+    def parse_specialties(self, url: str) -> list[Specialty]:
+        """Программы подготовки: бакалавриат/специалитет и магистратура."""
+
+        return _specialties_from_pages(
+            self.fetcher, [url.rstrip("/") + suffix for suffix in ("/programs/bakispec", "/programs/magistr")]
         )
 
     def parse_faculties(self, url: str) -> list[str]:
-        page_url = url.rstrip("/") + "/podrazdeleniya"
-        response = self.fetcher.get(page_url)
-        if not response.text:
+        response = self.fetcher.get(url.rstrip("/") + "/podrazdeleniya")
+        if not _ok(response):
             return []
         soup = BeautifulSoup(response.text, "lxml")
-        result: list[str] = []
         skip = (
-            "подразделения",
-            "поиск",
-            "сортировка",
-            "фильтр",
-            "связаться",
-            "задайте вопрос",
-            "филиал",
+            "подразделения", "поиск", "сортировка", "фильтр", "связаться",
+            "задайте вопрос", "филиал",
         )
         # На Вузопедии факультеты лежат в карточках .itemVuzTitle.
-        for node in soup.select(".itemVuzTitle"):
-            value = _text(node)
-            lowered = value.lower()
-            if not value or len(value) > 140:
-                continue
-            if any(marker in lowered for marker in skip):
-                continue
-            if not any(
-                marker in lowered
-                for marker in ("факультет", "институт", "школа", "центр", "кафедра")
-            ):
-                continue
-            result.append(value)
-        if result:
-            return list(dict.fromkeys(result))[:40]
-
-        for heading in soup.find_all("h2"):
-            value = _text(heading)
-            lowered = value.lower()
-            if not value or len(value) > 120:
-                continue
-            if any(marker in lowered for marker in skip):
-                continue
-            if not any(
-                marker in lowered
-                for marker in ("факультет", "институт", "школа", "центр", "кафедра")
-            ):
-                continue
-            result.append(value)
-        return list(dict.fromkeys(result))[:40]
+        result = _faculty_titles(soup.select(".itemVuzTitle"), skip, 140)
+        return result or _faculty_titles(soup.find_all("h2"), skip, 120)
 
 
 class PostupiParser:
@@ -317,101 +415,81 @@ class PostupiParser:
 
     def parse(self, url: str, city: str = "") -> AggregatorPassport:
         response = self.fetcher.get(url)
-        if not response.text:
-            source = "vuzopedia" if "Vuzopedia" in type(self).__name__ else "postupi"
-            return AggregatorPassport(source=source, url=url)
+        if not _ok(response):
+            return AggregatorPassport(source="postupi", url=url)
         soup = BeautifulSoup(response.text, "lxml")
         name = _text(soup.find("h1"))
-        text = _text(soup)
+        text = _card_text(soup)
 
         host = urlparse(url).netloc.lower().split(":")[0]
         subdomain = host.split(".")[0]
         city_value = city or CITY_BY_SUBDOMAIN.get(subdomain, "")
 
         lowered = text.lower()
-        if "негосударственн" in lowered or "частный" in lowered:
-            status = "частный"
-        elif "государственный" in lowered:
-            status = "государственный"
-        else:
-            status = ""
+        status = _status_from_text(text)
 
         dormitory = None
-        if re.search(r"(?:^|[,\s])общежитие(?:[,\s]|$)", text, re.IGNORECASE):
-            dormitory = True
-        elif "без общежития" in lowered or "общежитие нет" in lowered:
+        if re.search(
+            r"без\s+общежити|общежити[ея]\s+(?:нет|не\s+предоставля)|нет\s+общежити",
+            lowered,
+        ):
             dormitory = False
+        elif re.search(r"(?:^|[,\s])общежити[ея](?:[,\s.]|$)", text, re.IGNORECASE):
+            dormitory = True
 
         military = None
         if re.search(
-            r"воен\.?\s*уч\.?\s*центр|военная\s+кафедра", text, re.IGNORECASE
+            r"(?:нет|без)\s+(?:военн|воен\.)|(?:военн[а-яё]*\s+(?:кафедр[а-яё]*|учебн[а-яё]*\s+центр[а-яё]*)"
+            r"|воен\.?\s*уч\.?\s*центр)\s+(?:нет|отсутств)",
+            lowered,
+        ):
+            military = False
+        elif re.search(
+            r"воен\.?\s*уч\.?\s*центр|военн[а-яё]*\s+(?:кафедр|учебн[а-яё]*\s+центр)", text, re.IGNORECASE
         ):
             military = True
 
-        budget_match = re.search(
-            r"(\d[\d\s]*)\s*бюджет\.?\s*мест", text, re.IGNORECASE
+        specialties = _specialties_from_pages(
+            self.fetcher,
+            [
+                url.rstrip("/") + suffix
+                for suffix in ("/specialnosti/bakalavr/", "/specialnosti/magistr/", "/specialnosti/specialist/")
+            ],
         )
-        paid_match = re.search(
-            r"(\d[\d\s]*)\s*платных\s*мест", text, re.IGNORECASE
-        )
-        budget_places = _int(budget_match.group(1)) if budget_match else None
-        paid_places = _int(paid_match.group(1)) if paid_match else None
-
-        avg_ege = self._average_ege(soup)
-        faculties = self.parse_faculties(url)
-
         return AggregatorPassport(
             source="postupi",
             url=url,
             name=name,
             city=city_value,
             status=status,
-            avg_ege=avg_ege,
-            budget_places=budget_places,
-            paid_places=paid_places,
             dormitory=dormitory,
             military_department=military,
-            faculties=faculties,
+            faculties=self.parse_faculties(url),
+            specialties=specialties,
         )
 
-    @staticmethod
-    def _average_ege(soup: BeautifulSoup) -> float | None:
-        for slide in soup.select(".swiper-score__slide"):
-            spans = [_text(span) for span in slide.find_all("span")]
-            if len(spans) < 3 or not spans[0].isdigit():
-                continue
-            values = [
-                _float(value)
-                for value in spans[1:]
-                if re.fullmatch(r"\d+(?:[.,]\d+)?", value)
-            ]
-            values = [value for value in values if value is not None]
-            if values:
-                return values[0]
-        return None
-
     def parse_faculties(self, url: str) -> list[str]:
-        page_url = url.rstrip("/") + "/podrazdeleniya/"
-        response = self.fetcher.get(page_url)
-        if not response.text:
+        response = self.fetcher.get(url.rstrip("/") + "/podrazdeleniya/")
+        if not _ok(response):
             return []
         soup = BeautifulSoup(response.text, "lxml")
-        result: list[str] = []
         skip = ("подразделения", "поиск", "сортировка", "фильтр", "связаться")
-        for heading in soup.find_all("h2"):
-            value = _text(heading)
-            lowered = value.lower()
-            if not value or len(value) > 120:
-                continue
-            if any(marker in lowered for marker in skip):
-                continue
-            if not any(
-                marker in lowered
-                for marker in ("факультет", "институт", "школа", "центр", "кафедра")
-            ):
-                continue
-            result.append(value)
-        return list(dict.fromkeys(result))[:40]
+        return _faculty_titles(soup.find_all("h2"), skip, 120)
+
+
+def _faculty_titles(nodes, skip: tuple[str, ...], max_length: int) -> list[str]:
+    result: list[str] = []
+    for node in nodes:
+        value = _text(node)
+        lowered = value.lower()
+        if not value or len(value) > max_length:
+            continue
+        if any(marker in lowered for marker in skip):
+            continue
+        if not any(marker in lowered for marker in FACULTY_MARKERS):
+            continue
+        result.append(value)
+    return list(dict.fromkeys(result))[:40]
 
 
 class AggregatorService:
@@ -428,18 +506,25 @@ class AggregatorService:
         self.sources = tuple(sources)
         self.direct_url = direct_url
 
-    def _ddg_site_url(self, name: str, site: str) -> str:
-        query = quote(f"site:{site} {name}")
-        response = self.fetcher.get(
-            f"https://html.duckduckgo.com/html/?q={query}"
-        )
-        if not response.text:
-            return ""
-        soup = BeautifulSoup(response.text, "lxml")
-        for anchor in soup.select("a.result__a"):
-            href = _decode_ddg_url(anchor.get("href", ""))
-            if site.split("/")[0] in href and "/vuz/" in href:
-                return href
+    def _site_search_url(self, name: str, site: str, full_name: str = "") -> str:
+        """Ссылка на карточку вуза в агрегаторе через веб-поиск (Яндекс → Google → …)."""
+
+        from .news_search import NewsSearch
+
+        domain = site.split("/")[0]
+        for hit in NewsSearch(self.fetcher).web_search(f"site:{site} {name}"):
+            href = _decode_search_url(hit.url)
+            match = re.match(rf"(https?://(?:[\w-]+\.)?{re.escape(domain)}/vuz/[^/?#]+/)", href)
+            if not match:
+                continue
+            title = normalize_whitespace(hit.title)
+            if full_name and title and not (
+                _passport_matches(full_name, title.split("|")[0].split(" - ")[0], name)
+                or short_name_matches(name, title)
+            ):
+                continue
+            # Подстраница (/programmy/, /otzyvy/) → корень карточки вуза.
+            return match.group(1)
         return ""
 
     def collect(
@@ -458,43 +543,47 @@ class AggregatorService:
                 passports.append(passport)
             return passports
 
+        if not normalize_whitespace(name) and not normalize_whitespace(short_name):
+            # Без названия нельзя проверить, что карточка агрегатора о нужном вузе.
+            return passports
+
         if "vuzopedia" in self.sources:
             parser = VuzopediaParser(self.fetcher)
-            match = parser.best_match(name)
+            match = parser.best_match(name or short_name, short_name=short_name, city=city)
+            if match is None:
+                # Поиск Вузопедии закрыт проверкой «не бот» — ищем карточку
+                # через обычный поисковик.
+                url = self._site_search_url(short_name or name, "vuzopedia.ru/vuz", full_name=name)
+                match = {"url": url, "city": ""} if url else None
             if match:
-                passport = parser.parse(match["url"], city=match.get("city", city))
-                if passport.name and _passport_matches(name, passport.name):
+                passport = parser.parse(match["url"], city=match.get("city") or city)
+                if passport.name and _passport_matches(name or short_name, passport.name, short_name):
                     passports.append(passport)
 
         if "postupi" in self.sources:
-            url = self._ddg_site_url(short_name or name, "postupi.online/vuz")
+            url = self._site_search_url(short_name or name, "postupi.online/vuz", full_name=name)
             if url:
                 passport = PostupiParser(self.fetcher).parse(url, city=city)
-                if passport.name and _passport_matches(name, passport.name):
+                if passport.name and _passport_matches(name or short_name, passport.name, short_name):
                     passports.append(passport)
 
         return passports
 
 
+PASSPORT_FIELDS = ("city", "status", "dormitory", "military_department")
+
+
+def _filled(passport: AggregatorPassport) -> int:
+    return sum(getattr(passport, field) not in (None, "") for field in PASSPORT_FIELDS)
+
+
 def best_passport(passports: Iterable[AggregatorPassport]) -> AggregatorPassport | None:
     """Выбирает паспорт с максимальным числом заполненных полей."""
 
-    def score(passport: AggregatorPassport) -> int:
-        values = (
-            passport.city,
-            passport.status,
-            passport.avg_ege,
-            passport.budget_places,
-            passport.paid_places,
-            passport.dormitory,
-            passport.military_department,
-        )
-        return sum(value is not None and value != "" for value in values) + len(
-            passport.faculties
-        )
-
     items = list(passports)
-    return max(items, key=score) if items else None
+    if not items:
+        return None
+    return max(items, key=lambda item: _filled(item) + len(item.faculties) + len(item.specialties))
 
 
 def merge_passports(passports: Iterable[AggregatorPassport]) -> AggregatorPassport | None:
@@ -503,41 +592,18 @@ def merge_passports(passports: Iterable[AggregatorPassport]) -> AggregatorPasspo
     items = list(passports)
     if not items:
         return None
-    base = max(
-        items,
-        key=lambda passport: sum(
-            value is not None and value != ""
-            for value in (
-                passport.city,
-                passport.status,
-                passport.avg_ege,
-                passport.budget_places,
-                passport.paid_places,
-                passport.dormitory,
-                passport.military_department,
-            )
-        ),
-    )
+    base = max(items, key=_filled)
     data = base.model_dump()
     for passport in items:
-        for field in (
-            "city",
-            "status",
-            "avg_ege",
-            "budget_places",
-            "paid_places",
-            "dormitory",
-            "military_department",
-        ):
-            if data.get(field) in (None, "") and getattr(passport, field) not in (
-                None,
-                "",
-            ):
+        for field in PASSPORT_FIELDS:
+            if data.get(field) in (None, "") and getattr(passport, field) not in (None, ""):
                 data[field] = getattr(passport, field)
-    faculties: list[str] = []
-    for passport in items:
-        faculties.extend(passport.faculties)
-    data["faculties"] = list(dict.fromkeys(faculties))[:40]
+    data["faculties"] = list(dict.fromkeys(
+        faculty for passport in items for faculty in passport.faculties
+    ))[:40]
+    data["specialties"] = dedupe_specialties(
+        specialty for passport in items for specialty in passport.specialties
+    )
     data["source"] = "+".join(
         dict.fromkeys(passport.source for passport in items if passport.source)
     )
