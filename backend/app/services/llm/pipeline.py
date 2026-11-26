@@ -71,26 +71,43 @@ def chunks(text: str, size: int, overlap: int):
         start = end - overlap
 
 
-async def complete_validated(provider, model, prompt, payload, schema, attempts: int = 2):
+async def complete_validated(provider, model, prompt, payload, schema, attempts: int = 3):
     """Запрашивает JSON и повторяет попытку, если модель вернула мусор.
 
-    GigaChat периодически отдаёт обрезанный или невалидный JSON; повтор почти
-    всегда проходит, а без него целый чанк теряется.
+    GigaChat периодически отдаёт обрезанный или невалидный JSON, иногда в
+    markdown-обёртке; повтор и очистка обёртки спасают часть чанков.
     """
 
     last_exc: Exception | None = None
     validation_exc: Exception | None = None
-    for _ in range(max(1, attempts)):
+    for attempt in range(max(1, attempts)):
         try:
             raw = await provider.complete(prompt, payload, schema)
-            return model.model_validate_json(raw)
+            return model.model_validate_json(_strip_code_fence(raw))
         except ValidationError as exc:
             validation_exc = validation_exc or exc
             last_exc = exc
         except LLMError as exc:
             last_exc = validation_exc or exc
+            if attempt >= 1 and validation_exc is None:
+                # Транспортные/оборванные ответы второй раз обычно не лечатся.
+                break
     assert last_exc is not None
     raise last_exc
+
+
+def _strip_code_fence(raw: str) -> str:
+    """Убирает ```json ... ``` и текст вокруг JSON-объекта."""
+
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start : end + 1]
+    return text
 
 
 class AssistantPipeline:
