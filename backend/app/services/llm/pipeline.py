@@ -95,14 +95,18 @@ async def complete_validated(provider, model, prompt, payload, schema, attempts:
 
 class AssistantPipeline:
     def __init__(self, provider: JSONProvider, *, chunk_size: int = 12000,
-                 overlap: int = 1000, max_chunks: int = 50, review_window_days: int = REVIEW_WINDOW_DAYS):
+                 overlap: int = 1000, max_chunks: int = 50, review_window_days: int = REVIEW_WINDOW_DAYS,
+                 max_fragment_size: int = 4000, fragment_chunk_size: int | None = None):
         if (chunk_size < 100 or not 0 <= overlap < chunk_size // 2
-                or max_chunks < 1 or review_window_days < 1):
+                or max_chunks < 1 or review_window_days < 1
+                or max_fragment_size < 100):
             raise ValueError("Invalid chunk limits")
         self.provider = provider
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.max_chunks = max_chunks
+        self.max_fragment_size = max_fragment_size
+        self.fragment_chunk_size = fragment_chunk_size or chunk_size
         self.review_window_days = review_window_days
 
     def run_info(self, prompt_version: str) -> RunInfo:

@@ -55,12 +55,12 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
         by_id = {f.fragment_id: f for f in document.fragments}
         eligible = []
         for fragment in sorted(document.fragments, key=lambda f: f.start):
-            if fragment.end - fragment.start > pipeline.chunk_size:
+            if fragment.end - fragment.start > pipeline.max_fragment_size:
                 errors.append(PipelineError(source_id=document.source_id,
                                             chunk_id=fragment.fragment_id, code="fragment_too_large"))
             else:
                 eligible.append(fragment)
-        for batch in batches(eligible, pipeline.chunk_size):
+        for batch in batches(eligible, pipeline.fragment_chunk_size):
             chunk_id = f"{document.source_id}:{batch[0].start}-{batch[-1].end}"
             if processed >= pipeline.max_chunks:
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
