@@ -1,6 +1,7 @@
 """Extraction produces review candidates; drafting accepts only reviewed facts."""
 
 import hashlib
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -71,19 +72,47 @@ def chunks(text: str, size: int, overlap: int):
         start = end - overlap
 
 
-async def complete_validated(provider, model, prompt, payload, schema, attempts: int = 3):
-    """Запрашивает JSON и повторяет попытку, если модель вернула мусор.
+REPAIR_PROMPT = (
+    "Ты исправляешь повреждённый JSON. Верни ТОЛЬКО исправленный JSON-объект "
+    "по той же схеме, без markdown и пояснений. Не добавляй новых фактов: "
+    "сохрани все элементы, которые уже есть, и корректно закрой массивы."
+)
 
-    GigaChat периодически отдаёт обрезанный или невалидный JSON, иногда в
-    markdown-обёртке; повтор и очистка обёртки спасают часть чанков.
+
+async def complete_validated(provider, model, prompt, payload, schema, attempts: int = 3):
+    """Запрашивает JSON и чинит ответ, если модель сломала формат.
+
+    GigaChat периодически путает скобки и кавычки. Сначала пробуем локальные
+    исправления, затем просим модель переписать свой же JSON, затем спасаем
+    корректные факты из начала ответа.
     """
 
     last_exc: Exception | None = None
     validation_exc: Exception | None = None
+    previous_raw = ""
     for attempt in range(max(1, attempts)):
         try:
-            raw = await provider.complete(prompt, payload, schema)
-            return model.model_validate_json(_strip_code_fence(raw))
+            if attempt == 0 or not previous_raw:
+                raw = await provider.complete(prompt, payload, schema)
+            else:
+                raw = await provider.complete(
+                    REPAIR_PROMPT, {"broken_json": previous_raw}, schema
+                )
+            previous_raw = raw
+            cleaned = _strip_code_fence(raw)
+            try:
+                return model.model_validate_json(cleaned)
+            except ValidationError:
+                # Модель иногда вставляет неэкранированные кавычки в значения
+                # и путает закрывающие скобки: [ "id" } вместо [ "id" ].
+                repaired = _balance_brackets(_escape_inner_quotes(cleaned))
+                try:
+                    return model.model_validate_json(repaired)
+                except ValidationError:
+                    salvaged = _salvage_payload(repaired, model)
+                    if salvaged is not None:
+                        return model.model_validate(salvaged)
+                    raise
         except ValidationError as exc:
             validation_exc = validation_exc or exc
             last_exc = exc
@@ -94,6 +123,138 @@ async def complete_validated(provider, model, prompt, payload, schema, attempts:
                 break
     assert last_exc is not None
     raise last_exc
+
+
+def _balance_brackets(text: str) -> str:
+    """Исправляет перепутанные закрывающие скобки и незакрытые контейнеры."""
+
+    out: list[str] = []
+    stack: list[str] = []
+    in_string = False
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if char == "\\" and index + 1 < length:
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+        elif char in "[{":
+            stack.append(char)
+            out.append(char)
+        elif char in "]}":
+            wanted = "{" if char == "}" else "["
+            if stack and stack[-1] != wanted:
+                out.append("}" if stack[-1] == "{" else "]")
+                stack.pop()
+            else:
+                out.append(char)
+                if stack:
+                    stack.pop()
+        else:
+            out.append(char)
+        index += 1
+    if in_string:
+        out.append('"')
+    for opener in reversed(stack):
+        out.append("]" if opener == "[" else "}")
+    return "".join(out)
+
+
+def _salvage_payload(text: str, model):
+    """Собирает валидные факты из ответа, у которого испорчен хвост."""
+
+    facts = _scan_complete_objects(text)
+    if not facts:
+        return None
+    fields = getattr(model, "model_fields", {})
+    payload: dict[str, object] = {}
+    if "facts" in fields:
+        payload["facts"] = facts
+    if "gaps" in fields:
+        payload["gaps"] = []
+    return payload or None
+
+
+def _scan_complete_objects(text: str) -> list[dict]:
+    """Читает объекты массива facts до первого невалидного."""
+
+    match = re.search(r'"facts"\s*:\s*\[', text)
+    if not match:
+        return []
+    index = match.end()
+    depth = 0
+    start: int | None = None
+    collected: list[dict] = []
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == '"':
+            index += 1
+            while index < length and text[index] != '"':
+                if text[index] == "\\":
+                    index += 1
+                index += 1
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                chunk = _escape_inner_quotes(text[start : index + 1])
+                chunk = _balance_brackets(chunk)
+                try:
+                    collected.append(json.loads(chunk))
+                except ValueError:
+                    return collected
+                start = None
+        index += 1
+    return collected
+
+
+def _escape_inner_quotes(text: str) -> str:
+    """Экранирует кавычки внутри строковых значений JSON."""
+
+    out: list[str] = []
+    in_string = False
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if not in_string:
+            out.append(char)
+            if char == '"':
+                in_string = True
+            index += 1
+            continue
+        if char == "\\" and index + 1 < length:
+            out.append(char)
+            out.append(text[index + 1])
+            index += 2
+            continue
+        if char == '"':
+            lookahead = index + 1
+            while lookahead < length and text[lookahead] in " \t\r\n":
+                lookahead += 1
+            if lookahead >= length or text[lookahead] in ",}]:":
+                out.append(char)
+                in_string = False
+            else:
+                out.append('\\"')
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
 
 
 def _strip_code_fence(raw: str) -> str:
