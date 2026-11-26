@@ -306,6 +306,35 @@ class AssistantPipeline:
     async def extract_facts(self, request: ExtractionRequest | ContextExtractionRequest) -> ExtractionResult:
         if request.schema_version == "0.3":
             from .context_extraction import extract_context
+
+            fields = getattr(request, "fields", None)
+            if fields and len(fields) > 3:
+                # Один запрос на 8 полей GigaChat обрывает; режем на группы.
+                results = []
+                for start in range(0, len(fields), 3):
+                    group = fields[start : start + 3]
+                    allowed = {field.value for field in group}
+                    part = request.model_copy(update={"fields": group})
+                    result = await extract_context(self, part)
+                    result = result.model_copy(
+                        update={
+                            "facts": [
+                                fact for fact in result.facts
+                                if fact.field.value in allowed
+                            ]
+                        }
+                    )
+                    results.append(result)
+                return results[0].model_copy(
+                    update={
+                        "facts": [fact for result in results for fact in result.facts],
+                        "gaps": list(dict.fromkeys(
+                            gap for result in results for gap in result.gaps
+                        )),
+                        "errors": [error for result in results for error in result.errors],
+                        "complete": all(result.complete for result in results),
+                    }
+                )
             return await extract_context(self, request)
         if request.schema_version == "0.2":
             from .fragment_extraction import extract_with_fragments
