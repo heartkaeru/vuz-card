@@ -252,6 +252,8 @@ def checked(operation):
         return operation()
     except WorkflowError as exc:
         code = str(exc)
+        # Код отказа в журнале: в access-логе виден только статус 409.
+        LOGGER.warning("Действие отклонено: %s", code)
         raise HTTPException(404 if code.endswith("not_found") else 409, code) from None
 
 
@@ -261,6 +263,7 @@ async def checked_async(operation):
         return await result if inspect.isawaitable(result) else result
     except WorkflowError as exc:
         code = str(exc)
+        LOGGER.warning("Действие отклонено: %s", code)
         raise HTTPException(404 if code.endswith("not_found") else 409, code) from None
 
 
