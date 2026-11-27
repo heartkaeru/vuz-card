@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from datetime import timedelta
+from os.path import commonprefix
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -36,6 +37,10 @@ MEETING_DIRECTORY_ROLE = re.compile(
     r"\b(?:ректор|проректор|при[её]мная\s+(?:ректора|директора)|при[её]мная комиссия|"
     r"контакт[- ]центр|справочная(?: служба)?|канцелярия)\b", re.I,
 )
+NAVIGATION_LABELS = re.compile(
+    r"\b(?:абитуриентам|поступающим|студентам|сотрудникам|преподавателям|"
+    r"расписание|личный кабинет)\b"
+)
 
 
 def documents_for(card, mode):
@@ -43,7 +48,7 @@ def documents_for(card, mode):
     for document in card.documents:
         labels = {document.category, document.section}
         leadership = bool(labels & {"leadership", "contacts", "biography"})
-        context = bool(labels & {"organization", "about", "homepage", "research", "projects",
+        context = bool(labels & {"organization", "about", "homepage", "programs", "research", "projects",
                                 "grants", "project_news", "partnerships", "achievements", "events", "news"})
         unknown = not leadership and not context
         hints = any(f.contact_hints for f in document.fragments)
@@ -89,6 +94,31 @@ def prepare_leadership_documents(documents, *, meeting_profile):
                     del fragment["biography_subject"]
         selected.append(document)
     return selected
+
+
+def skip_shared_navigation(documents):
+    """Omit repeated navigation fragments from prompts while preserving source offsets."""
+    by_prefix = {}
+    for document in documents:
+        text = document["text"]
+        if len(text) >= 1024:
+            host = (urlsplit(document["url"]).hostname or "").removeprefix("www.")
+            by_prefix.setdefault((host, text[:1024]), []).append(document)
+    for group in by_prefix.values():
+        if len({document["url"] for document in group}) < 2:
+            continue
+        prefix = commonprefix([document["text"] for document in group])
+        if len(set(NAVIGATION_LABELS.findall(prefix.casefold()))) < 3:
+            continue
+        for document in group:
+            fragments = document["fragments"]
+            remaining = [fragment for fragment in fragments if fragment["end"] > len(prefix)]
+            if not remaining:
+                continue
+            anchors = {fragment.get(field) for fragment in fragments
+                       for field in ("institution_anchor_id", "entity_anchor_id")}
+            document["fragments"] = [fragment for fragment in fragments
+                                     if fragment["end"] > len(prefix) or fragment["fragment_id"] in anchors]
 
 
 def prioritize_review(facts):
@@ -181,6 +211,8 @@ class LLMWorkflow:
                     payload["project_structured_contacts"] = True
                 elif context_fields is not None:
                     payload["fields"] = context_fields
+                    if meeting_profile:
+                        skip_shared_navigation(payload["documents"])
                     # Detail-page URLs come from individual project/event items, not section listings.
                     detail_urls = {
                         item.url.rstrip("/"): item.title

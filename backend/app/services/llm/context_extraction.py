@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+from collections import deque
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -14,6 +15,15 @@ from .models import INSTITUTION_METRICS, EntitySubject, Evidence, ExtractionResu
 from .names import folded
 
 
+CONTEXT_SOURCE_SECTIONS = {
+    "institution": ({"about", "organization", "programs", "homepage"},),
+    "project": ({"projects", "research", "grants", "project_news", "partnerships"}, {"news"}),
+    "event": ({"events"}, {"news", "project_news"}),
+}
+LINKED_CONTEXT_FIELDS = {
+    "project": ("project.name", "project.role", "project.status"),
+    "event": ("event.name", "event.date", "event.status"),
+}
 INSTITUTION_NOUN = r"(?:университет|институт|академия|колледж|техникум|училище|школа|вуз|учреждение|образовательная организация)"
 METRIC_TOPICS = {
     "institution.teaching_staff": r"преподавател|педагог|профессорско",
@@ -32,6 +42,28 @@ FOUNDING_CONTEXT = re.compile(
 
 def normalize(value):
     return folded(" ".join(value.split()))
+
+
+def context_field_groups(fields):
+    by_kind = {}
+    for field in fields:
+        kind = field.value.partition(".")[0]
+        by_kind.setdefault(kind, []).append(field)
+    for kind, fields in by_kind.items():
+        linked = LINKED_CONTEXT_FIELDS.get(kind, ())
+        ordered = [field for key in linked for field in fields if field.value == key]
+        ordered.extend(field for field in fields if field.value not in linked)
+        for start in range(0, len(ordered), 3):
+            yield kind, ordered[start : start + 3]
+
+
+def documents_for_context_group(documents, kind, fields):
+    compatible = [doc for doc in documents if doc.fields is None or set(fields).intersection(doc.fields)]
+    for sections in CONTEXT_SOURCE_SECTIONS[kind]:
+        selected = [doc for doc in compatible if {doc.section.lower(), doc.category.lower()} & sections]
+        if selected:
+            return selected
+    return compatible
 
 
 def batches(document, size):
@@ -79,12 +111,35 @@ def batches(document, size):
         yield batch
 
 
+def document_batches(request, size, *, interleave_sources):
+    sources = deque()
+    for document in request.documents:
+        fields = request.fields
+        if document.fields is not None:
+            fields = document.fields if fields is None else [field for field in fields if field in document.fields]
+            if not fields:
+                continue
+        digest = hashlib.sha256(document.text.encode("utf-8")).hexdigest()
+        iterator = enumerate(batches(document, size))
+        if interleave_sources:
+            sources.append((document, fields, digest, iterator))
+        else:
+            yield document, fields, digest, iterator
+    while sources:
+        source = sources.popleft()
+        item = next(source[3], None)
+        if item is not None:
+            yield (*source[:3], (item,))
+            sources.append(source)
+
+
 async def extract_context(
     pipeline,
     request: ContextExtractionRequest,
     *,
     progress_callback=None,
     chunk_limit: int | None = None,
+    interleave_sources: bool = False,
 ):
     from .pipeline import PROMPTS, complete_validated
 
@@ -104,14 +159,10 @@ async def extract_context(
     processed = 0
     chunk_limit = pipeline.max_chunks if chunk_limit is None else max(0, chunk_limit)
     limit_reached = False
-    for document in request.documents:
-        fields = request.fields
-        if document.fields is not None:
-            fields = document.fields if fields is None else [field for field in fields if field in document.fields]
-            if not fields:
-                continue
-        digest = hashlib.sha256(document.text.encode("utf-8")).hexdigest()
-        for index, batch in enumerate(batches(document, pipeline.chunk_size)):
+    for document, fields, digest, chunks in document_batches(
+        request, pipeline.chunk_size, interleave_sources=interleave_sources,
+    ):
+        for index, batch in chunks:
             chunk_id = f"{document.source_id}:context:{index}"
             if sum(f.end - f.start for f in batch) > pipeline.chunk_size:
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,

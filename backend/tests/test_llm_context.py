@@ -13,6 +13,7 @@ from app.services.llm.context_models import ContextExtractionRequest, ContextFie
 from app.services.llm.fragment_models import parse_extraction_request
 from app.services.llm.models import EntitySubject, ExtractionRequest, FactField, GenerationRequest
 from app.services.llm.pipeline import DraftValidationError
+from app.services.llm.workflow import skip_shared_navigation
 from examples.llm.context_demo import example_request
 
 EXAMPLES = Path(__file__).parents[1] / "examples" / "llm"
@@ -182,6 +183,68 @@ def test_unrelated_reference_page_does_not_consume_project_extraction_budget():
     assert fact.validation_status == "passed"
     assert fact.evidence[0].source_id == source.source_id
     assert not result.errors
+
+
+def test_linked_event_and_project_fields_reach_dedicated_sources_within_budget():
+    request = example_request()
+    source = request.documents[0]
+
+    def document(source_id, section, count):
+        paragraphs = [f"{source_id} {i} " + "Источник " * 10 for i in range(count)]
+        fragments, offset = [], 0
+        for i, paragraph in enumerate(paragraphs):
+            fragments.append({"fragment_id": str(i), "start": offset, "end": offset + len(paragraph)})
+            offset += len(paragraph) + 1
+        return type(source).model_validate({
+            **source.model_dump(), "source_id": source_id, "section": section,
+            "text": "\n".join(paragraphs), "fragments": fragments,
+        })
+
+    request.documents = [
+        document("profile", "about", 12), document("project-index", "projects", 12),
+        document("project-page", "projects", 2), document("news-index", "news", 12),
+        document("event-page", "events", 2),
+    ]
+    request.fields = [
+        ContextField.PROFILE, ContextField.TYPE, ContextField.PROJECT_NAME, ContextField.PROJECT_ROLE,
+        ContextField.PROJECT_DESCRIPTION, ContextField.EVENT_NAME, ContextField.PROJECT_STATUS,
+        ContextField.EVENT_STATUS, ContextField.EVENT_DATE,
+    ]
+    calls = []
+
+    class Recorder(FixtureProvider):
+        async def complete(self, system, payload, schema):
+            calls.append((payload["source_id"], payload["fields"]))
+            return '{"facts":[],"gaps":[]}'
+
+    asyncio.run(AssistantPipeline(Recorder([]), chunk_size=125, overlap=10, max_chunks=8).extract_facts(request))
+
+    assert len(calls) == 8
+    assert [source_id for source_id, fields in calls if "project.name" in fields] == ["project-index", "project-page"]
+    assert all("project.role" in fields and "project.status" in fields for _, fields in calls if "project.name" in fields)
+    assert [source_id for source_id, fields in calls if "event.name" in fields] == ["event-page", "event-page"]
+    assert all("event.date" in fields and "event.status" in fields for _, fields in calls if "event.name" in fields)
+
+
+def test_shared_menu_is_excluded_but_the_original_text_and_anchors_stay():
+    menu = "Поступающим Студентам Расписание Личный кабинет " * 40
+    title = "Название учреждения"
+    prefix = menu + title + "\n"
+    documents = []
+    for key, value in (("one", "Первый проект"), ("two", "Второй проект")):
+        documents.append({
+            "url": f"https://institution.example/{key}", "text": prefix + value,
+            "fragments": [
+                {"fragment_id": "menu", "start": 0, "end": len(menu)},
+                {"fragment_id": "anchor", "start": len(menu), "end": len(prefix) - 1},
+                {"fragment_id": "content", "start": len(prefix), "end": len(prefix) + len(value),
+                 "institution_anchor_id": "anchor"},
+            ],
+        })
+    skip_shared_navigation(documents)
+    for document in documents:
+        assert [f["fragment_id"] for f in document["fragments"]] == ["anchor", "content"]
+        assert document["text"].startswith(prefix)
 
 
 def test_incompatible_values_flag_conflict_without_auto_selection():

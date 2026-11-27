@@ -306,40 +306,28 @@ class AssistantPipeline:
     async def extract_facts(self, request: ExtractionRequest | ContextExtractionRequest,
                             *, progress_callback=None) -> ExtractionResult:
         if request.schema_version == "0.3":
-            from .context_extraction import extract_context
+            from .context_extraction import context_field_groups, documents_for_context_group, extract_context
 
             fields = getattr(request, "fields", None)
             if fields and len(fields) > 3:
-                # Один запрос на 8 полей GigaChat обрывает; режем на группы.
+                # Small, typed groups share one extraction budget.
                 results = []
-                groups = [fields[start : start + 3] for start in range(0, len(fields), 3)]
+                groups = [
+                    (group, documents)
+                    for kind, group in context_field_groups(fields)
+                    if (documents := documents_for_context_group(request.documents, kind, group))
+                ]
+                if not groups:
+                    return await extract_context(self, request, progress_callback=progress_callback)
                 base_limit, extra = divmod(self.max_chunks, len(groups))
-                preferred_sections = {
-                    "project": {"projects", "research", "grants", "project_news", "news", "partnerships"},
-                    "event": {"events", "news"},
-                    "institution": {"about", "organization", "homepage"},
-                }
-                for index, group in enumerate(groups):
+                for index, (group, documents) in enumerate(groups):
                     allowed = {field.value for field in group}
-                    roots = {field.value.split(".", 1)[0] for field in group}
-                    preferred = set().union(*(preferred_sections.get(root, set()) for root in roots))
-                    documents = list(request.documents)
-                    if preferred:
-                        documents = [doc for _, doc in sorted(
-                            enumerate(documents),
-                            key=lambda pair: (
-                                0 if (pair[1].section or pair[1].category or "").lower() in preferred else 1,
-                                pair[0],
-                            ),
-                        )]
                     part = request.model_copy(update={"fields": group, "documents": documents})
                     chunk_limit = base_limit + (1 if index < extra else 0)
-                    if progress_callback is None:
-                        result = await extract_context(self, part, chunk_limit=chunk_limit)
-                    else:
-                        result = await extract_context(
-                            self, part, chunk_limit=chunk_limit, progress_callback=progress_callback
-                        )
+                    result = await extract_context(
+                        self, part, chunk_limit=chunk_limit, progress_callback=progress_callback,
+                        interleave_sources=True,
+                    )
                     result = result.model_copy(
                         update={
                             "facts": [
