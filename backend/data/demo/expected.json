@@ -1,0 +1,29 @@
+[
+  {
+    "name": "урфу",
+    "website": "https://urfu.ru",
+    "run_status": "partial",
+    "facts": 451,
+    "pending": 451,
+    "rejected": 0,
+    "seconds": 556
+  },
+  {
+    "name": "Юургу",
+    "website": "https://www.susu.ru/",
+    "run_status": "partial",
+    "facts": 163,
+    "pending": 146,
+    "rejected": 17,
+    "seconds": 431
+  },
+  {
+    "name": "Московский государственный университет",
+    "website": "https://msu.ru/",
+    "run_status": "partial",
+    "facts": 19,
+    "pending": 19,
+    "rejected": 0,
+    "seconds": 119
+  }
+]
