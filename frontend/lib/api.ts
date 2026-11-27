@@ -65,7 +65,6 @@ const errors: Record<string, string> = {
   "Method Not Allowed": "Backend не поддерживает удаление отчётов. Перезапустите backend и повторите.",
   presentation_preview_unavailable: "Предпросмотр презентации недоступен.",
   facts_require_freshness_check: "Истёк срок проверки фактов. Откройте блок «Повторная проверка перед экспортом» в карточке.",
-  fact_already_reconfirmed: "Эти сведения уже подтверждены повторным сбором. Обновите карточку.",
   run_not_ready_for_generation: "Сбор сведений ещё не завершён. Откройте карточку и проверьте статус задания.",
   invalid_selected_fact_ids: "Состав принятых сведений изменился. Обновите карточку и повторите экспорт.",
   partnership_match_requires_selected_accepted_facts: "Основания для предложений изменились. Повторите подбор перед экспортом.",
