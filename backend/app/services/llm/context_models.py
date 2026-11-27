@@ -49,6 +49,8 @@ class ContextFragment(StrictModel):
 
 class ContextDocument(SourceDocument):
     fragments: list[ContextFragment] = Field(min_length=1)
+    # Optional scope assigned by collection for dedicated reference pages.
+    fields: list[ContextField] | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def valid_fragments(self):

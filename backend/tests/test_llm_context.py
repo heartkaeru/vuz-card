@@ -171,6 +171,19 @@ def test_context_field_filter_and_duplicate_outputs():
     assert "field_not_requested" in result.facts[0].issues
 
 
+def test_unrelated_reference_page_does_not_consume_project_extraction_budget():
+    request = example_request()
+    source = request.documents[0]
+    reference = source.model_copy(update={"source_id": "reference-page", "fields": [ContextField.PROFILE]})
+    request.documents = [reference, source]
+    request.fields = [ContextField.PROJECT_STATUS]
+    result = extract([proposal()], request, max_chunks=1)
+    fact, = result.facts
+    assert fact.validation_status == "passed"
+    assert fact.evidence[0].source_id == source.source_id
+    assert not result.errors
+
+
 def test_incompatible_values_flag_conflict_without_auto_selection():
     items = [proposal(), proposal(value="планирует подать заявку")]
     result = extract(items)

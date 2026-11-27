@@ -97,6 +97,11 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
     facts, gaps, errors, seen = [], [], [], set()
     processed = 0
     for document in request.documents:
+        fields = request.fields
+        if document.fields is not None:
+            fields = document.fields if fields is None else [field for field in fields if field in document.fields]
+            if not fields:
+                continue
         digest = hashlib.sha256(document.text.encode("utf-8")).hexdigest()
         for index, batch in enumerate(batches(document, pipeline.chunk_size)):
             chunk_id = f"{document.source_id}:context:{index}"
@@ -116,7 +121,7 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                 "source_id": document.source_id,
                 "source_title": document.title,
                 "published_at": document.published_at.isoformat() if document.published_at else None,
-                "fields": [f.value for f in request.fields] if request.fields is not None else None,
+                "fields": [f.value for f in fields] if fields is not None else None,
                 "fragments": [{"fragment_id": f.fragment_id, "entity_scope_id": f.entity_scope_id,
                                "institution_anchor_id": f.institution_anchor_id,
                                "page_number": f.page_number,
@@ -127,8 +132,8 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
             schema["$defs"]["ContextFactProposal"]["properties"]["fragment_ids"]["items"] = {
                 "type": "string", "enum": list(fragments),
             }
-            if request.fields is not None:
-                schema["$defs"]["ContextFactProposal"]["properties"]["field"]["enum"] = [f.value for f in request.fields]
+            if fields is not None:
+                schema["$defs"]["ContextFactProposal"]["properties"]["field"]["enum"] = [f.value for f in fields]
             if only_institution_fields:
                 definition = schema["$defs"]["ContextFactProposal"]
                 if not metric_requested:
@@ -171,7 +176,7 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                 subject = item.subject
                 anchor = fragments.get(subject.entity_fragment_id)
                 refs = list(dict.fromkeys([subject.entity_fragment_id, *item.fragment_ids]))
-                if request.fields is not None and item.field not in request.fields:
+                if fields is not None and item.field not in fields:
                     issues.append("field_not_requested")
                 if not item.field.value.startswith(subject.entity_kind + "."):
                     issues.append("context_entity_field_mismatch")

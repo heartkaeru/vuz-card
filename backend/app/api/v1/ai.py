@@ -5,9 +5,11 @@ import inspect
 import logging
 import os
 import jwt
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from time import perf_counter
 from typing import Annotated, Literal
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
@@ -90,6 +92,9 @@ def get_collector():
         settings = Settings.from_env()
         # The LLM needs source documents from the official site, including on refresh.
         settings.aggregators_only = False
+        # These enrich the parser's own summary but do not produce inputs for fact extraction.
+        settings.use_aggregators = False
+        settings.use_news_search = False
         settings.max_retries = 1
         settings.timeout = min(settings.timeout, 20)
         settings.max_total_requests = min(settings.max_total_requests, 30)
@@ -268,8 +273,11 @@ async def resolve_registry_card_id(repository, workflow_card_id: str) -> str:
 
 async def collect_job(repository, pipeline, collector, card, job_id, leadership_url=None, source_options=None):
     try:
+        started = perf_counter()
         repository.update_job(job_id, status="running", progress=15, message="Сбор официальных страниц руководства")
         parsed = await asyncio.to_thread(collector, card["website"], card["name"], leadership_url, **(source_options or {}))
+        LOGGER.info("Source collection completed: job_id=%s elapsed_seconds=%.2f documents=%d warnings=%d errors=%d",
+                    job_id, perf_counter() - started, len(parsed.documents), len(parsed.warnings), len(parsed.errors))
         no_documents = not parsed.documents
         documents_note = ""
         if no_documents:
@@ -279,13 +287,18 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
         research, _ = workflow.create(Institution(id=card["id"], name=card["name"], card_version=card["version"]),
                                        parsed, job_id, modes=("0.2", "0.3") if (source_options or {}).get("include_institution") else ("0.2",))
         repository.set_latest(card["id"], research.run_id)
-        research = await workflow.extract(research.run_id, meeting_profile=not leadership_url, context_fields=[
-            "institution.profile", "institution.type", "institution.location", "institution.founded",
-            "institution.education_areas", "institution.education_levels", "institution.students",
-            "institution.teaching_staff", "institution.budget_students", "institution.dormitory_capacity",
-            "institution.dormitory_occupancy", "institution.structure", "project.name", "project.program",
-            "project.role", "project.partner", "project.status", "project.period", "project.description",
-            "event.name", "event.type", "event.date", "event.status", "event.description"])
+        extraction_started = perf_counter()
+        provider = pipeline.provider
+        async with provider.session() if isinstance(provider, GigaChatProvider) else nullcontext():
+            research = await workflow.extract(research.run_id, meeting_profile=not leadership_url, context_fields=[
+                "institution.profile", "institution.type", "institution.location", "institution.founded",
+                "institution.education_areas", "institution.education_levels", "institution.students",
+                "institution.teaching_staff", "institution.budget_students", "institution.dormitory_capacity",
+                "institution.dormitory_occupancy", "institution.structure", "project.name", "project.program",
+                "project.role", "project.partner", "project.status", "project.period", "project.description",
+                "event.name", "event.type", "event.date", "event.status", "event.description"])
+        LOGGER.info("Fact extraction completed: job_id=%s run_id=%s elapsed_seconds=%.2f status=%s facts=%d",
+                    job_id, research.run_id, perf_counter() - extraction_started, research.status, len(research.facts))
         has_candidates = any(fact.validation_status == "passed" and not fact.issues for fact in research.facts)
         if research.status == "failed" or not has_candidates:
             stage_errors = [error.code for result in research.results.values() for error in result.errors]

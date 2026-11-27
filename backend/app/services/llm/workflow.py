@@ -25,6 +25,11 @@ from .changes import compare_run, effective_facts, head_key, person_aliases, per
 
 
 DIRECTORY_SCOPE = re.compile(r"(?:/sveden/(?:struct|employees|pedagog)|/(?:structure|directory|staff|employees))(?:/|$)")
+REFERENCE_FIELDS = {
+    "education": ["institution.education_areas", "institution.education_levels", "institution.students",
+                  "institution.budget_students", "institution.teaching_staff"],
+    "objects": ["institution.dormitory_capacity", "institution.dormitory_occupancy"],
+}
 MEETING_DIRECTORY_ROLE = re.compile(
     r"\b(?:ректор|проректор|при[её]мная\s+(?:ректора|директора)|при[её]мная комиссия|"
     r"контакт[- ]центр|справочная(?: служба)?|канцелярия)\b", re.I,
@@ -171,6 +176,10 @@ class LLMWorkflow:
                         if item.url and item.title
                     }
                     for document in payload["documents"]:
+                        if meeting_profile:
+                            section = re.match(r"^/sveden/(education|objects)(?:/|$)", urlsplit(document["url"]).path)
+                            if section:
+                                document["fields"] = REFERENCE_FIELDS[section[1]]
                         title = detail_urls.get(document["url"].rstrip("/"))
                         if not title or not literal_value_in_text(title, document["title"]):
                             continue

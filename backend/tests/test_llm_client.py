@@ -54,6 +54,44 @@ def test_sdk_payload_and_tls_configuration(monkeypatch):
     assert result == '{"facts": []}'
 
 
+def test_collection_session_reuses_connection_and_closes_between_jobs(monkeypatch):
+    clients = []
+
+    class FakeSDK:
+        def __init__(self, **kwargs):
+            clients.append(self)
+            self.calls = 0
+            self.closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            self.closed = True
+
+        async def achat(self, payload):
+            assert not self.closed
+            self.calls += 1
+            return SimpleNamespace(choices=[SimpleNamespace(
+                finish_reason="stop", message=SimpleNamespace(content='{"facts": []}'))])
+
+    monkeypatch.setattr("app.services.llm.client.GigaChat", FakeSDK)
+    provider = GigaChatProvider(settings())
+
+    async def collect():
+        async with provider.session():
+            await provider.complete("leadership", {}, {})
+            await provider.complete("profile", {}, {})
+
+    async def run():
+        await asyncio.gather(collect(), collect())
+        await provider.complete("chat", {}, {})
+
+    asyncio.run(run())
+    assert [client.calls for client in clients] == [2, 2, 1]
+    assert all(client.closed for client in clients)
+
+
 def test_sdk_error_does_not_expose_headers_or_body(monkeypatch):
     class FailingSDK:
         def __init__(self, **kwargs):

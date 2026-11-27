@@ -74,6 +74,8 @@ def test_ai_collection_crawls_the_official_site_even_with_aggregator_default(mon
     class Parser:
         def __init__(self, settings, client):
             assert not settings.aggregators_only
+            assert not settings.use_aggregators
+            assert not settings.use_news_search
             self.client = client
 
         def parse(self, *, url, name, profile, allowed_sections):
