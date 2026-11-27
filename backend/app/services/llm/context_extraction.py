@@ -24,6 +24,13 @@ LINKED_CONTEXT_FIELDS = {
     "project": ("project.name", "project.role", "project.status"),
     "event": ("event.name", "event.date", "event.status"),
 }
+REPORT_MEASURES = {
+    "institution.students": re.compile(r"(?:контингент|численност\w*)\s+(?:обучающ\w*|студент\w*)", re.I),
+    "institution.teaching_staff": re.compile(r"педагогическ\w*\s+работник|профессорско-преподавательск\w*\s+состав", re.I),
+    "institution.budget_students": re.compile(r"(?:за сч[её]т|средств\w*)\s+(?:федерального\s+)?бюджет", re.I),
+    "institution.dormitory_capacity": re.compile(r"общежити\w*.*мест|мест.*общежити\w*", re.I),
+    "institution.dormitory_occupancy": re.compile(r"общежити\w*.*(?:загруз|засел|заполн)|(?:загруз|засел|заполн).*общежити\w*", re.I),
+}
 INSTITUTION_NOUN = r"(?:университет|институт|академия|колледж|техникум|училище|школа|вуз|учреждение|образовательная организация)"
 METRIC_TOPICS = {
     "institution.teaching_staff": r"преподавател|педагог|профессорско",
@@ -62,8 +69,23 @@ def documents_for_context_group(documents, kind, fields):
     for sections in CONTEXT_SOURCE_SECTIONS[kind]:
         selected = [doc for doc in compatible if {doc.section.lower(), doc.category.lower()} & sections]
         if selected:
+            if kind == "institution":
+                return [select_report_measures(doc, fields) if doc.file_sha256 else doc for doc in selected]
             return selected
     return compatible
+
+
+def select_report_measures(document, fields):
+    if not fields or any(field.value not in REPORT_MEASURES for field in fields):
+        return document
+    patterns = [REPORT_MEASURES[field.value] for field in fields]
+    relevant = [fragment for fragment in document.fragments if fragment.institution_anchor_id
+                and re.search(r"\d", text := normalize(document.text[fragment.start:fragment.end]))
+                and any(pattern.search(text) for pattern in patterns)]
+    if not relevant:
+        return document
+    keep = {fid for fragment in relevant for fid in (fragment.fragment_id, fragment.institution_anchor_id)}
+    return document.model_copy(update={"fragments": [f for f in document.fragments if f.fragment_id in keep]})
 
 
 def batches(document, size):

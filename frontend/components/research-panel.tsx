@@ -180,6 +180,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [sourceChecked, setSourceChecked] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [reviewFeedback, setReviewFeedback] = useState<{ message: string; failed: boolean } | null>(null);
   const [material, setMaterial] = useState<Material | null>(null);
   const [downloadFormat, setDownloadFormat] = useState<"pptx" | "docx">("pptx");
   const [formatPickerOpen, setFormatPickerOpen] = useState(false);
@@ -227,8 +228,6 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const reconfirmedIds = new Set(Object.values(run?.reconfirmed_facts ?? {}).flat());
   const candidates = run?.facts.filter((fact) => fact.origin !== "manual_edit" && !run.retired_fact_ids?.includes(fact.fact_id)
     && !reconfirmedIds.has(fact.fact_id)) ?? [];
-  const canAccept = (fact: Fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length;
-  const readyForReview = candidates.filter(canAccept);
   const problematic = candidates.filter((fact) => fact.verification_status === "rejected"
     || fact.verification_status === "conflict" || fact.validation_status === "failed" || fact.issues.length > 0);
   const blockedSelection = problematic.some((fact) => selected.includes(fact.fact_id));
@@ -297,6 +296,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   }, [university.backendId, chatCollectionJobId]);
 
   useEffect(() => { setSelected([]); setPastChanges(null); setRecheckConfirmed(false); setReviewTab("candidates"); }, [run?.run_id, run?.revision]);
+  useEffect(() => { setReviewFeedback(null); }, [run?.run_id]);
   useEffect(() => { setSourceChecked(false); setReplacePrevious(false); }, [run?.run_id, run?.revision, selected.join("|")]);
 
   useEffect(() => {
@@ -382,13 +382,25 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     if (!run) return;
     const decisionIds = decision === "revoke" ? selected.filter((id) => acceptedFactIds.has(id))
       : selected.filter((id) => candidateFactIds.has(id));
-    if (!decisionIds.length) { setError(decision === "revoke" ? "Выберите принятые сведения для отмены." : "Выберите сведения для решения."); return; }
-    if (!reviewer.trim() || !reason.trim()) { setError("Укажите проверяющего и основание решения."); return; }
-    if (decision === "accept" && !sourceChecked) { setError("Подтвердите проверку по первоисточникам."); return; }
-    if (decision === "accept" && (!currentComparison || retirementIds.length > 0 && !replacePrevious)) {
-      setError("Проверьте сравнение и подтвердите замену прежних сведений."); return;
+    let validationError = "";
+    if (!decisionIds.length) {
+      validationError = decision === "revoke" ? "Выберите принятые сведения для отмены." : "Выберите сведения для решения.";
+    } else if (decision === "accept" && blockedSelection) {
+      validationError = "Снимите отметки со строк «Конфликт» и «Отклонено», прежде чем принимать выбранные сведения.";
+    } else if (!reviewer.trim() || !reason.trim()) {
+      validationError = "Укажите проверяющего и основание решения.";
+    } else if (decision === "accept" && !sourceChecked) {
+      validationError = "Подтвердите проверку по первоисточникам.";
+    } else if (decision === "accept" && !currentComparison) {
+      validationError = "Сравнение сведений пока недоступно. Дождитесь загрузки или обновите карточку.";
+    } else if (decision === "accept" && retirementIds.length > 0 && !replacePrevious) {
+      validationError = "Проверьте сравнение и подтвердите замену прежних сведений.";
     }
-    setSaving(true); setError("");
+    if (validationError) {
+      setReviewFeedback({ message: validationError, failed: true });
+      return;
+    }
+    setSaving(true); setReviewFeedback(null);
     try {
       const updated = await post<ResearchRun>(`/runs/${run.run_id}/reviews`, {
         expected_revision: run.revision, reviewer,
@@ -396,7 +408,9 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         retirements: decision === "accept" ? retirementIds.map((fact_id) => ({fact_id, source_checked: sourceChecked, reason})) : [],
       });
       setRun(updated); onRunChange(updated); setMaterial(null);
-    } catch (failure) { setError(errorText(failure)); }
+      const labels = { accept: "Принято", reject: "Отклонено", revoke: "Отменено принятие" };
+      setReviewFeedback({ message: `${labels[decision]} сведений: ${decisionIds.length}.`, failed: false });
+    } catch (failure) { setReviewFeedback({ message: errorText(failure), failed: true }); }
     finally { setSaving(false); }
   }
 
@@ -789,9 +803,13 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         <div className="research-controls"><button className="button button--primary" type="button" disabled={Boolean(busy) || !selectedCandidateCount} onClick={() => { void review("accept"); }}>Принять выбранные ({selectedCandidateCount})</button>
         <button className="button button--soft" type="button" disabled={Boolean(busy) || !selectedCandidateCount} onClick={() => { void review("reject"); }}>Отклонить выбранные</button></div>
       </div>
-      </div>}</section>, reviewOutlet)}
+      </div>}
+      {reviewFeedback && <p className={reviewFeedback.failed ? "research-error" : "research-summary"}
+        role={reviewFeedback.failed ? "alert" : "status"}>{reviewFeedback.message}</p>}
+    </section>, reviewOutlet)}
     {formatPickerOpen && typeof document !== "undefined" && createPortal(<div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeFormatPicker(); }}>
-      <section className="report-format-dialog" role="dialog" aria-modal="true" aria-labelledby="report-format-title">
+      <section className="report-preview report-format-dialog" style={{ overflowY: "auto" }}
+        role="dialog" aria-modal="true" aria-labelledby="report-format-title">
         <header className="report-preview__header">
           <div><span className="eyebrow">ОТЧЁТ К ВСТРЕЧЕ</span><h2 id="report-format-title">Выберите формат файла</h2></div>
           <button className="icon-button" type="button" onClick={closeFormatPicker} aria-label="Закрыть выбор формата"><Icon name="close" size={19} /></button>

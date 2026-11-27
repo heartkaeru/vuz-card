@@ -9,19 +9,86 @@ from pydantic import ValidationError
 from pptx import Presentation
 
 from app.services.llm.client import FixtureProvider
-from app.services.llm.context_models import ContextExtractionRequest, ContextField
+from app.services.llm.context_extraction import select_report_measures
+from app.services.llm.context_models import ContextDocument, ContextExtractionRequest, ContextField
 from app.services.llm.fragment_models import FragmentExtractionRequest
 from app.services.llm.models import DraftResult, GenerationRequest, Institution
 from app.services.llm.pipeline import AssistantPipeline, DraftValidationError
-from app.services.llm.official_sources import official_program_candidates, official_reference_document
+from app.services.llm.official_sources import (
+    official_basic_candidates, official_catalog_candidates, official_program_candidates,
+    official_reference_document, official_self_study_url,
+)
 from app.services.meeting_pptx import build_meeting_presentation
 from parser.biography import mark_biography_subject
 from parser.cleaner import HTMLCleaner
 from parser.llm_adapter import to_llm_document
 from parser.institution_context import mark_institution_context
+from parser.models import UniversityData
 
 NAME = "Иванов Иван Иванович"
 INSTITUTION = {"id": "draft:dossier-test", "name": "Учебный университет", "card_version": 1}
+
+
+def test_official_catalog_needs_exact_code_and_name_on_the_same_official_row():
+    url = "https://programs.university.example/catalog/"
+    quote = "Математика | 01.03.01 Математика | Естественные науки | бакалавриат"
+    document = HTMLCleaner().to_document(f"<main><p>{quote}</p><p>09.03.04 Соседнее направление</p></main>",
+                                         url=url, section="programs")
+    card = UniversityData.model_validate({"university": {"name": INSTITUTION["name"], "url": "https://university.example"},
+        "documents": [document], "specialties": [
+            {"code": "01.03.01", "name": "Математика", "level": "бакалавриат", "source_url": url},
+            {"code": "09.03.04", "name": "Математика", "level": "магистратура", "source_url": url},
+            {"code": "01.03.01", "name": "Математика", "source_url": "https://elsewhere.example/catalog/"},
+        ]})
+    institution = Institution.model_validate(INSTITUTION)
+    facts = list(official_catalog_candidates(card, institution, [], {"institution.education_areas", "institution.education_levels"}))
+    assert {f.value for f in facts} == {"01.03.01 Математика", "бакалавриат"}
+    assert all(f.verification_status == "pending" and f.evidence[0].quote == quote and f.evidence[0].url == url for f in facts)
+
+
+def test_official_common_fields_use_disclosed_name_and_values():
+    url = "https://university.example/sveden/common/"
+    owner = "Федеральное образовательное учреждение высшего образования «Учебный университет»"
+    page = SimpleNamespace(final_url=url, text=f"""<main><p itemprop="fullName">{owner}</p>
+        <p>Дата создания образовательной организации: <span itemprop="regDate">10 июля 1930 г.</span></p>
+        <p>Адрес: <span itemprop="address">г. Москва, ул. Ленина, 11</span></p></main>""")
+    institution = Institution.model_validate(INSTITUTION)
+    doc = official_reference_document(SimpleNamespace(get=lambda _: page), url, url, institution.name, max_chars=4000)
+    candidates = {f.field.value: f for f in official_basic_candidates([doc], institution, [])}
+    assert {key: f.value for key, f in candidates.items()} == {"institution.founded": "10 июля 1930 г.",
+        "institution.location": "г. Москва, ул. Ленина, 11", "institution.type": "образовательное учреждение высшего образования"}
+    assert "Дата создания образовательной организации" in candidates["institution.founded"].evidence[0].quote
+    assert all(f.verification_status == "pending" and any(owner in e.quote for e in f.evidence) for f in candidates.values())
+
+
+def test_self_study_discovery_prefers_the_latest_head_office_report_on_official_site():
+    page = SimpleNamespace(final_url="https://university.example/sveden/document/", text=r"""
+        <div><a href="\reports\head.pdf">Скачать .PDF</a><a href="\reports\head.pdf.sig">ЭП</a>
+        Отчет о результатах самообследования за 2025 год (головной вуз)</div>
+        <a href="/branch.pdf">Отчет о результатах самообследования за 2026 год (филиал)</a>
+        <a href="https://elsewhere.example/latest.pdf">Отчет о результатах самообследования за 2026 год</a>
+        <a href="/older.pdf">Отчет о самообследовании за 2024 год</a>
+    """)
+    assert official_self_study_url(SimpleNamespace(get=lambda _: page), "https://university.example") == (
+        "https://university.example/reports/head.pdf")
+
+
+def test_pdf_measure_routing_retains_title_anchor_and_late_page():
+    blocks = ["Учебный университет. Отчёт за 2025 год", "Этапы развития цифровой среды",
+              "Контингент обучающихся по программам высшего образования составляет 1200 чел."]
+    text = "\n\n".join(blocks)
+    fragments = []
+    for index, block in enumerate(blocks):
+        start = text.index(block)
+        fragments.append({"fragment_id": f"f{index}", "start": start, "end": start + len(block),
+                          "page_number": (1, 4, 18)[index], "institution_anchor_id": "f0"})
+    doc = ContextDocument.model_validate({"source_id": "report", "url": "https://university.example/report.pdf",
+        "text": text, "retrieved_at": "2026-11-28T00:00:00Z", "file_sha256": "a" * 64, "fragments": fragments})
+
+    focused = select_report_measures(doc, [ContextField.STUDENTS])
+
+    assert focused.text == text and [f.page_number for f in focused.fragments] == [1, 18]
+    assert select_report_measures(doc, [ContextField.STUDENTS, ContextField.PROFILE]) is doc
 
 
 def test_official_program_reference_keeps_subdomain_and_literal_title_anchor():

@@ -37,7 +37,7 @@ from app.services.llm.card_intake import (
 from app.services.llm.collection_intent import named_update_query, refresh_scope, refresh_sources
 from app.services.llm.general_chat import answer_general, registry_answer
 from app.services.llm.models import Institution, MeetingContext, StrictModel
-from app.services.llm.official_sources import official_leadership_document, official_reference_document
+from app.services.llm.official_sources import official_leadership_document, official_reference_document, official_self_study_url
 from app.services.llm.partnership import (
     MATCH_CATALOG, REGIONAL_CASES, PartnershipMatch, event_is_upcoming, match_partnership, partnership_facts,
 )
@@ -74,6 +74,7 @@ def get_repository():
     return DemoRepository(sqlite_path)
 
 
+@lru_cache(maxsize=1)
 def get_pipeline():
     try:
         # 2000 для контекстных полей (GigaChat обрезает длинный JSON), 4000 для
@@ -129,7 +130,7 @@ def get_collector():
                                                         max_chars=settings.max_document_chars)
                 if official:
                     result.documents.insert(0, official)
-            existing = {document.url for document in result.documents}
+            existing = {document.url: document for document in result.documents}
             reference_documents = []
             for url in institution_urls:
                 document = official_reference_document(parser.client, url, website, name,
@@ -140,8 +141,21 @@ def get_collector():
                     reference_documents.extend(parser.collect_institution_documents([url]))
             if len(reference_documents) < len(institution_urls):
                 result.warnings.append("Часть справочных HTML-страниц не получена. Для PDF используйте отдельное поле отчёта.")
+            auto_report_url = None
             if include_institution and not leadership_url:
                 known_paths = {urlsplit(url).path.rstrip("/") for url in (*existing, *institution_urls)}
+                if not any(urlsplit(url).path.rstrip("/") == "/sveden/common" for url in institution_urls):
+                    common = official_reference_document(parser.client, urljoin(website, "/sveden/common/"),
+                                                         website, name, max_chars=settings.max_document_chars)
+                    if common is not None:
+                        reference_documents.append(common)
+                if not pdf_sources:
+                    auto_report_url = official_self_study_url(parser.client, website)
+            report_sources = pdf_sources or ([{"url": auto_report_url}] if auto_report_url else [])
+            pdf_documents, pdf_errors = parser.collect_pdf_documents(report_sources)
+            result.errors.extend(pdf_errors)
+            reference_documents.extend(pdf_documents)
+            if include_institution and not leadership_url:
                 for path in ("/sveden/education", "/sveden/objects"):
                     if path in known_paths:
                         continue
@@ -151,9 +165,6 @@ def get_collector():
                     )
                     if reference is not None:
                         reference_documents.append(reference)
-            pdf_documents, pdf_errors = parser.collect_pdf_documents(pdf_sources)
-            result.errors.extend(pdf_errors)
-            reference_documents.extend(pdf_documents)
             for document in pdf_documents:
                 if document.metadata.get("partial_pdf") == "true":
                     result.warnings.append(f"PDF: обработаны страницы {document.metadata['pdf_selected_pages']} из {document.metadata['pdf_page_count']}; полный отчёт не обработан.")

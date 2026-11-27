@@ -1,6 +1,49 @@
 """Readable output; source registry is built by code, not invented by the LLM."""
 
-from .models import DraftResult
+from datetime import datetime, timezone
+
+from .contacts import contact_statement
+from .context_render import context_statement, context_title
+from .leadership_render import leadership_statement
+from .models import DraftResult, GenerationRequest, GroundedStatement, RunInfo
+
+
+def render_accepted_facts_draft(request: GenerationRequest) -> DraftResult:
+    """Build a template draft from facts already validated by the drafting pipeline."""
+    sections = {}
+    for fact in request.facts:
+        context = context_title([fact])
+        contact = contact_statement([fact])
+        title = context or ("Контакты" if contact else "Руководство и биография")
+        text = context_statement([fact]) or contact or leadership_statement([fact]) or fact.value
+        sections.setdefault(title, []).append(GroundedStatement(text=text, fact_ids=[fact.fact_id]))
+
+    brief, slides, remaining_words = [], [], 800
+    for title, statements in sections.items():
+        summary = []
+        for statement in statements:
+            cost = len(statement.text.split())
+            if cost <= remaining_words:
+                summary.append(statement)
+                remaining_words -= cost
+        if summary:
+            brief.append({"title": title, "statements": summary})
+        slides.extend({"title": title, "theses": statements[start:start + 5]}
+                      for start in range(0, len(statements), 5))
+
+    if not brief:
+        brief.append({"title": "Справка к встрече", "statements": [{
+            "text": "Полные сведения приведены в тезисах и источниках.", "fact_ids": [request.facts[0].fact_id],
+        }]})
+    return DraftResult(
+        schema_version=request.schema_version, institution=request.institution, meeting=request.meeting,
+        run=RunInfo(provider="accepted-facts", model="template", prompt_version="accepted-facts-v1",
+                    created_at=datetime.now(timezone.utc)),
+        brief_sections=brief, slides=slides, questions=[],
+        sources={fact.fact_id: fact.evidence for fact in request.facts},
+        warnings=["Черновик собран по шаблону из принятых фактов после проверки чисел в ответе модели. "
+                  "Перед встречей проверьте материал."],
+    )
 
 
 def render_markdown(draft: DraftResult, facts=None) -> str:

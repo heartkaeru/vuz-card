@@ -98,11 +98,11 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
     left, right = [], []
     metrics = ("institution.students", "institution.budget_students", "institution.teaching_staff",
                "institution.dormitory_capacity", "institution.dormitory_occupancy")
-    for field in (*metrics, "institution.education_areas", "institution.education_levels",
-                  "institution.profile", "institution.type", "institution.location"):
+    for field in (*metrics, "institution.type", "institution.location", "institution.founded",
+                  "institution.education_levels", "institution.structure", "institution.education_areas", "institution.profile"):
         group = [f for f in institutional if f.field.value == field]
         target = left if field in metrics else right
-        limit = 1 if field in metrics else (5 if field == "institution.education_areas" else 1)
+        limit = {"institution.education_areas": 5, "institution.education_levels": 2}.get(field, 1)
         for f in group[:limit]:
             # Never truncate a population/year/unit qualifier to fit a number.
             target.append((CONTEXT_LABELS[field] + ": " + context_value(f), [f.fact_id], 7 if f.metric_context else 5))

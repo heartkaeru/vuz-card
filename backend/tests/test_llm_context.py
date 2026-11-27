@@ -247,6 +247,31 @@ def test_shared_menu_is_excluded_but_the_original_text_and_anchors_stay():
         assert document["text"].startswith(prefix)
 
 
+def test_shared_menu_keeps_leadership_and_contact_evidence():
+    menu = "Поступающим Студентам Расписание Личный кабинет " * 40
+    contact_heading = "Приёмная"
+    leader = "Иванов Иван Иванович — ректор"
+    repeated = menu + contact_heading + "\n" + leader + "\n"
+    documents = []
+    for key in ("one", "two"):
+        content = f"office-{key}@example.test"
+        documents.append({
+            "url": f"https://institution.example/{key}", "text": repeated + content,
+            "fragments": [
+                {"fragment_id": "menu", "start": 0, "end": len(menu)},
+                {"fragment_id": "heading", "start": len(menu), "end": len(menu + contact_heading)},
+                {"fragment_id": "leader", "start": len(menu + contact_heading) + 1, "end": len(repeated) - 1,
+                 "leadership_position": {"person_name": "Иванов Иван Иванович", "position": "ректор"}},
+                {"fragment_id": "contact", "start": len(repeated), "end": len(repeated + content),
+                 "contact_hints": [{"context_fragment_ids": ["heading"]}]},
+            ],
+        })
+    skip_shared_navigation(documents)
+    for document in documents:
+        assert [f["fragment_id"] for f in document["fragments"]] == ["heading", "leader", "contact"]
+        assert document["text"].startswith(repeated)
+
+
 def test_incompatible_values_flag_conflict_without_auto_selection():
     items = [proposal(), proposal(value="планирует подать заявку")]
     result = extract(items)

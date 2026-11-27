@@ -97,6 +97,36 @@ def test_ai_collection_crawls_the_official_site(monkeypatch):
     assert result.documents == snapshot.documents
 
 
+def test_collection_replaces_existing_document_with_an_explicit_official_reference(monkeypatch):
+    snapshot = example_card()
+    old = snapshot.documents[0]
+    reference = old.model_copy(update={"title": "Уточнённый официальный источник"})
+
+    class Parser:
+        def __init__(self, settings, client):
+            self.client = client
+
+        def parse(self, **kwargs):
+            return snapshot
+
+        def collect_pdf_documents(self, sources):
+            return [], []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("app.api.v1.ai.UniversityParser", Parser)
+    monkeypatch.setattr("app.api.v1.ai.official_leadership_document", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.api.v1.ai.official_reference_document",
+                        lambda client, url, *args, **kwargs: reference if url == old.url else None)
+    monkeypatch.setattr("app.api.v1.ai.official_self_study_url", lambda *args: None)
+    result = get_collector()("https://university.example", "Учебный пример",
+                             institution_urls=(old.url,), include_institution=True)
+
+    matches = [document for document in result.documents if document.url == old.url]
+    assert matches == [reference]
+
+
 def test_collection_reports_failure_when_every_record_is_rejected(api_client):
     client, repository, _ = api_client
     card = repository.create_card("Учебный университет", "", "https://university.example")
@@ -134,6 +164,42 @@ def test_collection_keeps_missing_document_diagnostic(api_client):
     job = repository.job(response.json()["job_id"])
     assert job["status"] == "failed" and job["result"]["code"] == "no_source_documents"
     assert "Страница недоступна" in job["message"]
+
+
+def test_export_uses_accepted_facts_after_draft_has_unsupported_number(api_client):
+    client, repository, _ = api_client
+    _, run = collected(client)
+    reviewed = client.post(f"/api/v1/ai/runs/{run['run_id']}/reviews", json=review_payload(run))
+    assert reviewed.status_code == 200
+    run = reviewed.json()
+    calls = []
+
+    class UnsupportedNumberProvider(DemoProvider):
+        async def complete(self, system, payload, schema):
+            calls.append(payload)
+            output = json.loads(await super().complete(system, payload, schema))
+            output["slides"][0]["theses"][0]["text"] += " Бюджет 987654321 рублей."
+            return json.dumps(output)
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(UnsupportedNumberProvider())
+    response = client.post(f"/api/v1/ai/runs/{run['run_id']}/materials", json={
+        "expected_revision": run["revision"], "request_key": "unsupported-number-fallback",
+        "presentation_variant": "compact",
+    })
+    assert response.status_code == 202, response.text
+    job = repository.job(response.json()["job_id"])
+    assert job["status"] == "completed", job
+    draft, _ = repository.material(job["result"]["material_id"])
+    assert len(calls) == 1
+    assert draft.run.provider == "accepted-facts" and not draft.questions
+    assert set(draft.sources) == {fact["fact_id"] for fact in run["facts"]}
+    brief = client.get(job["result"]["brief_url"]).text
+    assert "Иванов Иван Иванович" in brief and "987654321" not in brief
+    download = client.get(job["result"]["download_url"])
+    assert download.status_code == 200
+    presentation = Presentation(io.BytesIO(download.content))
+    text = "\n".join(shape.text for slide in presentation.slides for shape in slide.shapes if shape.has_text_frame)
+    assert "Иванов Иван Иванович" in text and "987654321" not in text
 
 
 def test_ui_api_full_path_and_pptx_download(api_client):

@@ -121,3 +121,29 @@ def test_banking_practice_needs_a_matching_spo_program():
     unrelated = fact("other", FactField.EDUCATION_AREAS, "Экономика предприятия")
     assert not asyncio.run(match_partnership(provider, [unrelated], MeetingContext()))
     assert banking not in provider.catalog
+
+
+@pytest.mark.parametrize("retry", [False, True])
+def test_invalid_proposal_does_not_discard_a_verified_match(retry):
+    program = fact("program", FactField.EDUCATION_AREAS, "Информатика и вычислительная техника")
+
+    class MixedProvider(MatchProvider):
+        calls = 0
+
+        async def complete(self, system, payload, schema):
+            self.calls += 1
+            valid, = json.loads(await super().complete(system, payload, schema))["matches"]
+            wrong_reference = {**valid, "basis_fact_ids": ["unknown"]}
+            wrong_shape = {**valid, "rationale": ""}
+            if self.calls == 1:
+                matches = [wrong_reference, wrong_shape]
+                if not retry:
+                    matches.append(valid)
+                return json.dumps({"matches": matches})
+            assert "Предыдущий ответ не прошёл проверку" in system
+            return json.dumps({"matches": [valid]})
+
+    provider = MixedProvider("sber-student-internships", [program.fact_id])
+    result, = asyncio.run(match_partnership(provider, [program], MeetingContext()))
+    assert result.basis_fact_ids == [program.fact_id]
+    assert provider.calls == (2 if retry else 1)

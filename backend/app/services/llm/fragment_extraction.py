@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from .changes import person_aliases, person_identity, person_name_parts
 from .client import LLMError
 from .contacts import CONTACT_FIELDS, reconcile_contact_candidates
 from .fragment_models import FragmentExtractionOutput, FragmentExtractionRequest
@@ -16,6 +17,7 @@ from .evidence import literal_value_in_text
 BIOGRAPHY_FIELDS = {FactField.EDUCATION, FactField.DEGREE, FactField.TITLE, FactField.CAREER,
                     FactField.BIRTH_DATE, FactField.BIRTH_PLACE, FactField.EXPERIENCE, FactField.HONORS,
                     FactField.INTERESTS, FactField.RESPONSIBILITIES, FactField.APPOINTED_AT}
+PERSON_IDENTITY_FIELDS = {FactField.NAME, FactField.POSITION}
 
 
 def normalized(value):
@@ -27,6 +29,36 @@ def value_key(field, value):
         digits = re.sub(r"\D", "", value)
         return "7" + digits[1:] if len(digits) == 11 and digits.startswith("8") else digits
     return normalized(value)
+
+
+def consolidate_person_facts(facts, aliases):
+    groups = {}
+    for fact in facts:
+        if (fact.field in PERSON_IDENTITY_FIELDS and fact.subject.person_name
+                and fact.validation_status == "passed" and not fact.issues):
+            identity = person_identity(fact, aliases)
+            value = normalized(fact.value) if fact.field == FactField.POSITION else None
+            key = (identity, fact.field, value)
+        else:
+            key = fact.fact_id
+        groups.setdefault(key, []).append(fact)
+
+    result = []
+    for group in groups.values():
+        if len(group) == 1:
+            result.append(group[0])
+            continue
+        representative = max(group, key=lambda fact: bool(person_name_parts(fact.subject.person_name)[1]))
+        evidence = {}
+        for fact in group:
+            for item in fact.evidence:
+                # A short spelling is not evidence for a full name with a patronymic.
+                if representative.field == FactField.NAME and not person_name_in_quote(representative.value, item.quote):
+                    continue
+                key = (item.source_id, item.fragment_id, item.start_offset, item.end_offset)
+                evidence.setdefault(key, item)
+        result.append(representative.model_copy(update={"evidence": list(evidence.values())}))
+    return result
 
 
 def batches(fragments, size):
@@ -217,6 +249,8 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest, *
                 subject_key = subject.model_dump_json() if name else None
                 key = (document.source_id, subject_key, proposal.field,
                        value_key(proposal.field, proposal.value), owner_key, tuple(sorted(set(issues))))
+                if proposal.field in PERSON_IDENTITY_FIELDS and not issues:
+                    key += (tuple(sorted(refs)),)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -330,13 +364,15 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest, *
                 evidence=fact.evidence, origin="subject_projection",
                 validation_status="passed", verification_status="pending",
             ))
+    aliases = person_aliases(f for f in facts if f.validation_status == "passed" and not f.issues)
+    facts = consolidate_person_facts(facts, aliases)
     # Different duties for one person are not automatically a conflict.
     heads = [f for f in facts if f.validation_status == "passed" and f.field == FactField.POSITION
              and not f.subject.department and re.fullmatch(
                  r"(?:ректор|директор|(?:и[.\s]*о[.\s]*|врио|исполняющий обязанности|"
                  r"временно исполняющий обязанности)\s*(?:ректор[а]?|директор[а]?))",
                  normalized(f.value))]
-    if len({normalized(f.subject.person_name) for f in heads}) > 1:
+    if len({person_identity(f, aliases) for f in heads}) > 1:
         for fact in heads:
             fact.verification_status = "conflict"
             fact.issues.append("multiple_head_candidates")

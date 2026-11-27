@@ -62,6 +62,44 @@ def test_server_builds_exact_quotes_with_offsets_and_hash():
     assert result.facts[1].field.value == "person.name"
 
 
+@pytest.mark.parametrize("other_head", [None, "Иванов Иван Петрович"])
+def test_leadership_aliases_merge_evidence_without_hiding_a_second_head(other_head):
+    req = request()
+    full_name = "Иванов Иван Иванович"
+    short_name = "Иван Иванов"
+    short_quote = f"Ректор {short_name}"
+    other_quote = f"Ректор {other_head}" if other_head else ""
+    text = f"{short_quote}\n\n{other_quote}"
+    fragments = [{"fragment_id": "short", "start": 0, "end": len(short_quote)}]
+    if other_head:
+        fragments.append({"fragment_id": "other", "start": len(short_quote) + 2, "end": len(text)})
+    data = req.model_dump(mode="json")
+    data["documents"].append({
+        **data["documents"][0], "source_id": "second", "url": "https://university.example/rector",
+        "text": text, "fragments": fragments,
+    })
+    second = [proposal(value="ректор", refs=["short"], person=short_name)]
+    if other_head:
+        second.append(proposal(refs=["other"], person=other_head))
+    provider = FixtureProvider([
+        {"facts": [proposal()], "gaps": []}, {"facts": second, "gaps": []},
+    ])
+    result = asyncio.run(AssistantPipeline(provider).extract_facts(FragmentExtractionRequest.model_validate(data)))
+    positions = [f for f in result.facts if f.field.value == "appointment.position"]
+    names = [f for f in result.facts if f.field.value == "person.name"]
+    if other_head:
+        # The two published patronymics make the short spelling ambiguous.
+        assert {fact.subject.person_name for fact in positions} == {short_name, full_name, other_head}
+        assert all(fact.issues == ["multiple_head_candidates"] for fact in positions)
+    else:
+        position, = positions
+        name, = names
+        assert position.verification_status == "pending"
+        assert position.subject.person_name == name.value == full_name
+        assert {item.source_id for item in position.evidence} == {"source", "second"}
+        assert {item.source_id for item in name.evidence} == {"source"}
+
+
 def test_model_cannot_supply_or_rewrite_a_quote():
     item = proposal()
     item["quote"] = "Иванов — директор другой организации"

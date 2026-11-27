@@ -1,5 +1,6 @@
 """Propose meeting opportunities from the reviewed card and a fixed catalog."""
 
+import json
 import re
 from collections.abc import Iterable
 from datetime import date, datetime, timezone
@@ -16,6 +17,7 @@ from .workflow_models import ResearchRun
 
 
 CatalogKind = Literal["sber_product", "external_course"]
+MAX_MATCHES = 3
 
 
 class MatchArgument(StrictModel):
@@ -226,7 +228,7 @@ class MatchProposal(MatchArgument):
 
 
 class MatchOutput(StrictModel):
-    matches: list[MatchProposal] = Field(max_length=3)
+    matches: list[MatchProposal] = Field(max_length=MAX_MATCHES)
 
 
 def partnership_facts(run: ResearchRun) -> list[Fact]:
@@ -294,7 +296,7 @@ async def match_partnership(
     }
     schema = MatchOutput.model_json_schema()
     schema["$defs"]["MatchProposal"]["properties"]["catalog_id"]["enum"] = list(catalog)
-    raw = await provider.complete(PROMPT, {
+    payload = {
         "meeting": meeting.model_dump(mode="json"),
         "catalog": [
             {**entry.model_dump(mode="json", exclude={"available_for_matching", "requires_operational_context"}),
@@ -314,36 +316,65 @@ async def match_partnership(
             "published_at": max((proof.published_at.isoformat() for proof in fact.evidence if proof.published_at),
                                 default=None),
         } for fact in facts],
-    }, schema)
+    }
+    raw = await provider.complete(PROMPT, payload, schema)
     try:
-        output = MatchOutput.model_validate_json(raw)
-    except ValidationError:
+        return _validate_matches(raw, catalog, facts, required_basis, operational_basis)
+    except LLMError as exc:
+        if str(exc) != "invalid_partnership_response":
+            raise
+    retry_prompt = PROMPT + (
+        "\nПредыдущий ответ не прошёл проверку. Сверь catalog_id, basis_fact_ids и regional_case_id "
+        "с входными данными. Пропусти предложение, если ему не хватает подтверждённых оснований."
+    )
+    raw = await provider.complete(retry_prompt, payload, schema)
+    return _validate_matches(raw, catalog, facts, required_basis, operational_basis)
+
+
+def _validate_matches(raw, catalog, facts, required_basis, operational_basis) -> list[PartnershipMatch]:
+    try:
+        output = json.loads(raw)
+    except json.JSONDecodeError:
         raise LLMError("invalid_partnership_response") from None
+    if (not isinstance(output, dict) or output.keys() != {"matches"}
+            or not isinstance(output["matches"], list) or len(output["matches"]) > MAX_MATCHES):
+        raise LLMError("invalid_partnership_response")
 
     fact_ids = {fact.fact_id for fact in facts}
     basis_ids = {fact.fact_id for fact in facts if fact.field not in CONTEXT_ONLY_FIELDS}
     seen = set()
     matches = []
-    for proposal in output.matches:
+    invalid = False
+    for item in output["matches"]:
+        try:
+            proposal = MatchProposal.model_validate(item)
+        except ValidationError:
+            invalid = True
+            continue
         catalog_id = proposal.catalog_id
         basis = set(proposal.basis_fact_ids)
-        if catalog_id not in catalog or catalog_id in seen or not basis <= fact_ids:
-            raise LLMError("invalid_partnership_response")
-        seen.add(catalog_id)
+        if catalog_id not in catalog or not basis <= fact_ids:
+            invalid = True
+            continue
+        if catalog_id in seen:
+            continue
         if not basis & basis_ids:
             continue
         entry = catalog[catalog_id]
         if catalog_id in required_basis and not basis & required_basis[catalog_id]:
-            raise LLMError("invalid_partnership_response")
+            invalid = True
+            continue
         case_ref = REGIONAL_CASES.get(proposal.regional_case_id)
         if proposal.regional_case_id and (case_ref is None or case_ref[0] != catalog_id):
-            raise LLMError("invalid_partnership_response")
+            invalid = True
+            continue
         rationale = proposal.rationale
         if entry.requires_operational_context:
-            initiatives = [operational_basis[catalog_id][fact_id] for fact_id in proposal.basis_fact_ids
-                           if fact_id in operational_basis[catalog_id]]
+            supported = operational_basis.get(catalog_id, {})
+            initiatives = [supported[fact_id] for fact_id in proposal.basis_fact_ids if fact_id in supported]
             if not initiatives:
-                raise LLMError("invalid_partnership_response")
+                invalid = True
+                continue
             planned = next((text for text in initiatives if PLANNED_INITIATIVE.search(normalized(text))), None)
             if planned:
                 rationale = planned if len(planned) <= 220 else "В источнике указаны планы вуза по этой инициативе."
@@ -354,4 +385,7 @@ async def match_partnership(
             product_name=entry.name, catalog_url=entry.url, kind=entry.kind,
             regional_case=case_ref[1] if case_ref else None, event_start=entry.event_start,
         ))
+        seen.add(catalog_id)
+    if invalid and not matches:
+        raise LLMError("invalid_partnership_response")
     return matches

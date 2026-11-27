@@ -1,9 +1,10 @@
 """Provider boundary: SDK details are confined to this file."""
 
+import asyncio
 import json
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +77,9 @@ class GigaChatProvider:
     def __init__(self, settings: GigaChatSettings):
         self.settings = settings
         self.model = settings.model
+        # Personal credentials allow one in-flight request. Wait between requests,
+        # so a chat or match can run while a collection session is still open.
+        self._request_lock = asyncio.Lock() if settings.scope == "GIGACHAT_API_PERS" else nullcontext()
         self._session: ContextVar[GigaChat | None] = ContextVar("gigachat_session", default=None)
 
     @asynccontextmanager
@@ -119,7 +123,7 @@ class GigaChatProvider:
 
     async def chat(self, messages: list[dict], **options):
         try:
-            async with self.session() as client:
+            async with self._request_lock, self.session() as client:
                 response = await client.achat({
                     "model": self.model,
                     "messages": messages,

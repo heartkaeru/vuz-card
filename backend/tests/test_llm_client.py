@@ -92,6 +92,54 @@ def test_collection_session_reuses_connection_and_closes_between_jobs(monkeypatc
     assert all(client.closed for client in clients)
 
 
+def test_personal_scope_lets_matching_run_between_collection_requests(monkeypatch):
+    calls = []
+
+    async def run():
+        first_started = asyncio.Event()
+        first_can_finish = asyncio.Event()
+
+        class FakeSDK:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def achat(self, payload):
+                task = payload["messages"][0]["content"]
+                calls.append(task)
+                if task == "leadership":
+                    first_started.set()
+                    await first_can_finish.wait()
+                return SimpleNamespace(choices=[SimpleNamespace(
+                    finish_reason="stop", message=SimpleNamespace(content="{}"))])
+
+        monkeypatch.setattr("app.services.llm.client.GigaChat", FakeSDK)
+        provider = GigaChatProvider(GigaChatSettings(
+            credentials="test-secret", model="test-model", scope="GIGACHAT_API_PERS",
+        ))
+
+        async def collect():
+            async with provider.session():
+                await provider.complete("leadership", {}, {})
+                await provider.complete("profile", {}, {})
+
+        collection = asyncio.create_task(collect())
+        await first_started.wait()
+        matching = asyncio.create_task(provider.complete("matching", {}, {}))
+        await asyncio.sleep(0)
+        assert calls == ["leadership"]
+        first_can_finish.set()
+        await asyncio.gather(collection, matching)
+
+    asyncio.run(run())
+    assert calls == ["leadership", "matching", "profile"]
+
+
 def test_sdk_error_does_not_expose_headers_or_body(monkeypatch):
     class FailingSDK:
         def __init__(self, **kwargs):
