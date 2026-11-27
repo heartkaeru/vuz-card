@@ -38,6 +38,10 @@ def test_vuzopedia_passport() -> None:
       </article>
     </body></html>
     """
+    programs = """<html><body><ul>
+      <li><a href="/p/1">09.03.01 Информатика и вычислительная техника</a></li>
+      <li><a href="/p/2">38.03.01 Экономика</a></li>
+    </ul></body></html>"""
     faculties = """
     <html><body>
       <div class="itemVuzTitle">Факультет тестовый</div>
@@ -48,14 +52,16 @@ def test_vuzopedia_passport() -> None:
         {
             "https://vuzopedia.ru/vuz/1": page,
             "https://vuzopedia.ru/vuz/1/podrazdeleniya": faculties,
+            "https://vuzopedia.ru/vuz/1/programs/bakispec": programs,
         }
     )
     passport = VuzopediaParser(fetcher).parse("https://vuzopedia.ru/vuz/1")
 
     assert passport.city == "Москва"
     assert passport.status == "государственный"
-    assert passport.budget_places == 100
-    assert passport.paid_places == 50
+    assert [item.code for item in passport.specialties] == ["09.03.01", "38.03.01"]
+    assert passport.specialties[0].level == "бакалавриат"
+    assert passport.specialties[0].group_name == "Информатика и вычислительная техника"
     assert passport.dormitory is True
     assert passport.military_department is True
     assert passport.faculties == ["Факультет тестовый", "Институт тестовый"]
@@ -82,6 +88,9 @@ def test_postupi_passport() -> None:
         {
             "https://msk.postupi.online/vuz/test/": page,
             "https://msk.postupi.online/vuz/test/podrazdeleniya/": faculties,
+            "https://msk.postupi.online/vuz/test/specialnosti/magistr/": (
+                "<table><tr><td>38.04.08</td><td>Финансы и кредит</td></tr></table>"
+            ),
         }
     )
     passport = PostupiParser(fetcher).parse(
@@ -90,9 +99,9 @@ def test_postupi_passport() -> None:
 
     assert passport.city == "Москва"
     assert passport.status == "государственный"
-    assert passport.avg_ege == 80.5
-    assert passport.budget_places == 100
-    assert passport.paid_places == 50
+    assert [(item.code, item.name, item.level) for item in passport.specialties] == [
+        ("38.04.08", "Финансы и кредит", "магистратура")
+    ]
     assert passport.dormitory is True
     assert passport.military_department is True
     assert passport.faculties == ["Факультет тестовый", "Институт тестовый"]

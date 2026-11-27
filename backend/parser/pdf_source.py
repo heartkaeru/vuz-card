@@ -7,6 +7,7 @@ import re
 from pypdf import PdfReader
 
 from .models import DocumentFragment, SourceDocument, utc_now
+from .utils import sentence_boundaries
 
 
 class PDFSourceError(ValueError):
@@ -17,11 +18,8 @@ def semantic_spans(text):
     for paragraph in re.finditer(r"\S[\s\S]*?(?=\n[ \t]*\n|\Z)", text):
         value = paragraph.group()
         boundaries = [paragraph.start()]
-        for match in re.finditer(r"(?<=[а-яёА-ЯЁA-Za-z)])\.\s+(?=[А-ЯЁA-Z])", value):
-            word = re.search(r"([\w]+)\.$", value[:match.start() + 1])
-            if word and len(word.group(1)) <= 3:
-                continue  # г., им., initials, etc. are not sentence boundaries.
-            boundaries.append(paragraph.start() + match.end())
+        # Сокращения (г., им., т.е.) и инициалы не являются границей предложения.
+        boundaries.extend(paragraph.start() + start for start in sentence_boundaries(value))
         boundaries.extend(paragraph.start() + match.end() for match in re.finditer(
             r"\n[ \t]*(?=[•–−]\s)", value))
         boundaries.append(paragraph.end())

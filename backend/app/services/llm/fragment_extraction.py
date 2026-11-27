@@ -42,7 +42,7 @@ def batches(fragments, size):
         yield batch
 
 
-async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
+async def extract_with_fragments(pipeline, request: FragmentExtractionRequest, *, progress_callback=None):
     from .pipeline import PROMPTS, complete_validated
 
     # Recheck offsets and scopes even if a caller mutated an existing Pydantic object.
@@ -100,7 +100,11 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                             code=str(exc) if isinstance(exc, LLMError)
                                             else "invalid_extraction_json"))
+                if progress_callback:
+                    progress_callback(chunk_id)
                 continue
+            if progress_callback:
+                progress_callback(chunk_id)
             gaps.extend(output.gaps)
             for proposal in output.facts:
                 issues, refs = [], list(dict.fromkeys(proposal.fragment_ids))

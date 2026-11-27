@@ -53,9 +53,6 @@ class UniversityInfo(BaseModel):
     region: Optional[str] = None
     city: Optional[str] = None
     status: Optional[str] = None
-    avg_ege: Optional[float] = None
-    budget_places: Optional[int] = None
-    paid_places: Optional[int] = None
     dormitory: Optional[bool] = None
     military_department: Optional[bool] = None
     faculties: list[str] = Field(default_factory=list)
@@ -270,17 +267,40 @@ class AggregatorPassport(BaseModel):
     name: str = ""
     city: Optional[str] = None
     status: Optional[str] = None
-    avg_ege: Optional[float] = None
-    budget_places: Optional[int] = None
-    paid_places: Optional[int] = None
     dormitory: Optional[bool] = None
     military_department: Optional[bool] = None
     faculties: list[str] = Field(default_factory=list)
+    specialties: list["Specialty"] = Field(default_factory=list)
 
     @field_validator("name", "city", "status", mode="before")
     @classmethod
     def _strip_passport(cls, value: object) -> object:
         return _strip_value(value)
+
+
+class Specialty(BaseModel):
+    """Специальность / направление подготовки: «09.03.01 Информатика и ВТ»."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    code: str
+    name: str
+    level: str = ""
+    group_code: str = ""
+    group_name: str = ""
+    source_url: str = ""
+
+
+class CooperationDirection(BaseModel):
+    """Направление сотрудничества Сбера с вузом и основания для него."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    area: str
+    programs_count: int = 0
+    has_existing_cooperation: bool = False
+    evidence: list[str] = Field(default_factory=list)
+    source_urls: list[str] = Field(default_factory=list)
 
 
 class NewsMention(BaseModel):
@@ -553,6 +573,8 @@ class UniversityData(BaseModel):
     passport: Optional[AggregatorPassport] = None
     passports: list[AggregatorPassport] = Field(default_factory=list)
     news_mentions: list[NewsMention] = Field(default_factory=list)
+    specialties: list[Specialty] = Field(default_factory=list)
+    cooperation_directions: list[CooperationDirection] = Field(default_factory=list)
     documents: list[SourceDocument] = Field(default_factory=list)
     conflicts: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
@@ -575,6 +597,8 @@ class UniversityData(BaseModel):
             "events": len(self.events),
             "passports": len(self.passports),
             "news_mentions": len(self.news_mentions),
+            "specialties": len(self.specialties),
+            "cooperation_directions": len(self.cooperation_directions),
             "documents": len(self.documents),
             "warnings": len(self.warnings),
             "errors": len(self.errors),
@@ -594,3 +618,62 @@ class UniversityData(BaseModel):
         payload["official_domain"] = self.university.official_domain
         payload["last_updated"] = _iso(self.last_updated)
         return payload
+
+
+AggregatorPassport.model_rebuild()
+
+
+def focus_document(document: SourceDocument, keep, min_chars: int = 1) -> SourceDocument | None:
+    """Копия документа только с нужными фрагментами (смещения пересчитаны).
+
+    ``keep(text)`` решает, нужен ли фрагмент. Сохраняются и фрагменты, на
+    которые ссылаются оставленные (заголовок-владелец контакта, якорь
+    биографии), чтобы документ оставался валидным для LLM-контрактов.
+    Возвращает ``None``, если сокращать нечего или остаётся слишком мало.
+    """
+
+    by_id = {fragment.fragment_id: fragment for fragment in document.fragments}
+    keep_ids = {
+        fragment.fragment_id
+        for fragment in document.fragments
+        if keep(document.text[fragment.start:fragment.end])
+    }
+    for fragment_id in list(keep_ids):
+        fragment = by_id[fragment_id]
+        for hint in fragment.contact_hints:
+            keep_ids.update(hint.context_fragment_ids)
+        if fragment.biography_subject:
+            keep_ids.add(fragment.biography_subject.anchor_fragment_id)
+        if fragment.institution_anchor_id:
+            keep_ids.add(fragment.institution_anchor_id)
+    keep_ids &= set(by_id)
+    if not keep_ids or len(keep_ids) == len(by_id):
+        return None
+    parts: list[str] = []
+    fragments: list[DocumentFragment] = []
+    offset = 0
+    for fragment in document.fragments:
+        if fragment.fragment_id not in keep_ids:
+            continue
+        piece = document.text[fragment.start:fragment.end]
+        if parts:
+            offset += 2
+        fragments.append(fragment.model_copy(update={"start": offset, "end": offset + len(piece)}))
+        parts.append(piece)
+        offset += len(piece)
+    text = "\n\n".join(parts)
+    if len(text) < min_chars:
+        return None
+    import hashlib
+
+    return document.model_copy(
+        update={
+            "text": text,
+            "fragments": fragments,
+            "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "metadata": {**document.metadata, "focused_from_chars": str(len(document.text))},
+            "blocks": [],
+            "main_html": "",
+        }
+    )
+

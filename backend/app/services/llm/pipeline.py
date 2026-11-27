@@ -120,9 +120,9 @@ async def complete_validated(provider, model, prompt, payload, schema, attempts:
             last_exc = exc
         except LLMError as exc:
             last_exc = validation_exc or exc
-            if attempt >= 1 and validation_exc is None:
-                # Транспортные/оборванные ответы второй раз обычно не лечатся.
-                break
+            # Транспортные и оборванные ответы нельзя исправить повторным
+            # запросом на «починку JSON»; SDK уже выполняет сетевые повторы.
+            break
     assert last_exc is not None
     raise last_exc
 
@@ -303,7 +303,8 @@ class AssistantPipeline:
         return RunInfo(provider=self.provider.name, model=self.provider.model,
                        prompt_version=prompt_version, created_at=datetime.now(timezone.utc))
 
-    async def extract_facts(self, request: ExtractionRequest | ContextExtractionRequest) -> ExtractionResult:
+    async def extract_facts(self, request: ExtractionRequest | ContextExtractionRequest,
+                            *, progress_callback=None) -> ExtractionResult:
         if request.schema_version == "0.3":
             from .context_extraction import extract_context
 
@@ -311,11 +312,34 @@ class AssistantPipeline:
             if fields and len(fields) > 3:
                 # Один запрос на 8 полей GigaChat обрывает; режем на группы.
                 results = []
-                for start in range(0, len(fields), 3):
-                    group = fields[start : start + 3]
+                groups = [fields[start : start + 3] for start in range(0, len(fields), 3)]
+                base_limit, extra = divmod(self.max_chunks, len(groups))
+                preferred_sections = {
+                    "project": {"projects", "research", "grants", "project_news", "news", "partnerships"},
+                    "event": {"events", "news"},
+                    "institution": {"about", "organization", "homepage"},
+                }
+                for index, group in enumerate(groups):
                     allowed = {field.value for field in group}
-                    part = request.model_copy(update={"fields": group})
-                    result = await extract_context(self, part)
+                    roots = {field.value.split(".", 1)[0] for field in group}
+                    preferred = set().union(*(preferred_sections.get(root, set()) for root in roots))
+                    documents = list(request.documents)
+                    if preferred:
+                        documents = [doc for _, doc in sorted(
+                            enumerate(documents),
+                            key=lambda pair: (
+                                0 if (pair[1].section or pair[1].category or "").lower() in preferred else 1,
+                                pair[0],
+                            ),
+                        )]
+                    part = request.model_copy(update={"fields": group, "documents": documents})
+                    chunk_limit = base_limit + (1 if index < extra else 0)
+                    if progress_callback is None:
+                        result = await extract_context(self, part, chunk_limit=chunk_limit)
+                    else:
+                        result = await extract_context(
+                            self, part, chunk_limit=chunk_limit, progress_callback=progress_callback
+                        )
                     result = result.model_copy(
                         update={
                             "facts": [
@@ -335,10 +359,14 @@ class AssistantPipeline:
                         "complete": all(result.complete for result in results),
                     }
                 )
-            return await extract_context(self, request)
+            if progress_callback is None:
+                return await extract_context(self, request)
+            return await extract_context(self, request, progress_callback=progress_callback)
         if request.schema_version == "0.2":
             from .fragment_extraction import extract_with_fragments
-            return await extract_with_fragments(self, request)
+            if progress_callback is None:
+                return await extract_with_fragments(self, request)
+            return await extract_with_fragments(self, request, progress_callback=progress_callback)
         prompt = (PROMPTS / "extract.txt").read_text(encoding="utf-8")
         facts, errors, gaps = [], [], []
         seen = set()
@@ -370,7 +398,11 @@ class AssistantPipeline:
                     errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                                 code=str(exc) if isinstance(exc, LLMError)
                                                 else "invalid_extraction_json"))
+                    if progress_callback:
+                        progress_callback(chunk_id)
                     continue
+                if progress_callback:
+                    progress_callback(chunk_id)
                 gaps.extend(output.gaps)
                 for proposal in output.facts:
                     issues, evidence = [], []

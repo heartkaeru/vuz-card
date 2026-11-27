@@ -20,6 +20,7 @@ import re
 from typing import Iterable, Literal
 
 from .models import Leadership, SourceDocument, UniversityData
+from .utils import looks_like_person_name
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -107,14 +108,16 @@ def to_llm_request(
     """
 
     if schema_version == "0.3":
-        documents = [
-            to_llm_document(
+        documents = []
+        for document in card.documents:
+            item = to_llm_document(
                 document,
                 include_fragments=True,
                 include_contact_hints=False,
             )
-            for document in card.documents
-        ]
+            item["section"] = document.section
+            item["category"] = document.category
+            documents.append(item)
     else:
         documents = to_llm_documents(card.documents)
 
@@ -134,23 +137,35 @@ def to_llm_request(
     return request
 
 
-def to_officials(card: UniversityData, *, institution_id: str) -> list[dict[str, object]]:
-    """Руководство в формате ``app.schemas.university.Official``."""
+def to_officials(
+    card: UniversityData, *, institution_id: str, require_person_name: bool = False
+) -> list[dict[str, object]]:
+    """Преобразует сведения о руководстве в API-представление.
+
+    ``require_person_name`` отбрасывает записи, где вместо ФИО оказался
+    абзац или заголовок страницы (для автоматического заполнения CRM).
+    """
 
     officials: list[dict[str, object]] = []
-    for index, leader in enumerate(card.leadership, start=1):
+    for leader in card.leadership:
+        if require_person_name and not looks_like_person_name(leader.full_name or ""):
+            continue
+        position = (leader.position or "").strip() or "Руководитель"
+        if len(position) > 160:
+            position = position[:157].rstrip() + "..."
         officials.append(
             {
-                "id": f"{institution_id}-official-{index}",
+                "id": f"{institution_id}-official-{len(officials) + 1}",
                 "fio": leader.full_name,
-                "position": leader.position,
+                "position": position,
                 "department": leader.unit,
-                "responsibilities": leader.source_quote,
+                "responsibilities": leader.source_quote or leader.bio,
                 "email": leader.reception_email or leader.email,
                 "phone": leader.reception_phone or leader.office_phone or leader.phone,
                 "photo_url": leader.photo_url,
                 "source_url": leader.source_url or None,
                 "status": "ai_draft",
+                "previous_value": None,
             }
         )
     return officials
@@ -163,7 +178,7 @@ def to_university_detail(
     university_id: int = 1,
     short_name: str | None = None,
 ) -> dict[str, object]:
-    """Карточка в формате ``app.schemas.university.UniversityDetail``."""
+    """Преобразует собранные сведения в API-представление карточки."""
 
     return {
         "id": university_id,
@@ -172,7 +187,7 @@ def to_university_detail(
         "inn": card.university.inn or "",
         "website": card.university.url,
         "region": card.university.region or "",
-        "city": "",
+        "city": card.university.city or "",
         "rector_fio": _rector_name(card.leadership),
         "version": 1,
         "updated_at": _iso(card.last_updated),
@@ -186,6 +201,8 @@ def to_university_detail(
 def _rector_name(leaders: Iterable[Leadership]) -> str | None:
     for leader in leaders:
         position = (leader.position or "").lower()
-        if re.search(r"\bректор(?:а|ом|у|е)?\b", position):
+        if re.search(r"\bректор(?:а|ом|у|е)?\b", position) or re.search(
+            r"исполняющ[а-яё]*\s+обязанност[а-яё]*\s+ректор|врио\s+ректор", position
+        ):
             return leader.full_name
     return None

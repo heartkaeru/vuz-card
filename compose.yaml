@@ -6,8 +6,13 @@ services:
     restart: unless-stopped
     env_file:
       - backend/.env
+    # Chromium запускается с --disable-dev-shm-usage, поэтому большой /dev/shm
+    # не нужен; 256 МБ — запас на случай, если флаг не сработает.
+    shm_size: "256m"
     environment:
       VUZ_HOST: 0.0.0.0
+      # Сервер 1 vCPU / 2 ГБ: одновременно не больше одного Chromium.
+      PARSER_MAX_BROWSERS: "1"
       VUZ_PORT: 8000
       VUZ_MVP_DB: /var/lib/vuz/registry.sqlite3
       VUZ_AUTH_DB: /var/lib/vuz/auth.sqlite3

@@ -79,7 +79,13 @@ def batches(document, size):
         yield batch
 
 
-async def extract_context(pipeline, request: ContextExtractionRequest):
+async def extract_context(
+    pipeline,
+    request: ContextExtractionRequest,
+    *,
+    progress_callback=None,
+    chunk_limit: int | None = None,
+):
     from .pipeline import PROMPTS, complete_validated
 
     request = ContextExtractionRequest.model_validate_json(request.model_dump_json())
@@ -96,6 +102,8 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                   "metric_context для численности остаётся обязательным.\n\n" + prompt)
     facts, gaps, errors, seen = [], [], [], set()
     processed = 0
+    chunk_limit = pipeline.max_chunks if chunk_limit is None else max(0, chunk_limit)
+    limit_reached = False
     for document in request.documents:
         fields = request.fields
         if document.fields is not None:
@@ -109,10 +117,11 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                             code="context_scope_too_large"))
                 continue
-            if processed >= pipeline.max_chunks:
+            if processed >= chunk_limit:
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                             code="context_batch_limit_reached"))
-                continue
+                limit_reached = True
+                break
             processed += 1
             fragments = {f.fragment_id: f for f in batch}
             text = {f.fragment_id: document.text[f.start:f.end] for f in batch}
@@ -152,7 +161,11 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                             code=str(exc) if isinstance(exc, LLMError)
                                             else "invalid_context_json"))
+                if progress_callback:
+                    progress_callback(chunk_id)
                 continue
+            if progress_callback:
+                progress_callback(chunk_id)
             gaps.extend(output.gaps)
             for item in output.facts:
                 issues = []
@@ -273,6 +286,8 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                     validation_status="failed" if issues else "passed",
                     verification_status="rejected" if issues else "pending", issues=issues,
                 ))
+        if limit_reached:
+            break
     # Multiple incompatible values in one source occurrence are review flags.
     groups = {}
     for fact in facts:
