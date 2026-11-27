@@ -11,7 +11,7 @@ from app.services.llm import AssistantPipeline
 from app.services.llm.client import FixtureProvider
 from app.services.llm.context_models import ContextExtractionRequest, ContextField
 from app.services.llm.fragment_models import parse_extraction_request
-from app.services.llm.models import EntitySubject, ExtractionRequest, GenerationRequest
+from app.services.llm.models import EntitySubject, ExtractionRequest, FactField, GenerationRequest
 from app.services.llm.pipeline import DraftValidationError
 from examples.llm.context_demo import example_request
 
@@ -282,6 +282,29 @@ def test_one_context_statement_cannot_mix_entities():
     output["slides"][0]["theses"][0] = {"text": "Сводные сведения.", "fact_ids": ["fact_2", "fact_6"]}
     with pytest.raises(DraftValidationError, match="context_statement_requires_single_entity"):
         asyncio.run(AssistantPipeline(FixtureProvider([output])).generate_materials(request))
+
+
+def test_one_institution_statement_can_use_facts_from_multiple_sources():
+    request = reviewed_request()
+    profile = request.facts[0]
+    program = profile.model_copy(update={
+        "fact_id": "another-official-source",
+        "subject": profile.subject.model_copy(update={"entity_id": "another-source-entity"}),
+        "field": FactField.EDUCATION_AREAS,
+        "value": "Прикладная информатика",
+    })
+    request.facts.append(program)
+    output = responses()[1]
+    output["slides"][0]["theses"][0] = {
+        "text": "Сведения об учреждении.", "fact_ids": ["fact_1", program.fact_id],
+    }
+
+    draft = asyncio.run(AssistantPipeline(FixtureProvider([output])).generate_materials(request))
+
+    statement = draft.slides[0].theses[0]
+    assert statement.fact_ids == [profile.fact_id, program.fact_id]
+    assert "Прикладная информатика" in statement.text
+    assert profile.value.rstrip(". ") in statement.text
 
 
 def test_brief_limit_also_applies_after_context_template_expansion():

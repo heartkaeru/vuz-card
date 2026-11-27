@@ -31,7 +31,13 @@ LABELS = {
 def context_statement(facts: list[Fact]) -> str | None:
     if not facts or not all(isinstance(f.subject, EntitySubject) for f in facts):
         return None
-    if len({(f.subject.entity_id, f.subject.entity_kind, f.subject.entity_name) for f in facts}) != 1:
+    # Institution facts from separate official pages can have different source entity IDs.
+    identities = {
+        (f.subject.entity_kind, f.subject.entity_name,
+         f.institution_id if f.subject.entity_kind == "institution" else f.subject.entity_id)
+        for f in facts
+    }
+    if len(identities) != 1:
         return None
     parts = [facts[0].subject.entity_name.rstrip(". ")]
     seen = set()
