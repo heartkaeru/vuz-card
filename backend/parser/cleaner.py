@@ -120,7 +120,17 @@ DEPARTMENT_MARKERS = (
     "лицей",
 )
 
-INLINE_SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "canvas", "img", "input", "button"}
+# Классы/id шапки, подвала и меню сайта: «header», «main-menu», «menu-popup»,
+# «top-nav», «site-footer». «page-header» с заголовком страницы не трогаем
+# (узел с <h1> не удаляется).
+MENU_CLASS_RE = re.compile(
+    r"^(?:(?:main|top|site|mega|header|primary|global|left|mobile)[-_]?(?:menu|nav|navigation)(?:[-_].*)?"
+    r"|menu[-_](?:popup|wrap|list|bar|main|top|mobile|container)(?:[-_].*)?"
+    r"|(?:site[-_])?(?:header|footer)"
+    r"|for[-_]main[-_]menu)$"
+)
+
+INLINE_SKIP_TAGS ={"script", "style", "noscript", "template", "svg", "canvas", "img", "input", "button"}
 
 LEADERSHIP_SCOPES = {"rucovodstvo", "rucovodstvoZam", "rucovodstvoFil"}
 LOCAL_PHONE_RE = re.compile(r"(?<![\d+])\d{3}[- ]\d{2}[- ]\d{2}(?!\d)")
@@ -374,6 +384,25 @@ class HTMLCleaner:
             if class_tokens & noise_words or node_id in noise_words:
                 if node.name not in {"main", "article", "body"}:
                     node.decompose()
+                continue
+            # Шапка и выпадающее меню сайта, свёрстанные div-ами без <nav>/<header>
+            # (у УрФУ: «section header», «main-menu», «menu-popup»). Без этого меню
+            # попадает в текст каждой страницы, а его ссылки — в «мероприятия».
+            if (
+                node.name not in {"main", "article", "body", "html"}
+                and (
+                    any(MENU_CLASS_RE.match(token) for token in class_tokens)
+                    or MENU_CLASS_RE.match(node_id)
+                )
+                and node.find(["main", "article"]) is None
+                and not self._is_page_title_header(node)
+                # Микроразметка «Сведений» (руководство, программы) — контент.
+                and node.select_one(
+                    '[itemprop~="rucovodstvo"], [itemprop~="rucovodstvoZam"], [itemprop~="fio"], '
+                    '[itemprop~="eduCode"], [itemprop~="teachingStaff"]'
+                ) is None
+            ):
+                node.decompose()
 
         for node in soup.select("[hidden], [aria-hidden='true']"):
             if node.name in {"main", "article", "body"}:
@@ -384,6 +413,20 @@ class HTMLCleaner:
             if len(node.get_text(" ", strip=True)) >= 30:
                 continue
             node.decompose()
+
+    @staticmethod
+    def _is_page_title_header(node: Tag) -> bool:
+        """Шапка страницы с заголовком (<h1> и немного текста), а не меню сайта.
+
+        В меню бывают свои <h1> («Студентам» у УрФУ), но меню — это много
+        текста, почти целиком из ссылок.
+        """
+
+        if node.find("h1") is None:
+            return False
+        text = node.get_text(" ", strip=True)
+        links = " ".join(link.get_text(" ", strip=True) for link in node.find_all("a"))
+        return len(text) < 600 and len(links) < 0.5 * max(1, len(text))
 
     def _select_main(self, soup: BeautifulSoup) -> Tag | None:
         # Селекторы заданы в порядке приоритета. Берём первый селектор,

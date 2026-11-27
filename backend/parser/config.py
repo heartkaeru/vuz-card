@@ -177,6 +177,8 @@ class SectionSpec:
     # «грант/проект/НИР». Полезно для обзорных страниц, где кроме проектов
     # публикуются обычные новости.
     require_keywords: bool = False
+    # Запасные адреса раздела, если основной оказался пустым.
+    alternatives: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -222,6 +224,13 @@ DEFAULT_ITEM_SELECTORS: tuple[str, ...] = (
     ".views-row",
     ".card",
     ".pk-event-card",
+    # Карточки мероприятий и новостей в распространённых вёрстках
+    # (у УрФУ — «event-item» в списке, догружаемом скриптом).
+    ".event-item",
+    ".events-item",
+    ".event",
+    ".news-list-item",
+    ".announce-item",
 )
 
 
@@ -362,7 +371,10 @@ UNIVERSITY_PROFILES: dict[str, UniversityProfile] = {
             ),
             SectionSpec(
                 name="projects",
-                url="https://urfu.ru/ru/partners/projects/",
+                # «Прорывные научные проекты» — мегапроекты университета.
+                # /ru/partners/projects/ — услуги и мероприятия для партнёров.
+                url="https://urfu.ru/ru/science/breakthrough/",
+                alternatives=("https://urfu.ru/ru/science/futurerussia/",),
                 item_selectors=DEFAULT_ITEM_SELECTORS,
             ),
             SectionSpec(

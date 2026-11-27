@@ -19,6 +19,7 @@ import sys
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from urllib.parse import urlencode, urljoin
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -103,6 +104,12 @@ from .utils import (
 LOGGER = logging.getLogger("parser")
 
 GENERIC_LINK_TITLES = {
+    "о проекте",
+    "узнать подробнее",
+    "узнать больше",
+    "перейти на сайт",
+    "сайт проекта",
+    "подробнее о проекте",
     "подробнее",
     "читать далее",
     "все новости",
@@ -202,6 +209,52 @@ SECTION_URL_PATTERNS: dict[str, tuple[str, ...]] = {
     "news": ("news", "novosti", "press"),
     "events": ("events", "anons", "announcements", "meropriyatiya", "afisha"),
 }
+
+# Атрибуты с адресом, откуда скрипт сайта догружает список карточек.
+AJAX_URL_ATTRS = ("data-url", "data-ajax-url", "data-load-url", "data-ajax", "data-src-url", "data-endpoint")
+AJAX_PAGE_SIZE_KEYS = {"rows", "limit", "count", "perpage", "pagesize", "size", "per_page"}
+AJAX_MIN_PAGE_SIZE = 6
+
+# Ссылки, которые ведут не на проекты вуза, а на услуги/мероприятия для партнёров.
+PROJECTS_PENALTY_RE = re.compile(r"партн[её]р|услуг|реклам|мероприят|partner|uslugi|events?\b", re.IGNORECASE)
+PROJECTS_BONUS_RE = re.compile(
+    r"приоритет[- ]?2030|priority|национальн[а-я]*\s+проект|нацпроект|научн[а-я]*\s+проект|"
+    r"стратегическ[а-я]*\s+проект|проекты\s+университета|исследовательск[а-я]*\s+проект|"
+    r"передов[а-я]*\s+инженерн|мегагрант|мегапроект|прорывн[а-я]*\s+(?:научн[а-я]*\s+)?проект|"
+    r"research[-_]projects|science/projects|breakthrough|np-projects",
+    re.IGNORECASE,
+)
+
+
+def _projects_link_bonus(text: str, url: str) -> int:
+    haystack = f"{text} {url}"
+    bonus = 0
+    if PROJECTS_BONUS_RE.search(haystack):
+        bonus += 15
+    if PROJECTS_PENALTY_RE.search(haystack):
+        bonus -= 12
+    return bonus
+
+
+def _is_detail_url(url: str, page_url: str) -> bool:
+    """Ссылка ведёт на отдельную публикацию, а не на другой раздел сайта.
+
+    Да: подстраница раздела (``/ru/events/16852/`` со страницы ``/ru/events/``),
+    адрес с числовым id или датой (``/news/1221851338.html``, ``/2026/11/…``).
+    Нет: ``/ru/students/``, ``/org/persons/``, ``strategy.hse.ru/``.
+    """
+
+    path = utils.urlparse(url or "").path.rstrip("/")
+    page_path = utils.urlparse(page_url or "").path.rstrip("/")
+    if not path or path == page_path:
+        return False
+    if page_path and path.startswith(page_path + "/"):
+        return True
+    segments = [segment for segment in path.split("/") if segment]
+    return len(segments) >= 2 and bool(
+        re.search(r"(?:^|/)\d{3,}(?:[./_-]|$)|/20\d{2}/\d{1,2}/|\d{4,}\.html?$", path)
+    )
+
 
 SBER_RE = re.compile(r"(?<![а-яёa-z])(?:сбер|sber)", re.IGNORECASE)
 PROJECT_TITLE_RE = re.compile(
@@ -1379,12 +1432,17 @@ class UniversityParser:
                 # Поощряем короткие «раздельные» URL и штрафуем новости.
                 if section_name not in {"news", "project_news"} and "/news" in absolute:
                     score -= 5
+                if section_name == "projects":
+                    score += _projects_link_bonus(text, absolute)
+                    if score <= 0:
+                        continue
                 candidates.append((score, absolute))
             if not candidates:
                 continue
             candidates.sort(key=lambda item: (-item[0], len(item[1])))
             # Лучший кандидат уже занят другим разделом — берём следующий.
-            url = next((candidate for _, candidate in candidates if candidate not in used_urls), "")
+            free = list(dict.fromkeys(candidate for _, candidate in candidates if candidate not in used_urls))
+            url = free[0] if free else ""
             if not url:
                 continue
             used_urls.add(url)
@@ -1392,6 +1450,7 @@ class UniversityParser:
                 SectionSpec(
                     name=section_name,
                     url=url,
+                    alternatives=tuple(free[1:3]) if section_name == "projects" else (),
                     item_selectors=DEFAULT_ITEM_SELECTORS
                     if section_name
                     in {
@@ -1498,7 +1557,127 @@ class UniversityParser:
             )
             if doc is None or soup is None:
                 continue
+            if section.name in self.LIST_SECTIONS:
+                doc, soup = self._expand_ajax_lists(page_url, doc, soup, section)
+            before = self._section_count(section.name)
             self._dispatch_section(section, doc, soup)
+            if (
+                section.name == "projects"
+                and self._section_count(section.name) == before
+                and section.alternatives
+            ):
+                # Страница оказалась не о проектах (например, услуги для
+                # партнёров): пробуем следующий найденный кандидат.
+                alternative = SectionSpec(
+                    name=section.name,
+                    url=section.alternatives[0],
+                    item_selectors=section.item_selectors,
+                    content_selectors=section.content_selectors,
+                    alternatives=section.alternatives[1:],
+                )
+                LOGGER.info("Проекты: %s пуст, пробую %s", section.url, alternative.url)
+                self._parse_section(alternative)
+
+    def _section_count(self, name: str) -> int:
+        return {
+            "projects": len(self._projects),
+            "events": len(self._events),
+            "news": len(self._news_mentions) + len(self._events) + len(self._projects),
+        }.get(name, 0)
+
+    def _expand_ajax_lists(
+        self, page_url: str, doc: SourceDocument, soup: BeautifulSoup, section: SectionSpec
+    ) -> tuple[SourceDocument, BeautifulSoup]:
+        """Догружает списки, которые сайт заполняет скриптом.
+
+        Пример — мероприятия УрФУ: в HTML только пустой
+        ``<div class="events-container" data-url="/get-events/ru/events/" data-rows="3" …>``,
+        а сами карточки браузер запрашивает с этого адреса, передавая
+        остальные ``data-*`` атрибуты как параметры. Делаем тот же запрос
+        обычным HTTP-клиентом (с robots.txt и лимитами) — без Chromium.
+        """
+
+        expanded = False
+        for node in soup.find_all(True):
+            if expanded and len(node.find_all(True)) > 0 and node.get("data-ajax-expanded"):
+                continue
+            if node.name in {"img", "script", "a", "iframe", "link", "source", "video", "audio", "form", "input"}:
+                continue
+            raw = next((node.get(attr) for attr in AJAX_URL_ATTRS if node.get(attr)), "")
+            if not isinstance(raw, str) or not raw.strip() or node.get("data-ajax-expanded"):
+                continue
+            if len(node.get_text(" ", strip=True)) > 40:
+                continue  # контейнер уже заполнен
+            url = urljoin(doc.url or page_url, raw.strip())
+            if not is_same_domain(url, page_url) or not is_probably_content_link(url):
+                continue
+            if re.search(r"/(?:fb|feedback|form|forms|search|login|auth|cart)(?:/|$)", utils.urlparse(url).path.lower()):
+                continue
+            params: dict[str, str] = {}
+            for attr, value in node.attrs.items():
+                if not attr.startswith("data-") or attr in AJAX_URL_ATTRS or not isinstance(value, str):
+                    continue
+                if len(value) > 300:
+                    continue
+                key = re.sub(r"-([a-z])", lambda m: m.group(1).upper(), attr[5:])
+                if key.lower() in AJAX_PAGE_SIZE_KEYS and value.isdigit():
+                    value = str(max(int(value), AJAX_MIN_PAGE_SIZE))
+                params[key] = value
+            full_url = url + (("&" if "?" in url else "?") + urlencode(params) if params else "")
+            result = self.client.get(full_url)
+            node["data-ajax-expanded"] = "1"
+            if result is None or not (result.text or "").strip():
+                continue
+            fragment_html = result.text
+            if "json" in (result.content_type or "").lower():
+                try:
+                    payload = json.loads(fragment_html)
+                except ValueError:
+                    continue
+                fragment_html = next(
+                    (str(payload.get(key)) for key in ("html", "content", "data", "items")
+                     if isinstance(payload, dict) and isinstance(payload.get(key), str)),
+                    "",
+                )
+            fragment = _make_soup(fragment_html)
+            body = fragment.body or fragment
+            children = [child for child in list(body.children)]
+            # Берём только списки публикаций: в ответе должно быть хотя бы две
+            # ссылки на отдельные страницы (форма обратной связи и прочие
+            # виджеты с data-url сюда не проходят).
+            detail_links = {
+                canonical_url(anchor.get("href", ""), url)
+                for anchor in body.find_all("a", href=True)
+                if _is_detail_url(canonical_url(anchor.get("href", ""), url), page_url)
+            }
+            if not children or len(detail_links) < 2:
+                continue
+            for child in children:
+                node.append(child.extract())
+            expanded = True
+            LOGGER.info("%s: догружен список со страницы %s (%s)", section.name, url, len(fragment_html))
+            if sum(1 for marker in soup.find_all(attrs={"data-ajax-expanded": "1"})) >= 3:
+                break
+        if not expanded:
+            return doc, soup
+
+        cleaner_obj = HTMLCleaner(
+            content_selectors=section.content_selectors
+            or (self.profile.content_selectors if self.profile else ())
+            or DEFAULT_CONTENT_SELECTORS,
+            max_chars=self.settings.max_document_chars,
+        )
+        new_doc = cleaner_obj.to_document(
+            str(soup), url=doc.url, section=section.name, content_type=doc.content_type
+        )
+        new_doc.retrieved_at = doc.retrieved_at
+        new_doc.metadata.update({key: value for key, value in doc.metadata.items() if key == "cache_status"})
+        new_doc.metadata["ajax_expanded"] = "true"
+        key = (canonical_url(page_url), section.name)
+        self._page_cache[key] = (new_doc, soup)
+        if key in self._documents:
+            self._documents[key] = new_doc
+        return new_doc, soup
 
     def _section_page_urls(self, section: SectionSpec) -> list[str]:
         urls = [section.url]
@@ -2396,6 +2575,12 @@ class UniversityParser:
                 for item in items
                 if _has_keyword(f"{item['title']} {item['description']}", PROJECT_TYPE_KEYWORDS)
             ]
+        if len(items) < 2:
+            # Страница-перечень: «заголовок проекта → руководитель, описание,
+            # ссылка „О проекте“» (у УрФУ — «Прорывные научные проекты»).
+            headed = self._items_from_headings(doc)
+            if len(headed) > len(items):
+                items = headed
         items = self._enrich_items_with_pages(items, "projects")
         for item in items:
             self._projects.append(self._project_from_item(item, doc))
@@ -2460,13 +2645,23 @@ class UniversityParser:
         self, doc: SourceDocument, soup: BeautifulSoup, section: SectionSpec
     ) -> None:
         items = self._extract_items(doc, soup, section)
-        items = self._enrich_items_with_pages(items, "events")
+        items = self._enrich_items_with_pages(items, "events", doc.url)
         # Some calendars expose event cards as links without an extractable date,
         # while the date and title are still present together in the document text.
         # Always consult this fallback; an undated link must not suppress dated
         # paragraph/list-item candidates from the same page.
-        items.extend(self._items_from_blocks(doc, EVENT_TYPE_KEYWORDS))
+        # Абзацы без собственной ссылки принимаются только с датой: иначе
+        # это пункты меню и описания разделов («Курсы подготовки к ОГЭ»).
+        items.extend(
+            item
+            for item in self._items_from_blocks(doc, EVENT_TYPE_KEYWORDS, prefer_future=True)
+            if item["date"]
+        )
         for item in items:
+            if not item["date"] and not _is_detail_url(item["url"], doc.url):
+                # Дату события без даты можно узнать только на странице события.
+                # Ссылка не на страницу события — это навигация, а не мероприятие.
+                continue
             text = f"{item['title']} {item['description']}"
             self._events.append(
                 Event(
@@ -2658,7 +2853,7 @@ class UniversityParser:
         )
 
     def _enrich_items_with_pages(
-        self, items: list[dict[str, str]], section_name: str
+        self, items: list[dict[str, str]], section_name: str, page_url: str = ""
     ) -> list[dict[str, str]]:
         """Догружает страницы публикаций: дата, текст и документ для LLM."""
 
@@ -2686,6 +2881,11 @@ class UniversityParser:
                 enriched.append(item)
                 continue
             if item_url.rstrip("/") == (self._base_url or "").rstrip("/"):
+                enriched.append(item)
+                continue
+            if is_event_section and page_url and not _is_detail_url(item_url, page_url):
+                # Не скачиваем разделы сайта («Студентам», список сотрудников)
+                # под видом страниц мероприятий: это не события и лишний текст для LLM.
                 enriched.append(item)
                 continue
             doc, detail_soup = self._get_page(item_url, section=section_name)
@@ -2817,18 +3017,25 @@ class UniversityParser:
             except Exception:  # noqa: BLE001
                 continue
 
+        prefer_future = section.name == "events"
         if containers:
             for container in containers:
-                item = self._item_from_container(container, doc.url)
+                item = self._item_from_container(container, doc.url, prefer_future=prefer_future)
                 if item:
                     items.append(item)
 
         # Если карточки не дали результата (или их слишком мало), пробуем
-        # ссылки напрямую — это устойчивее к незнакомой вёрстке.
+        # ссылки напрямую — это устойчивее к незнакомой вёрстке. Но ссылка
+        # должна вести на публикацию (подстраница раздела, id в адресе) или
+        # иметь дату/описание: иначе это пункт меню («Студентам», «Стипендии»).
         if len(items) < 3:
             for anchor in content_soup.select("a[href]"):
-                item = self._item_from_anchor(anchor, doc.url)
-                if item:
+                item = self._item_from_anchor(anchor, doc.url, prefer_future=prefer_future)
+                if item and (
+                    _is_detail_url(item["url"], doc.url)
+                    or item["date"]
+                    or len(item["description"]) >= 40
+                ):
                     items.append(item)
 
         # Дедупликация и ограничение.
@@ -2862,7 +3069,7 @@ class UniversityParser:
         return result[: self.settings.max_items_per_section]
 
     def _item_from_container(
-        self, container: Tag, page_url: str
+        self, container: Tag, page_url: str, *, prefer_future: bool = False
     ) -> dict[str, str] | None:
         heading = container.find(["h1", "h2", "h3", "h4", "h5"])
         anchors = [
@@ -2891,10 +3098,10 @@ class UniversityParser:
         url = canonical_url(anchor.get("href", ""), page_url)
         if not is_same_domain(url, page_url):
             return None
-        return self._build_item(title, container, url)
+        return self._build_item(title, container, url, prefer_future=prefer_future)
 
     def _item_from_anchor(
-        self, anchor: Tag, page_url: str
+        self, anchor: Tag, page_url: str, *, prefer_future: bool = False
     ) -> dict[str, str] | None:
         href = normalize_whitespace(anchor.get("href", ""))
         if not href or not is_probably_content_link(href):
@@ -2903,13 +3110,20 @@ class UniversityParser:
         if not is_same_domain(url, page_url):
             return None
         title = normalize_whitespace(anchor.get_text(" ", strip=True))
+        # Ссылка — часть заголовка («Доклад <a>Ксении Голубович …</a>»):
+        # название мероприятия — весь заголовок, а не только текст ссылки.
+        heading = anchor.find_parent(["h1", "h2", "h3", "h4", "h5"])
+        if heading is not None:
+            heading_text = normalize_whitespace(heading.get_text(" ", strip=True))
+            if len(title) <= len(heading_text) <= 300:
+                title = heading_text
         if len(title) < 8:
             return None
         container = self._closest_container(anchor)
-        return self._build_item(title, container or anchor, url)
+        return self._build_item(title, container or anchor, url, prefer_future=prefer_future)
 
     def _build_item(
-        self, title: str, container: Tag, url: str
+        self, title: str, container: Tag, url: str, *, prefer_future: bool = False
     ) -> dict[str, str] | None:
         title = _strip_leading_date(normalize_whitespace(title)).strip(" |•·—–-")
         if not title or title.lower() in GENERIC_LINK_TITLES:
@@ -2920,7 +3134,11 @@ class UniversityParser:
         if title in description:
             description = description.replace(title, " ", 1)
         # Убираем дату из описания, если она уже выделена.
-        date_value = self._event_start_date(container) or parse_date(container_text)
+        date_value = self._event_start_date(container) or parse_date(
+            container_text, prefer_future=prefer_future
+        )
+        if not date_value and prefer_future:
+            date_value = self._group_heading_date(container)
         if date_value:
             description = re.sub(
                 r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b", " ", description
@@ -2966,8 +3184,65 @@ class UniversityParser:
         return best
 
     @staticmethod
+    def _group_heading_date(container: Tag) -> str | None:
+        """Дата из заголовка группы: «Сегодня, 27 ноября» над карточками анонсов.
+
+        В календарях (ВШЭ) дата указана один раз над группой мероприятий
+        одного дня, а в самих карточках её нет.
+        """
+
+        branch = container
+        for ancestor in list(container.parents)[:5]:
+            if not isinstance(ancestor, Tag):
+                break
+            for child in ancestor.find_all(["h2", "h3", "h4"], recursive=False):
+                if child is branch or branch in child.parents:
+                    break
+                if branch.sourceline is not None and child.sourceline is not None and child.sourceline > branch.sourceline:
+                    break
+                parsed = parse_date(normalize_whitespace(child.get_text(" ", strip=True)), prefer_future=True)
+                if parsed:
+                    return parsed
+            branch = ancestor
+        return None
+
+    @staticmethod
+    def _items_from_headings(doc: SourceDocument) -> list[dict[str, str]]:
+        """Пункты «заголовок + текст под ним» со страницы-перечня проектов."""
+
+        blocks = [block for block in doc.blocks if block.text]
+        headings = [index for index, block in enumerate(blocks) if block.kind == "heading"]
+        items: list[dict[str, str]] = []
+        for position, index in enumerate(headings):
+            if position == 0 and index == 0:
+                continue  # заголовок самой страницы
+            title = normalize_whitespace(blocks[index].text)
+            if not 15 <= len(title) <= 300 or title.lower() in GENERIC_LINK_TITLES:
+                continue
+            end = headings[position + 1] if position + 1 < len(headings) else len(blocks)
+            body = [
+                blocks[i].text
+                for i in range(index + 1, end)
+                if blocks[i].text.lower() not in GENERIC_LINK_TITLES
+            ]
+            description = normalize_whitespace(" ".join(body))
+            # Под заголовком проекта — руководитель или описание; «Контакты
+            # служб» и прочие подвалы без текста отбрасываются.
+            if len(description) < 30 or _is_navigation_like(description):
+                continue
+            items.append(
+                {
+                    "title": title,
+                    "description": truncate_text(description, 600),
+                    "date": "",
+                    "url": doc.url,
+                }
+            )
+        return items[:30]
+
+    @staticmethod
     def _items_from_blocks(
-        doc: SourceDocument, keywords: dict[str, tuple[str, ...]]
+        doc: SourceDocument, keywords: dict[str, tuple[str, ...]], *, prefer_future: bool = False
     ) -> list[dict[str, str]]:
         """Fallback: абзацы с ключевыми словами проекта/мероприятия."""
 
@@ -2990,7 +3265,7 @@ class UniversityParser:
                 {
                     "title": title,
                     "description": truncate_text(text, 600),
-                    "date": parse_date(text) or "",
+                    "date": parse_date(text, prefer_future=prefer_future) or "",
                     "url": doc.url,
                 }
             )

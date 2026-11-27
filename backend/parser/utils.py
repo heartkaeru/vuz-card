@@ -183,6 +183,9 @@ JUNK_URL_PARTS = (
     "?s=",
     "/tag/",
     "/tags/",
+    "/keywords/",
+    "/category/",
+    "/categories/",
     "/author/",
     "/print",
     "/login",
@@ -809,7 +812,9 @@ def phone_key(value: str) -> str:
     return digits
 
 
-def parse_date(value: str, default_year: int | None = None) -> str | None:
+def parse_date(
+    value: str, default_year: int | None = None, *, prefer_future: bool = False
+) -> str | None:
     """Извлекает первую дату и приводит её к ISO ``YYYY-MM-DD``.
 
     Поддерживаются ISO, ``DD.MM.YYYY``, ``2 ноября 2026``, диапазоны
@@ -844,6 +849,21 @@ def parse_date(value: str, default_year: int | None = None) -> str | None:
         except ValueError:
             continue
 
+    if prefer_future:
+        # Анонсы: «1.12 18:10 Встреча клуба…» — день.месяц и время, без года.
+        short = re.search(r"(?<![\d.])(\d{1,2})\.(\d{1,2})(?![\d.])(?=\s*(?:[,–—-]\s*)?\d{1,2}:\d{2})", text)
+        if short:
+            day, month = int(short.group(1)), int(short.group(2))
+            today = datetime.now(timezone.utc).date()
+            try:
+                result = datetime(today.year, month, day).date()
+            except ValueError:
+                result = None
+            if result is not None:
+                if (today - result).days > 31:
+                    result = result.replace(year=today.year + 1)
+                return result.isoformat()
+
     match = DATE_RU_RE.search(text)
     if match:
         day = int(match.group(1))
@@ -869,8 +889,15 @@ def parse_date(value: str, default_year: int | None = None) -> str | None:
         except ValueError:
             return None
         if guessed_year:
-            # «15 декабря» в январской ленте — это прошлый год, а не будущее.
             today = datetime.now(timezone.utc).date()
+            if prefer_future and (today - result).days > 31:
+                # Анонс «19 января», опубликованный в ноябре, — следующий год.
+                try:
+                    result = result.replace(year=year + 1)
+                except ValueError:
+                    return None
+                return result.isoformat()
+            # «15 декабря» в январской ленте — это прошлый год, а не будущее.
             if (result - today).days > 31:
                 try:
                     result = result.replace(year=year - 1)
