@@ -44,7 +44,7 @@ def configure_logging() -> None:
     logging.getLogger("parser").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").disabled = True
     logging.getLogger("uvicorn.error").disabled = True
-    for name in ("httpx", "httpcore", "urllib3", "gigachat"):
+    for name in ("httpx", "httpcore", "urllib3", "gigachat", "pymorphy3"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
