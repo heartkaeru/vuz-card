@@ -122,7 +122,7 @@ class DemoRepository(LLMRepository):
             try:
                 (self.path.parent / "presentations" / f"{material_id}.{extension}").unlink(missing_ok=True)
             except OSError:
-                LOGGER.exception("Could not remove expired %s report %s", extension, material_id)
+                LOGGER.exception("Не удалось удалить устаревший отчёт: формат=%s, файл=%s", extension, material_id)
 
     def general_chat_history(self, user_id, limit):
         with closing(connect(self.path)) as db:
@@ -369,7 +369,7 @@ class DemoRepository(LLMRepository):
                 try:
                     (presentation_dir / f"{material_id}{suffix}").unlink(missing_ok=True)
                 except OSError:
-                    LOGGER.exception("Could not remove exported material for card %s", card_id)
+                    LOGGER.exception("Не удалось удалить экспортированный файл карточки: карточка=%s", card_id)
         return True
 
     def new_job(self, card_id, request_key, task_type, identity):
@@ -492,7 +492,7 @@ class DemoRepository(LLMRepository):
             try:
                 (folder / f"{old_material_id}.{extension}").unlink(missing_ok=True)
             except OSError:
-                LOGGER.exception("Could not remove expired %s report %s", extension, old_material_id)
+                LOGGER.exception("Не удалось удалить устаревший отчёт: формат=%s, файл=%s", extension, old_material_id)
         return {"saved": True, "report_id": report_id, "removed": len(removed)}
 
     def remove_material_from_reports(self, report_id):
@@ -511,5 +511,5 @@ class DemoRepository(LLMRepository):
         try:
             (self.path.parent / "presentations" / f"{material_id}.{format.lower()}").unlink(missing_ok=True)
         except OSError:
-            LOGGER.exception("Could not remove report %s", report_id)
+            LOGGER.exception("Не удалось удалить отчёт: идентификатор=%s", report_id)
         return {"deleted": True}

@@ -16,6 +16,7 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from logging_config import describe_error
 
 from .models import SourceDocument
 
@@ -345,4 +346,4 @@ class CrawlCache:
             temporary.replace(self.path)
             self._dirty = False
         except OSError as exc:  # pragma: no cover - диск/права
-            LOGGER.warning("Не удалось сохранить кэш %s: %s", self.path, exc)
+            LOGGER.warning("Не удалось сохранить кэш %s: %s", self.path, describe_error(exc))

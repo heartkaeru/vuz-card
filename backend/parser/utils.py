@@ -18,6 +18,7 @@ from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
 import requests
+from logging_config import RussianFormatter, describe_error
 
 from .config import Settings
 
@@ -275,7 +276,7 @@ def setup_logging(
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
-    formatter = logging.Formatter(
+    formatter = RussianFormatter(
         "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
@@ -1141,7 +1142,7 @@ class RobotsPolicy:
             else:
                 LOGGER.info("robots.txt не найден (%s), обход разрешён", robots_url)
         except requests.RequestException as exc:
-            LOGGER.warning("Не удалось получить robots.txt %s: %s", robots_url, exc)
+            LOGGER.warning("Не удалось получить robots.txt %s: %s", robots_url, describe_error(exc))
             parser = None
 
         with self._lock:
@@ -1203,7 +1204,7 @@ class HttpClient:
                 "Достигнут лимит запросов на обход "
                 f"({self.settings.max_total_requests}): {url}"
             )
-            LOGGER.warning(self.last_error)
+            LOGGER.warning(describe_error(self.last_error))
             return None
         if self.settings.respect_robots:
             allowed, crawl_delay = self.robots.can_fetch(url)
@@ -1211,7 +1212,7 @@ class HttpClient:
                 self.limiter.set_host_delay(urlparse(url).netloc.lower(), crawl_delay)
             if not allowed:
                 self.last_error = f"robots.txt запрещает обход: {url}"
-                LOGGER.warning(self.last_error)
+                LOGGER.warning(describe_error(self.last_error))
                 return None
 
         last_exception: Exception | None = None
@@ -1239,7 +1240,7 @@ class HttpClient:
                     if len(content) > self.settings.max_response_bytes:
                         self.last_error_code = "response_too_large"
                         self.last_error = f"Слишком большой ответ (лимит {self.settings.max_response_bytes} байт): {url}"
-                        LOGGER.warning(self.last_error)
+                        LOGGER.warning(describe_error(self.last_error))
                         return None
                 content = bytes(content)
                 elapsed = time.monotonic() - started
@@ -1267,7 +1268,7 @@ class HttpClient:
                     self.last_error = f"429 Too Many Requests: {url}"
                     LOGGER.warning(
                         "%s; пауза %.1f с (попытка %s/%s)",
-                        self.last_error,
+                        describe_error(self.last_error),
                         retry_after or self.settings.backoff_factor * attempt,
                         attempt,
                         self.settings.max_retries,
@@ -1283,12 +1284,12 @@ class HttpClient:
                         f"Доступ запрещён ({response.status_code}): {url}. "
                         "Обход блокировки не выполняется."
                     )
-                    LOGGER.error(self.last_error)
+                    LOGGER.error(describe_error(self.last_error))
                     return None
 
                 if response.status_code >= 500:
                     self.last_error = f"Ошибка сервера {response.status_code}: {url}"
-                    LOGGER.warning(self.last_error)
+                    LOGGER.warning(describe_error(self.last_error))
                     last_exception = FetchError(self.last_error)
                     host = urlparse(url).netloc.lower()
                     self.limiter.set_host_delay(
@@ -1307,7 +1308,7 @@ class HttpClient:
 
                 if response.status_code >= 400:
                     self.last_error = f"HTTP {response.status_code}: {url}"
-                    LOGGER.error(self.last_error)
+                    LOGGER.error(describe_error(self.last_error))
                     return None
 
                 if looks_like_block_page(body, response.status_code):
@@ -1315,7 +1316,7 @@ class HttpClient:
                         f"Похоже на капчу/заглушку Anti-DDoS: {url}. "
                         "Автоматический обход не выполняется."
                     )
-                    LOGGER.error(self.last_error)
+                    LOGGER.error(describe_error(self.last_error))
                     return None
 
                 return FetchResult(
@@ -1337,7 +1338,7 @@ class HttpClient:
                     attempt,
                     self.settings.max_retries,
                     url,
-                    exc,
+                    describe_error(exc),
                 )
                 if not is_last_attempt:
                     time.sleep(
@@ -1349,7 +1350,7 @@ class HttpClient:
 
         if last_exception:
             self.last_error = f"{type(last_exception).__name__}: {last_exception}"
-        LOGGER.error("Не удалось загрузить %s: %s", url, self.last_error)
+        LOGGER.error("Не удалось загрузить %s: %s", url, describe_error(self.last_error))
         return None
 
     def close(self) -> None:

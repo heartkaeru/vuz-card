@@ -1,6 +1,7 @@
 """Provider boundary: SDK details are confined to this file."""
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,6 +10,9 @@ from typing import Protocol
 import httpx
 from gigachat import GigaChat
 from gigachat.exceptions import GigaChatException, ResponseError
+from logging_config import describe_error
+
+LOGGER = logging.getLogger("gigachat")
 
 
 class LLMError(RuntimeError):
@@ -77,8 +81,10 @@ class GigaChatProvider:
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ], response_format={"type": "json_schema", "schema": schema, "strict": True})
         if choice.finish_reason != "stop":
+            LOGGER.error("Запрос к GigaChat завершился ошибкой: %s", describe_error("incomplete_model_response"))
             raise LLMError("incomplete_model_response")
         if not choice.message.content:
+            LOGGER.error("Запрос к GigaChat завершился ошибкой: %s", describe_error("empty_model_response"))
             raise LLMError("empty_model_response")
         return choice.message.content
 
@@ -102,19 +108,29 @@ class GigaChatProvider:
                     **options,
                 })
                 if not response.choices:
+                    LOGGER.error("Запрос к GigaChat завершился ошибкой: %s",
+                                 describe_error("incomplete_model_response"))
                     raise LLMError("incomplete_model_response")
                 return response.choices[0]
         except ResponseError as exc:
-            raise LLMError(f"gigachat_http_{exc.status_code}") from None
+            error = LLMError(f"gigachat_http_{exc.status_code}")
+            LOGGER.error("Запрос к GigaChat завершился ошибкой: %s", describe_error(error))
+            raise error from None
         except httpx.TimeoutException:
-            raise LLMError("gigachat_timeout") from None
+            error = LLMError("gigachat_timeout")
+            LOGGER.error("Запрос к GigaChat завершился ошибкой: %s", describe_error(error))
+            raise error from None
         except httpx.ConnectError as exc:
             code = ("gigachat_certificate_verification_failed"
                     if "CERTIFICATE_VERIFY_FAILED" in str(exc)
                     else "gigachat_connection_failed")
-            raise LLMError(code) from None
+            error = LLMError(code)
+            LOGGER.error("Запрос к GigaChat завершился ошибкой: %s", describe_error(error))
+            raise error from None
         except (GigaChatException, httpx.HTTPError):
-            raise LLMError("gigachat_request_failed") from None
+            error = LLMError("gigachat_request_failed")
+            LOGGER.error("Запрос к GigaChat завершился ошибкой: %s", describe_error(error))
+            raise error from None
 
 
 class FixtureProvider:

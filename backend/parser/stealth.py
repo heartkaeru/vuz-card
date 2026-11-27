@@ -18,6 +18,7 @@ import threading
 import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+from logging_config import describe_error
 
 LOGGER = logging.getLogger(__name__)
 
@@ -391,7 +392,7 @@ class StealthFetcher:
         except ValueError:
             return StealthResponse(url, 0, "", error="public_website_required")
         except Exception as exc:  # noqa: BLE001 - сеть/SSL/таймаут
-            LOGGER.warning("Не удалось загрузить %s: %s", url, exc)
+            LOGGER.warning("Не удалось загрузить %s: %s", url, describe_error(exc))
             if (
                 self.enable_playwright
                 and browser_allowed_for(url)

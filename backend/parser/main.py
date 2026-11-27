@@ -4307,9 +4307,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default="WARNING",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
-        help="Уровень логирования.",
+        help="Уровень журналирования (по умолчанию только предупреждения и ошибки).",
     )
     parser.add_argument("--log-file", type=Path, default=None, help="Файл журнала.")
     parser.add_argument(
@@ -4454,37 +4454,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             slug = profile_key or slugify(card.university.name)
             paths = save_results(card, settings.output_dir, slug=slug)
             summary = card.summary()
-            print("\n" + "=" * 70)
-            print(f"ВУЗ: {summary['university']}")
-            print(
-                f"Руководство: {summary['leadership']} | Контакты: {summary['contacts']} | "
-                f"Проекты: {summary['projects']} | Гранты: {summary['grants']} | "
-                f"Наука: {summary['research']} | Партнёры: {summary['partnerships']} | "
-                f"Достижения: {summary['achievements']} | Мероприятия: {summary['events']} | "
-                f"Документы: {summary['documents']} | Паспорт: {summary['passports']} | "
-                f"Новости о Сбере: {summary['news_mentions']}"
-            )
-            print(f"Предупреждения: {summary['warnings']} | Ошибки: {summary['errors']}")
-            print(f"Карточка: {paths['card']}")
-            print(f"Документы для LLM: {paths['documents']}")
-            if "changes" in paths:
-                print(f"Изменения: {paths['changes']}")
             if card.warnings:
-                print("Предупреждения:")
-                for warning in card.warnings[:10]:
-                    print(f"  - {warning}")
+                for warning in card.warnings:
+                    LOGGER.warning("%s: %s", summary["university"], warning)
             if card.errors:
                 failures += 1
-                print("Ошибки:")
-                for error in card.errors[:10]:
-                    print(f"  - {error}")
+                for error in card.errors:
+                    LOGGER.error("%s: %s", summary["university"], error)
+                LOGGER.error("Сбор завершён с ошибками: вуз=%s, ошибок=%s, предупреждений=%s",
+                             summary["university"], len(card.errors), len(card.warnings))
+            elif card.warnings:
+                LOGGER.warning("Сбор завершён с предупреждениями: вуз=%s, предупреждений=%s",
+                               summary["university"], len(card.warnings))
+            else:
+                print(
+                    "Всё успешно: вуз=%s, руководство=%s, контакты=%s, проекты=%s, мероприятия=%s, документов=%s"
+                    % (summary["university"], summary["leadership"], summary["contacts"],
+                       summary["projects"], summary["events"], summary["documents"]),
+                    flush=True,
+                )
         except KeyboardInterrupt:
             LOGGER.warning("Остановлено пользователем")
             return 130
         except Exception as exc:  # noqa: BLE001
             failures += 1
-            LOGGER.exception("Не удалось обработать %s: %s", profile_key or url, exc)
-            print(f"ОШИБКА: {profile_key or url}: {exc}", file=sys.stderr)
+            LOGGER.exception("Не удалось обработать вуз %s: %s", profile_key or url, exc)
         finally:
             university_parser.close()
 

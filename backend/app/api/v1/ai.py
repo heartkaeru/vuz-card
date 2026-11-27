@@ -22,6 +22,7 @@ from parser.config import SectionSpec, Settings, UniversityProfile
 from parser.main import UniversityParser
 from parser.public_http import public_site_session, public_url
 from parser.utils import HttpClient
+from logging_config import describe_error
 
 from app.services.llm.client import ConfigurationError, GigaChatProvider, GigaChatSettings, LLMError
 from app.auth.security import decode_access_token
@@ -243,6 +244,11 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
     try:
         repository.update_job(job_id, status="running", progress=15, message="Сбор официальных страниц руководства")
         parsed = await asyncio.to_thread(collector, card["website"], card["name"], leadership_url, **(source_options or {}))
+        for parse_warning in parsed.warnings:
+            LOGGER.warning("Предупреждение парсера: вуз=%s, причина=%s",
+                           card["name"], describe_error(parse_warning))
+        for parse_error in parsed.errors:
+            LOGGER.error("Ошибка парсера: вуз=%s, причина=%s", card["name"], describe_error(parse_error))
         no_documents = not parsed.documents
         documents_note = ""
         if no_documents:
@@ -257,9 +263,22 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
             "institution.education_areas", "institution.education_levels", "institution.students", "institution.structure",
             "project.name", "project.program", "project.role", "project.status", "project.period", "project.description",
             "event.name", "event.type", "event.date", "event.status", "event.description"])
+        stage_errors = list(research.errors)
+        for result in research.results.values():
+            stage_errors.extend(error.code for error in result.errors)
+        unique_errors = list(dict.fromkeys(stage_errors))
+        for error_code in unique_errors:
+            normalized_code = error_code.split(":", 1)[-1]
+            LOGGER.error(
+                "Ошибка извлечения фактов: вуз=%s, задание=%s, причина=%s",
+                card["name"], job_id, describe_error(normalized_code),
+            )
         if research.status == "failed" or not research.facts:
-            stage_errors = [error.code for result in research.results.values() for error in result.errors]
             if no_documents:
+                LOGGER.error(
+                    "Сбор остановлен: вуз=%s, задание=%s, причина=%s",
+                    card["name"], job_id, describe_error(documents_note),
+                )
                 repository.update_job(
                     job_id,
                     status="failed",
@@ -268,26 +287,38 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
                     result={"run_id": research.run_id, "code": "no_source_documents"},
                 )
                 return
+            LOGGER.error("Сбор не завершён: вуз=%s, задание=%s", card["name"], job_id)
             repository.update_job(job_id, status="failed", progress=100, message="Не удалось извлечь проверяемые факты",
-                                  result={"run_id": research.run_id, "code": stage_errors[0] if stage_errors else "no_valid_extraction"})
+                                  result={"run_id": research.run_id, "code": unique_errors[0].split(":", 1)[-1] if unique_errors else "no_valid_extraction"})
         else:
             message = "Сведения собраны. Проверьте изменения"
             if research.reconfirmed_facts:
                 message += f". Подтверждено повторным сбором: {len(research.reconfirmed_facts)}"
             if research.status == "partial":
                 message += ". Часть источников или сведений не обработана"
+                LOGGER.warning(
+                    "Сбор завершён частично: вуз=%s, задание=%s, найдено фактов=%s, ошибок=%s",
+                    card["name"], job_id, len(research.facts), len(unique_errors),
+                )
+            else:
+                LOGGER.info(
+                    "Всё успешно: вуз=%s, задание=%s, найдено фактов=%s",
+                    card["name"], job_id, len(research.facts),
+                )
             repository.update_job(job_id, status="completed", progress=100,
                                   message=message, result={"run_id": research.run_id})
     except asyncio.CancelledError:
+        LOGGER.warning("Сбор отменён: вуз=%s, задание=%s", card["name"], job_id)
         repository.update_job(job_id, status="failed", message="Сбор прерван", result={"code": "collection_cancelled"})
         raise
     except (WorkflowError, LLMError) as exc:
-        LOGGER.exception("Collection pipeline failed: card_id=%s job_id=%s", card["id"], job_id)
+        LOGGER.error("Сбой сбора: вуз=%s, задание=%s, причина=%s",
+                     card["name"], job_id, describe_error(exc))
         repository.update_job(job_id, status="failed", progress=100,
                               message="Сбор не завершился. Проверьте сайт и настройки ИИ.",
                               result={"code": str(exc)})
     except Exception:
-        LOGGER.exception("Collection job failed: card_id=%s job_id=%s", card["id"], job_id)
+        LOGGER.exception("Внутренняя ошибка сбора: вуз=%s, задание=%s", card["name"], job_id)
         repository.update_job(job_id, status="failed", message="Ошибка сбора. Повторите попытку или уточните адрес сайта",
                               result={"code": "collection_failed"})
 
@@ -312,14 +343,18 @@ async def material_job(repository, pipeline, run_id, payload, job_id):
             result={"material_id": material_id, "download_url": f"/api/v1/ai/materials/{material_id}/download",
                     "brief_url": f"/api/v1/ai/materials/{material_id}/brief",
                     "presentation_variant": payload.presentation_variant})
+        LOGGER.info("Всё успешно: презентация сформирована, задание=%s", job_id)
     except asyncio.CancelledError:
+        LOGGER.warning("Формирование материалов отменено: задание=%s", job_id)
         repository.update_job(job_id, status="failed", message="Формирование прервано", result={"code": "generation_cancelled"})
         raise
     except (WorkflowError, DraftValidationError, LLMError) as exc:
         message = ("Истёк срок проверки фактов. Повторно сверьте их перед экспортом."
                    if str(exc) == "facts_require_freshness_check" else "Материалы не сформированы")
+        LOGGER.error("Не удалось сформировать материалы: задание=%s, причина=%s", job_id, describe_error(exc))
         repository.update_job(job_id, status="failed", message=message, result={"code": str(exc)})
     except Exception:
+        LOGGER.exception("Внутренняя ошибка формирования материалов: задание=%s", job_id)
         repository.update_job(job_id, status="failed", message="Ошибка формирования презентации",
                               result={"code": "material_generation_failed"})
 
@@ -352,7 +387,7 @@ async def resolve_intake_website(name: str, website: str | None) -> str:
         try:
             candidate = await asyncio.to_thread(resolve_site, name)
         except Exception:
-            LOGGER.exception("Official-site discovery failed for institution: %s", name)
+            LOGGER.exception("Не удалось найти официальный сайт учреждения: %s", name)
             raise HTTPException(502, "official_site_discovery_failed") from None
     if not candidate:
         raise HTTPException(422, "official_site_not_found")

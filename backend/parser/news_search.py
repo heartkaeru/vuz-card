@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from xml.etree import ElementTree
 
 from bs4 import BeautifulSoup
+from logging_config import describe_error
 
 from .models import NewsMention
 from .stealth import StealthFetcher
@@ -315,7 +316,7 @@ class NewsSearch:
                 return self._bing(query)
             return self._duckduckgo(query)
         except Exception as exc:  # noqa: BLE001 - один движок не критичен
-            LOGGER.warning("Поиск %s не удался: %s", engine, exc)
+            LOGGER.warning("Поисковик %s не ответил: %s", engine, describe_error(exc))
             return []
         finally:
             _CURRENT_ENGINE.name = ""
@@ -383,9 +384,9 @@ class NewsSearch:
                     if hits or "<error" not in xml[:500]:
                         return hits
                 else:
-                    LOGGER.warning("Yandex Search API v2: HTTP %s %s", response.status_code, response.text[:200])
+                    LOGGER.warning("Поисковый API Яндекса вернул HTTP %s", response.status_code)
             except (requests.RequestException, ValueError) as exc:
-                LOGGER.warning("Yandex Search API v2 недоступен: %s", exc)
+                LOGGER.warning("Поисковый API Яндекса недоступен: %s", describe_error(exc))
         credentials = (
             {"folderid": folder, "apikey": api_key}
             if folder and api_key
@@ -401,10 +402,10 @@ class NewsSearch:
                 timeout=timeout,
             )
         except requests.RequestException as exc:
-            LOGGER.warning("Yandex Search API (XML) недоступен: %s", exc)
+            LOGGER.warning("XML-поиск Яндекса недоступен: %s", describe_error(exc))
             return []
         if response.status_code != 200 or "<error" in response.text[:500]:
-            LOGGER.warning("Yandex Search API (XML): %s", response.text[:200])
+            LOGGER.warning("XML-поиск Яндекса вернул ошибку HTTP %s", response.status_code)
             return []
         return self._parse_yandex_xml(response.text, query)
 
