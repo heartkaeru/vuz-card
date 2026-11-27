@@ -86,7 +86,11 @@ NO_BROWSER_HOSTS = (
     "yandex.ru", "yandex.com", "google.com", "googleapis.com", "bing.com",
     "duckduckgo.com", "yahoo.com", "wikipedia.org", "wikidata.org",
 )
-BROWSER_NETWORK_ERRORS = ("ssl", "tls", "certificate", "handshake", "connection reset", "http/2", "http2")
+BROWSER_NETWORK_ERRORS = (
+    "ssl", "tls", "certificate", "handshake", "connection reset",
+    "connection aborted", "remote disconnected", "remote end closed",
+    "http/2", "http2",
+)
 
 
 def browser_allowed_for(url: str) -> bool:

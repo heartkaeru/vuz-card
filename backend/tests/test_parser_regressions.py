@@ -775,3 +775,6 @@ def test_chromium_runs_only_when_needed(monkeypatch):
     assert not stealth.looks_like_spa_shell(short_page)
     assert not stealth.network_error_needs_browser("Connection timed out")
     assert stealth.network_error_needs_browser("SSL: CERTIFICATE_VERIFY_FAILED")
+    assert stealth.network_error_needs_browser(
+        "Connection aborted: RemoteDisconnected('Remote end closed connection without response')"
+    )

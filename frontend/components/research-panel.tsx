@@ -2,7 +2,7 @@
 
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, post, errorText, downloadFile, type ApiCard, type CardDetail, type Fact, type ResearchRun, type Job, type Material, type ChangeSet, type PptxPreviewData, type ResearchHistory, type SavedMaterial, type PartnershipMatch, type CardActionResult } from "@/lib/api";
+import { api, post, errorText, BACKEND_CONNECTION_ERROR, downloadFile, type ApiCard, type CardDetail, type Fact, type ResearchRun, type Job, type Material, type ChangeSet, type PptxPreviewData, type ResearchHistory, type SavedMaterial, type PartnershipMatch, type CardActionResult } from "@/lib/api";
 import { Icon } from "@/components/icon";
 import { PptxPreview } from "@/components/pptx-preview";
 import { type University } from "@/data/universities";
@@ -216,6 +216,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const acceptedFactGroups = acceptedFacts.length ? groupReviewFacts(acceptedFacts, university.name, identityFacts) : [];
 
   function load(detail: CardDetail) {
+    setError((current) => current === BACKEND_CONNECTION_ERROR ? "" : current);
     setCard(detail); setWebsite(detail.website); setRun(detail.run); onRunChange(detail.run); setJob(detail.job);
     if (detail.job?.identity?.presentation_variant) setPresentationVariant(detail.job.identity.presentation_variant);
     if (detail.job?.identity?.leadership_url) setLeadershipUrl(detail.job.identity.leadership_url);
@@ -239,6 +240,10 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     onShowFacts();
   }
 
+  function clearConnectionError() {
+    setError((current) => current === BACKEND_CONNECTION_ERROR ? "" : current);
+  }
+
   useEffect(() => {
     let active = true;
     if (university.backendId) api<CardDetail>(`/cards/${encodeURIComponent(university.backendId)}`)
@@ -254,10 +259,10 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     if (!run || !card) return;
     let active = true;
     api<ChangeSet>(`/runs/${run.run_id}/changes`)
-      .then((changes) => { if (active) setComparison(changes); })
+      .then((changes) => { if (active) { clearConnectionError(); setComparison(changes); } })
       .catch((failure) => { if (active) setError(errorText(failure)); });
     api<ResearchHistory[]>(`/cards/${encodeURIComponent(card.id)}/history`)
-      .then((runs) => { if (active) setHistory(runs); })
+      .then((runs) => { if (active) { clearConnectionError(); setHistory(runs); } })
       .catch((failure) => { if (active) setError(errorText(failure)); });
     return () => { active = false; };
   }, [run?.run_id, run?.revision, card?.id]);
@@ -269,10 +274,12 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       try {
         const next = await api<Job>(`/jobs/${job.job_id}`);
         if (!active) return;
+        clearConnectionError();
         setJob(next);
         if (next.status === "completed" || next.status === "failed") {
           if (next.result?.run_id) {
             const updatedRun = await api<ResearchRun>(`/runs/${next.result.run_id}`);
+            clearConnectionError();
             setRun(updatedRun); onRunChange(updatedRun);
           }
           if (next.result?.material_id) setMaterial(next.result as Material);

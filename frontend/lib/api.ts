@@ -131,8 +131,10 @@ const errors: Record<string, string> = {
   incomplete_model_response: "Ответ модели прерван. Часть сведений не обработана; повторите сбор или уточните источник.",
 };
 
+export const BACKEND_CONNECTION_ERROR = "Не удалось подключиться к серверу. Убедитесь, что backend запущен.";
+
 export function errorText(error: unknown) {
-  if (error instanceof TypeError && /fetch|network/i.test(error.message)) return "Не удалось подключиться к серверу. Убедитесь, что backend запущен.";
+  if (error instanceof TypeError && /fetch|network/i.test(error.message)) return BACKEND_CONNECTION_ERROR;
   return error instanceof Error ? errors[error.message] ?? (/^[a-z0-9_:.-]+$/.test(error.message)
     ? `Не удалось выполнить действие (код: ${error.message}).` : error.message) : "Не удалось выполнить действие.";
 }
