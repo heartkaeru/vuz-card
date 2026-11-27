@@ -1,0 +1,11 @@
+university,site,site_found,leadership,contacts,rector_found,rector_photo,parser_errors,parse_seconds,measured_at,branch
+МГУ,https://msu.ru/,yes,105,98,yes,yes,0,102,2026-11-26,feature/auto-site-create
+УрФУ,https://urfu.ru/,yes,289,300,yes,yes,0,82,2026-11-26,feature/auto-site-create
+ЮУрГУ,https://www.susu.ru/,yes,320,300,yes,yes,0,68,2026-11-26,feature/auto-site-create
+КФУ,https://kpfu.ru/,yes,218,208,yes,yes,0,162,2026-11-26,feature/auto-site-create
+СПбГУ,https://spbu.ru/,yes,91,79,yes,yes,0,97,2026-11-26,feature/auto-site-create
+НИУ ВШЭ,https://www.hse.ru/,yes,289,190,yes,yes,0,98,2026-11-26,feature/auto-site-create
+МФТИ,https://mipt.ru/,yes,410,300,yes,no,0,167,2026-11-26,feature/auto-site-create
+РУДН,https://www.rudn.ru/,yes,278,300,yes,yes,0,110,2026-11-26,feature/auto-site-create
+НГУ,https://www.nsu.ru/,yes,65,80,yes,no,0,80,2026-11-26,feature/auto-site-create
+МГТУ им. Баумана,https://bmstu.ru/,yes,24,2,yes,yes,0,263,2026-11-26,feature/auto-site-create
