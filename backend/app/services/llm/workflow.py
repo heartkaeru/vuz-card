@@ -71,10 +71,7 @@ class LLMWorkflow:
         card = UniversityData.model_validate(self.repository.source_card(run_id))
         results, errors, cancelled = {}, [], False
         processed_chunks = 0
-        total_chunks = self.pipeline.max_chunks * sum(
-            max(1, (len(context_fields) + 2) // 3) if mode == "0.3" and context_fields else 1
-            for mode in run.requested_modes
-        )
+        total_chunks = self.pipeline.max_chunks * len(run.requested_modes)
 
         def report_progress(mode, chunk_id):
             nonlocal processed_chunks

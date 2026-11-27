@@ -312,14 +312,34 @@ class AssistantPipeline:
             if fields and len(fields) > 3:
                 # Один запрос на 8 полей GigaChat обрывает; режем на группы.
                 results = []
-                for start in range(0, len(fields), 3):
-                    group = fields[start : start + 3]
+                groups = [fields[start : start + 3] for start in range(0, len(fields), 3)]
+                base_limit, extra = divmod(self.max_chunks, len(groups))
+                preferred_sections = {
+                    "project": {"projects", "research", "grants", "project_news", "news", "partnerships"},
+                    "event": {"events", "news"},
+                    "institution": {"about", "organization", "homepage"},
+                }
+                for index, group in enumerate(groups):
                     allowed = {field.value for field in group}
-                    part = request.model_copy(update={"fields": group})
+                    roots = {field.value.split(".", 1)[0] for field in group}
+                    preferred = set().union(*(preferred_sections.get(root, set()) for root in roots))
+                    documents = list(request.documents)
+                    if preferred:
+                        documents = [doc for _, doc in sorted(
+                            enumerate(documents),
+                            key=lambda pair: (
+                                0 if (pair[1].section or pair[1].category or "").lower() in preferred else 1,
+                                pair[0],
+                            ),
+                        )]
+                    part = request.model_copy(update={"fields": group, "documents": documents})
+                    chunk_limit = base_limit + (1 if index < extra else 0)
                     if progress_callback is None:
-                        result = await extract_context(self, part)
+                        result = await extract_context(self, part, chunk_limit=chunk_limit)
                     else:
-                        result = await extract_context(self, part, progress_callback=progress_callback)
+                        result = await extract_context(
+                            self, part, chunk_limit=chunk_limit, progress_callback=progress_callback
+                        )
                     result = result.model_copy(
                         update={
                             "facts": [
