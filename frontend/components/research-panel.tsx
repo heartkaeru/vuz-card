@@ -268,7 +268,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   }, [run?.run_id, run?.revision, card?.id]);
 
   useEffect(() => {
-    if (!job || !["queued", "running"].includes(job.status)) return;
+    if (!job || !["queued", "running", "cancelling"].includes(job.status)) return;
     let active = true;
     const timer = window.setInterval(async () => {
       try {
@@ -276,7 +276,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         if (!active) return;
         clearConnectionError();
         setJob(next);
-        if (next.status === "completed" || next.status === "failed") {
+        if (next.status === "completed" || next.status === "failed" || next.status === "cancelled") {
           if (next.result?.run_id) {
             const updatedRun = await api<ResearchRun>(`/runs/${next.result.run_id}`);
             clearConnectionError();
@@ -293,6 +293,17 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     }, 1400);
     return () => { active = false; window.clearInterval(timer); };
   }, [job?.job_id, job?.status]);
+
+  async function cancelCollection() {
+    if (!job || !card || !["queued", "running"].includes(job.status)) return;
+    try {
+      const cancelled = await api<Job>(`/jobs/${encodeURIComponent(job.job_id)}/cancel`, { method: "POST" });
+      setJob(cancelled);
+      setError("");
+    } catch (failure) {
+      setError(errorText(failure));
+    }
+  }
 
   async function refresh(): Promise<CardActionResult> {
     setSaving(true); setError(""); setMaterial(null);
@@ -585,7 +596,14 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         onChange={(event) => setRecheckConfirmed(event.target.checked)} /> Я повторно сверил(а) все указанные сведения, значения актуальны</label>
       </fieldset>
     </details>}
-    {job && <div className="research-progress" role="status"><span>{job.message}</span><progress value={job.progress} max={100} /></div>}
+    {job && <div className="research-progress" role="status">
+      <span>{job.message}</span><progress value={job.progress} max={100} />
+      {job.task_type === "collect" && ["queued", "running", "cancelling"].includes(job.status) &&
+        <button className="button button--soft research-cancel" type="button" disabled={job.status === "cancelling"}
+          onClick={() => { void cancelCollection(); }}>
+          {job.status === "cancelling" ? "Останавливаю…" : "Остановить сбор"}
+        </button>}
+    </div>}
     {error && <p className="research-error" role="alert">{error}</p>}
     {run && <p className="research-summary">В последнем сборе: {run.facts.length} кандидатов · на проверке: {pending} · в подтверждённой карточке: {accepted} · отклонено: {rejected} · {run.status === "partial" ? "сбор частичный" : run.status === "failed" ? "сбор не выполнен; прежние принятые сведения сохранены" : "результат сохранён"}.
       {!showFacts && <button className="text-button" type="button" onClick={onShowFacts}>Проверить факты</button>}</p>}

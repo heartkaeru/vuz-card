@@ -66,6 +66,7 @@ ERROR_MESSAGES = {
     "no_source_documents": "Парсер не получил документы для анализа.",
     "empty_source_documents": "Часть полученных страниц не содержит пригодного текста.",
     "collection_cancelled": "Сбор был прерван.",
+    "job_not_cancellable": "Это задание нельзя остановить этой кнопкой.",
     "generation_cancelled": "Формирование материалов было прервано.",
     "collection_failed": "Сбор завершился внутренней ошибкой.",
     "material_generation_failed": "Не удалось сформировать материалы.",

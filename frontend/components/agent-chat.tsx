@@ -48,7 +48,7 @@ function CollectionProgress({ jobId, initialText }: { jobId: string; initialText
         if (controller.signal.aborted) return;
         setJob(next);
         setUnavailable(false);
-        if (next.status === "queued" || next.status === "running") {
+        if (next.status === "queued" || next.status === "running" || next.status === "cancelling") {
           timer = window.setTimeout(poll, 1500);
         }
       } catch {
@@ -66,9 +66,26 @@ function CollectionProgress({ jobId, initialText }: { jobId: string; initialText
   }, [jobId]);
 
   const text = unavailable ? "Статус сбора временно недоступен. Проверяю ещё раз…"
+    : job?.status === "cancelling" ? "Останавливаю сбор данных…"
     : job?.status === "running" ? `Сбор выполняется · ${job.progress}%. ${job.message}`
-      : job?.status === "completed" || job?.status === "failed" ? job.message : initialText;
-  return <p role="status">{text}</p>;
+      : job?.status === "completed" || job?.status === "failed" || job?.status === "cancelled" ? job.message : initialText;
+  async function cancel() {
+    if (!job || !["queued", "running"].includes(job.status)) return;
+    try {
+      const next = await api<Job>(`/jobs/${encodeURIComponent(job.job_id)}/cancel`, { method: "POST" });
+      setJob(next);
+    } catch {
+      setUnavailable(true);
+    }
+  }
+
+  return <div role="status">
+    <p>{text}</p>
+    {job?.task_type === "collect" && ["queued", "running", "cancelling"].includes(job.status) &&
+      <button type="button" disabled={job.status === "cancelling"} onClick={() => { void cancel(); }}>
+        {job.status === "cancelling" ? "Останавливаю сбор…" : "Остановить сбор"}
+      </button>}
+  </div>;
 }
 
 export function AgentChat({ open, universityName, cardId, mode, onModeChange, onOpenCard, onClose, onAction,

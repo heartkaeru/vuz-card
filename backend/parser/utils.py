@@ -1079,7 +1079,7 @@ class RateLimiter:
         with self._lock:
             return max(self.base_delay, self._host_delays.get(host, 0.0))
 
-    def wait(self, url: str) -> None:
+    def wait(self, url: str, cancel_event: threading.Event | None = None) -> bool:
         host = urlparse(url).netloc.lower()
         with self._lock:
             delay = max(self.base_delay, self._host_delays.get(host, 0.0))
@@ -1090,8 +1090,17 @@ class RateLimiter:
             wait_for = delay - (now - last)
             if wait_for > 0:
                 LOGGER.debug("Пауза %.2f с перед запросом к %s", wait_for, host)
-                time.sleep(wait_for)
+        while wait_for > 0:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
+            pause = min(wait_for, 0.2)
+            time.sleep(pause)
+            wait_for -= pause
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        with self._lock:
             self._last_request[host] = time.monotonic()
+        return True
 
 
 class RobotsPolicy:
@@ -1174,6 +1183,7 @@ class HttpClient:
         self._requests_made = 0
         self.last_error: str = ""
         self.last_error_code: str = ""
+        self.cancel_event: threading.Event | None = None
 
     def _next_user_agent(self) -> str:
         with self._ua_lock:
@@ -1199,6 +1209,10 @@ class HttpClient:
 
         self.last_error = ""
         self.last_error_code = ""
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            self.last_error_code = "cancelled"
+            self.last_error = "Сбор остановлен пользователем"
+            return None
         if self._requests_made >= self.settings.max_total_requests:
             self.last_error = (
                 "Достигнут лимит запросов на обход "
@@ -1208,6 +1222,10 @@ class HttpClient:
             return None
         if self.settings.respect_robots:
             allowed, crawl_delay = self.robots.can_fetch(url)
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                self.last_error_code = "cancelled"
+                self.last_error = "Сбор остановлен пользователем"
+                return None
             if crawl_delay:
                 self.limiter.set_host_delay(urlparse(url).netloc.lower(), crawl_delay)
             if not allowed:
@@ -1217,13 +1235,20 @@ class HttpClient:
 
         last_exception: Exception | None = None
         for attempt in range(1, self.settings.max_retries + 1):
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                self.last_error_code = "cancelled"
+                self.last_error = "Сбор остановлен пользователем"
+                return None
             with self._counter_lock:
                 if self._requests_made >= self.settings.max_total_requests:
                     self.last_error = "Достигнут лимит запросов на обход"
                     break
                 self._requests_made += 1
             is_last_attempt = attempt >= self.settings.max_retries
-            self.limiter.wait(url)
+            if not self.limiter.wait(url, self.cancel_event):
+                self.last_error_code = "cancelled"
+                self.last_error = "Сбор остановлен пользователем"
+                return None
             started = time.monotonic()
             response = None
             try:
@@ -1234,8 +1259,16 @@ class HttpClient:
                     allow_redirects=True,
                     stream=True,
                 )
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    self.last_error_code = "cancelled"
+                    self.last_error = "Сбор остановлен пользователем"
+                    return None
                 content = bytearray()
                 for block in response.iter_content(chunk_size=65536):
+                    if self.cancel_event is not None and self.cancel_event.is_set():
+                        self.last_error_code = "cancelled"
+                        self.last_error = "Сбор остановлен пользователем"
+                        return None
                     content.extend(block)
                     if len(content) > self.settings.max_response_bytes:
                         self.last_error_code = "response_too_large"

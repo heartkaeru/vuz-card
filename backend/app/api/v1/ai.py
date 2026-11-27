@@ -5,6 +5,7 @@ import inspect
 import logging
 import os
 import jwt
+import threading
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -44,6 +45,8 @@ from app.services.pptx_preview import preview_presentation
 router = APIRouter(prefix="/ai", tags=["Демо 1: сбор, проверка и презентация"])
 chat_bearer = HTTPBearer(auto_error=False)
 LOGGER = logging.getLogger(__name__)
+ACTIVE_COLLECTIONS: dict[str, dict] = {}
+ACTIVE_COLLECTIONS_LOCK = threading.Lock()
 
 
 def chat_user(credentials: HTTPAuthorizationCredentials | None = Depends(chat_bearer)):
@@ -75,7 +78,7 @@ def get_pipeline():
 
 def get_collector():
     def collect(website, name, leadership_url=None, *, biography_url=None, institution_urls=(), pdf_sources=(),
-                include_institution=False, public_site_only=False):
+                include_institution=False, public_site_only=False, cancel_event=None):
         settings = Settings.from_env()
         # The LLM needs source documents from the official site, including on refresh.
         settings.max_retries = 1
@@ -97,6 +100,8 @@ def get_collector():
         settings.use_news_search = False
         client = HttpClient(settings, session=public_site_session()) if public_site_only else None
         parser = UniversityParser(settings, client=client)
+        if cancel_event is not None:
+            parser.client.cancel_event = cancel_event
         try:
             profile = (UniversityProfile(slug="selected-official-sources", name=name, url=website,
                        sections=(SectionSpec(name="leadership", url=leadership_url),) if leadership_url else (),
@@ -144,6 +149,25 @@ def get_collector():
         finally:
             parser.close()
     return collect
+
+
+def schedule_collection(background, repository, pipeline, collector, card, job_id,
+                        leadership_url=None, source_options=None):
+    cancel_event = threading.Event()
+    active = {"event": cancel_event, "task": None, "stage": "queued"}
+    with ACTIVE_COLLECTIONS_LOCK:
+        ACTIVE_COLLECTIONS[job_id] = active
+    background.add_task(
+        collect_job,
+        repository,
+        pipeline,
+        collector,
+        card,
+        job_id,
+        leadership_url,
+        source_options,
+        cancel_event=cancel_event,
+    )
 
 
 class CardCreate(StrictModel):
@@ -240,10 +264,27 @@ async def checked_async(operation):
         raise HTTPException(404 if code.endswith("not_found") else 409, code) from None
 
 
-async def collect_job(repository, pipeline, collector, card, job_id, leadership_url=None, source_options=None):
+async def collect_job(repository, pipeline, collector, card, job_id, leadership_url=None,
+                      source_options=None, *, cancel_event=None):
+    task = asyncio.current_task()
+    run_id = None
+    with ACTIVE_COLLECTIONS_LOCK:
+        active = ACTIVE_COLLECTIONS.get(job_id)
+        if active is not None:
+            active["task"] = task
+            active["stage"] = "parser"
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise asyncio.CancelledError
         repository.update_job(job_id, status="running", progress=15, message="Сбор официальных страниц руководства")
-        parsed = await asyncio.to_thread(collector, card["website"], card["name"], leadership_url, **(source_options or {}))
+        collector_options = dict(source_options or {})
+        if cancel_event is not None:
+            collector_options["cancel_event"] = cancel_event
+        parsed = await asyncio.to_thread(
+            collector, card["website"], card["name"], leadership_url, **collector_options
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise asyncio.CancelledError
         for parse_warning in parsed.warnings:
             LOGGER.warning("Предупреждение парсера: вуз=%s, причина=%s",
                            card["name"], describe_error(parse_warning))
@@ -257,7 +298,14 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
         workflow = LLMWorkflow(repository, pipeline)
         research, _ = workflow.create(Institution(id=card["id"], name=card["name"], card_version=card["version"]),
                                        parsed, job_id, modes=("0.2", "0.3") if (source_options or {}).get("include_institution") else ("0.2",))
+        run_id = research.run_id
         repository.set_latest(card["id"], research.run_id)
+        with ACTIVE_COLLECTIONS_LOCK:
+            active = ACTIVE_COLLECTIONS.get(job_id)
+            if active is not None:
+                active["stage"] = "llm"
+        if cancel_event is not None and cancel_event.is_set():
+            raise asyncio.CancelledError
         repository.update_job(job_id, progress=55, message="GigaChat обрабатывает первый запрос")
 
         def update_extraction_progress(mode, processed, total, _chunk_id):
@@ -323,8 +371,9 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
                                   message=message, result={"run_id": research.run_id})
     except asyncio.CancelledError:
         LOGGER.warning("Сбор отменён: вуз=%s, задание=%s", card["name"], job_id)
-        repository.update_job(job_id, status="failed", message="Сбор прерван", result={"code": "collection_cancelled"})
-        raise
+        repository.update_job(job_id, status="cancelled", progress=100,
+                              message="Сбор остановлен по запросу пользователя",
+                              result={"code": "collection_cancelled", **({"run_id": run_id} if run_id else {})})
     except (WorkflowError, LLMError) as exc:
         LOGGER.error("Сбой сбора: вуз=%s, задание=%s, причина=%s",
                      card["name"], job_id, describe_error(exc))
@@ -335,6 +384,10 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
         LOGGER.exception("Внутренняя ошибка сбора: вуз=%s, задание=%s", card["name"], job_id)
         repository.update_job(job_id, status="failed", message="Ошибка сбора. Повторите попытку или уточните адрес сайта",
                               result={"code": "collection_failed"})
+    finally:
+        with ACTIVE_COLLECTIONS_LOCK:
+            if ACTIVE_COLLECTIONS.get(job_id) is active:
+                ACTIVE_COLLECTIONS.pop(job_id, None)
 
 
 async def material_job(repository, pipeline, run_id, payload, job_id):
@@ -419,7 +472,7 @@ async def enqueue_card_intake(name, city, website, request_key, background, repo
         name, city, website, request_key, source_options,
     ))
     if created:
-        background.add_task(collect_job, repository, pipeline, collector, card, job["job_id"],
+        schedule_collection(background, repository, pipeline, collector, card, job["job_id"],
                             source_options=source_options)
     return {"card": card, "job": job}
 
@@ -545,7 +598,7 @@ async def chat_message(card_id: str, payload: ChatRequest, background: Backgroun
                 refresh=(key, identity),
             ))
             if created:
-                background.add_task(collect_job, repository, pipeline, collector, card, job["job_id"],
+                schedule_collection(background, repository, pipeline, collector, card, job["job_id"],
                                     source_options=source_options)
             return turn
     return checked(lambda: repository.save_chat_turn(
@@ -581,13 +634,50 @@ async def refresh(card_id: str, payload: RefreshRequest, background: BackgroundT
         {"version": payload.version, "leadership_url": str(payload.leadership_url) if payload.leadership_url else None,
          **source_options}))
     if created:
-        background.add_task(collect_job, repository, pipeline, collector, card, job["job_id"],
+        schedule_collection(background, repository, pipeline, collector, card, job["job_id"],
                             str(payload.leadership_url) if payload.leadership_url else None, source_options)
     return job
 
 
 @router.get("/jobs/{job_id}")
 def get_job(job_id: str, repository=Depends(get_repository)):
+    return checked(lambda: repository.job(job_id))
+
+
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, repository=Depends(get_repository)):
+    job = checked(lambda: repository.job(job_id))
+    if job.get("task_type") != "collect":
+        raise HTTPException(409, "job_not_cancellable")
+    if job.get("status") not in {"queued", "running", "cancelling"}:
+        return job
+
+    with ACTIVE_COLLECTIONS_LOCK:
+        active = ACTIVE_COLLECTIONS.get(job_id)
+        if active is not None:
+            active["event"].set()
+            task = active.get("task")
+            stage = active.get("stage")
+        else:
+            task = None
+            stage = None
+
+    if active is None:
+        current = checked(lambda: repository.job(job_id))
+        if current.get("status") not in {"queued", "running", "cancelling"}:
+            return current
+        repository.update_job(
+            job_id, status="cancelled", progress=100,
+            message="Сбор остановлен по запросу пользователя",
+            result={"code": "collection_cancelled"},
+        )
+    else:
+        repository.update_job(job_id, status="cancelling", message="Останавливаю сбор данных")
+        # During parsing the worker thread stops cooperatively at the next request
+        # boundary. During GigaChat extraction, cancel the async request directly.
+        if task is not None and stage == "llm":
+            task.cancel()
+    LOGGER.info("Пользователь остановил сбор: задание=%s", job_id)
     return checked(lambda: repository.job(job_id))
 
 

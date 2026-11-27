@@ -1035,6 +1035,10 @@ class UniversityParser:
         self._specialties: list[Specialty] = []
         self._rector_page_url: str = ""
 
+    def _cancelled(self) -> bool:
+        event = getattr(self.client, "cancel_event", None)
+        return event is not None and event.is_set()
+
     # ------------------------------------------------------------------
     # Публичный API
     # ------------------------------------------------------------------
@@ -1118,6 +1122,9 @@ class UniversityParser:
             # агрегаторов. Набор разделов сайта задаётся настройкой.
             allowed_sections = tuple(self.settings.sections)
         if not base_url:
+            if self._cancelled():
+                self._warnings.append("Сбор остановлен пользователем.")
+                return self._build_card(base_url, name, profile_obj, None)
             LOGGER.info("Официальный сайт не найден: только агрегаторы и поиск")
             self._enrich_aggregators(base_url)
             self._enrich_rector_from_web()
@@ -1164,6 +1171,8 @@ class UniversityParser:
             )
 
         for section in sections:
+            if self._cancelled():
+                break
             try:
                 self._parse_section(section)
             except Exception as exc:  # noqa: BLE001 - один раздел не должен ронять запуск
@@ -1171,11 +1180,14 @@ class UniversityParser:
                 LOGGER.exception(message)
                 self._errors.append(message)
 
-        self._enrich_rector_from_web()
-        self._enrich_rectorate()
-        self._enrich_bios()
-        self._enrich_aggregators(base_url)
-        self._enrich_news_mentions()
+        if self._cancelled():
+            self._warnings.append("Сбор остановлен пользователем.")
+        else:
+            self._enrich_rector_from_web()
+            self._enrich_rectorate()
+            self._enrich_bios()
+            self._enrich_aggregators(base_url)
+            self._enrich_news_mentions()
         card = self._build_card(base_url, name, profile_obj, homepage_doc)
         if self._cache is not None:
             self._cache.prune()
@@ -1477,6 +1489,8 @@ class UniversityParser:
 
     def _parse_section(self, section: SectionSpec) -> None:
         for page_url in self._section_page_urls(section):
+            if self._cancelled():
+                return
             doc, soup = self._get_page(
                 page_url,
                 section=section.name,
@@ -1559,7 +1573,7 @@ class UniversityParser:
         Ответы 4xx/5xx и заглушки антибота не считаются страницей.
         """
 
-        if not self.settings.enable_playwright:
+        if self._cancelled() or not self.settings.enable_playwright:
             return None
         error_code = getattr(self.client, "last_error_code", "")
         last_error = str(getattr(self.client, "last_error", "") or "")
@@ -1598,6 +1612,8 @@ class UniversityParser:
     def _fetch_raw(self, canonical: str, section: str) -> tuple[str, str, str, dict | None, bool] | None:
         """HTML страницы из кэша или сети: (html, final_url, content_type, запись кэша, свежая ли)."""
 
+        if self._cancelled():
+            return None
         if self._cache is not None:
             failure = self._cache.get_failure(canonical)
             if failure is not None and not self.settings.enable_playwright:
@@ -1701,6 +1717,8 @@ class UniversityParser:
         section: str,
         content_selectors: Sequence[str] = (),
     ) -> tuple[SourceDocument | None, BeautifulSoup | None]:
+        if self._cancelled():
+            return None, None
         canonical = canonical_url(url)
         key = (canonical, section)
         if key in self._page_cache:

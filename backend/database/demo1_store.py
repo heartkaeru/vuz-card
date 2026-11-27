@@ -294,7 +294,7 @@ class DemoRepository(LLMRepository):
                 return card, job, False
             for row in db.execute("SELECT payload FROM llm_job WHERE card_id=? ORDER BY rowid DESC", (card["id"],)):
                 job = json.loads(row[0])
-                if job["status"] in {"queued", "running"}:
+                if job["status"] in {"queued", "running", "cancelling"}:
                     if job["task_type"] != "collect":
                         raise WorkflowError("card_job_already_running")
                     return card, job, False
@@ -317,7 +317,7 @@ class DemoRepository(LLMRepository):
         with closing(connect(self.path)) as db:
             self._read_card(db, card_id)
             jobs = db.execute("SELECT payload FROM llm_job WHERE card_id=?", (card_id,)).fetchall()
-            if any(json.loads(row[0]).get("status") in {"queued", "running"} for row in jobs):
+            if any(json.loads(row[0]).get("status") in {"queued", "running", "cancelling"} for row in jobs):
                 raise WorkflowError("card_job_already_running")
 
     def delete_card(self, card_id, actor=""):
@@ -328,7 +328,7 @@ class DemoRepository(LLMRepository):
             if card is None:
                 return False
             jobs = db.execute("SELECT payload FROM llm_job WHERE card_id=?", (card_id,)).fetchall()
-            if any(json.loads(row[0]).get("status") in {"queued", "running"} for row in jobs):
+            if any(json.loads(row[0]).get("status") in {"queued", "running", "cancelling"} for row in jobs):
                 raise WorkflowError("card_job_already_running")
             material_ids = [row[0] for row in db.execute(
                 "SELECT m.material_id FROM llm_material m JOIN llm_run r ON r.run_id=m.run_id WHERE r.institution_id=?",
@@ -387,7 +387,7 @@ class DemoRepository(LLMRepository):
                 raise WorkflowError("request_key_payload_mismatch")
             return job, False
         for row in db.execute("SELECT payload FROM llm_job WHERE card_id=?", (card_id,)):
-            if json.loads(row[0])["status"] in {"queued", "running"}:
+            if json.loads(row[0])["status"] in {"queued", "running", "cancelling"}:
                 raise WorkflowError("card_job_already_running")
         job = {"job_id": f"job_{uuid4().hex}", "card_id": card_id, "task_type": task_type,
                "status": "queued", "progress": 0, "message": "Задание создано",
@@ -431,7 +431,7 @@ class DemoRepository(LLMRepository):
         with closing(connect(self.path)) as db, db:
             for row in db.execute("SELECT id,payload FROM llm_job").fetchall():
                 job = json.loads(row[1])
-                if job["status"] in {"queued", "running"}:
+                if job["status"] in {"queued", "running", "cancelling"}:
                     job.update(status="failed", message="Сервер перезапущен. Запустите задание заново",
                                result={"code": "server_restarted"})
                     db.execute("UPDATE llm_job SET payload=? WHERE id=?", (json.dumps(job, ensure_ascii=False), row[0]))
