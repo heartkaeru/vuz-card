@@ -81,6 +81,10 @@ def get_collector():
         settings.timeout = min(settings.timeout, 20)
         settings.max_total_requests = min(settings.max_total_requests, 30)
         settings.fetch_item_pages = False
+        # Догружаем только несколько страниц мероприятий: там часто указана
+        # дата начала события, которой нет в карточке списка.
+        settings.fetch_event_pages = True
+        settings.max_event_documents = min(settings.max_event_documents, 3)
         settings.max_bios = min(settings.max_bios, 3)
         # SvelteKit-сайты (например, МГУ) отдают пустой HTML без браузера.
         settings.enable_playwright = True

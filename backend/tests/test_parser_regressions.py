@@ -455,7 +455,69 @@ def test_default_sections_include_events_and_event_parser_uses_machine_and_text_
 
     events = {event.title: event.date for event in parser._events}
     assert events["Форум науки"] == "2026-12-10"
+    assert events["Лекция по робототехнике"] is None
     assert any("конференция" in title.lower() for title in events)
+
+
+def test_event_detail_start_date_is_used_instead_of_article_publication_date(monkeypatch):
+    detail_html = """<html><head>
+      <meta property="article:published_time" content="2026-01-01T09:00:00+03:00">
+      <script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"EducationEvent",
+         "name":"День открытых дверей","startDate":"2026-11-27T10:00:00+03:00"}
+      </script>
+      </head><body><h1>День открытых дверей</h1></body></html>"""
+    detail_doc = HTMLCleaner().to_document(
+        detail_html, url="https://vuz.ru/events/open-day/", section="events"
+    )
+    parser = UniversityParser(
+        Settings(
+            use_sqlite=False,
+            use_cache=False,
+            fetch_event_pages=True,
+            max_event_documents=1,
+        )
+    )
+    parser._base_url = "https://vuz.ru/"
+    monkeypatch.setattr(
+        parser,
+        "_get_page",
+        lambda *_args, **_kwargs: (detail_doc, _make_soup(detail_html)),
+    )
+    try:
+        event = {"title": "День открытых дверей", "description": "", "date": "", "url": detail_doc.url}
+        enriched = parser._enrich_items_with_pages([event], "events")
+        assert enriched[0]["date"] == "2026-11-27"
+
+        article_only_html = '<html><head><meta property="article:published_time" content="2026-01-01T09:00:00+03:00"></head><body><h1>Форум</h1></body></html>'
+        article_only_doc = HTMLCleaner().to_document(
+            article_only_html, url="https://vuz.ru/events/forum/", section="events"
+        )
+        monkeypatch.setattr(
+            parser,
+            "_get_page",
+            lambda *_args, **_kwargs: (article_only_doc, _make_soup(article_only_html)),
+        )
+        undated = {"title": "Форум", "description": "", "date": "", "url": article_only_doc.url}
+        enriched = parser._enrich_items_with_pages([undated], "events")
+        assert enriched[0]["date"] == ""
+    finally:
+        parser.close()
+
+
+def test_section_discovery_keeps_sveden_fallbacks_when_homepage_is_unavailable(monkeypatch):
+    parser = UniversityParser(Settings(use_sqlite=False, use_cache=False))
+    monkeypatch.setattr(parser, "_get_page", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(parser, "_sitemap_links", lambda _url: [])
+    try:
+        sections = parser._discover_sections("https://vuz.ru/", None)
+    finally:
+        parser.close()
+
+    by_name = {section.name: section.url for section in sections}
+    assert by_name["leadership"] == "https://vuz.ru/sveden/struct/"
+    assert by_name["programs"] == "https://vuz.ru/sveden/education/"
+    assert by_name["contacts"] == "https://vuz.ru/sveden/struct/"
 
 
 def test_two_word_rector_signature_and_same_person_merge():

@@ -79,6 +79,8 @@ class Settings:
     max_bios: int = 6
     fetch_item_pages: bool = True
     max_item_documents: int = 8
+    fetch_event_pages: bool = False
+    max_event_documents: int = 3
     news_window_months: int = 24
     use_aggregators: bool = True
     # Разделы официального сайта для сбора. Агрегаторы и поиск новостей
@@ -132,6 +134,8 @@ class Settings:
             max_bios=max(0, _env_int("PARSER_MAX_BIOS", 6)),
             fetch_item_pages=_env_bool("PARSER_ITEM_PAGES", True),
             max_item_documents=max(0, _env_int("PARSER_MAX_ITEM_DOCS", 8)),
+            fetch_event_pages=_env_bool("PARSER_EVENT_PAGES", False),
+            max_event_documents=max(0, _env_int("PARSER_MAX_EVENT_DOCS", 3)),
             news_window_months=max(0, _env_int("PARSER_NEWS_MONTHS", 24)),
             use_aggregators=_env_bool("PARSER_AGGREGATORS", True),
             sections=tuple(

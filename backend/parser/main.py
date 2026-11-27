@@ -1291,9 +1291,10 @@ class UniversityParser:
 
         if homepage_soup is None:
             homepage_doc, fetched_soup = self._get_page(base_url, section="homepage")
-            if homepage_doc is None:
-                return []
-            homepage_soup = fetched_soup
+            # A site can block its root page while exposing the standard
+            # education-organization pages. Keep discovering from an empty
+            # homepage and still add the /sveden/ fallback URLs below.
+            homepage_soup = fetched_soup if homepage_doc is not None else None
 
         soup = homepage_soup or _make_soup("")
         links: list[tuple[str, str, str]] = []
@@ -2415,10 +2416,9 @@ class UniversityParser:
                         query="",
                     )
                 )
-            if _has_keyword(item["title"], EVENT_TYPE_KEYWORDS) and item["date"]:
-                # Событие из новости засчитываем только при наличии даты
-                # и ключевого слова в заголовке: так отсекаются новости
-                # и навигационные ссылки, не являющиеся мероприятиями.
+            if _has_keyword(item["title"], EVENT_TYPE_KEYWORDS):
+                # Дата может быть опубликована только на странице события.
+                # Не теряем само событие, если список пока не дал дату.
                 self._events.append(
                     Event(
                         title=item["title"],
@@ -2449,10 +2449,6 @@ class UniversityParser:
         # paragraph/list-item candidates from the same page.
         items.extend(self._items_from_blocks(doc, EVENT_TYPE_KEYWORDS))
         for item in items:
-            if not item["date"]:
-                # Мероприятие без даты бесполезно для карточки и часто
-                # оказывается пунктом меню.
-                continue
             text = f"{item['title']} {item['description']}"
             self._events.append(
                 Event(
@@ -2648,16 +2644,23 @@ class UniversityParser:
     ) -> list[dict[str, str]]:
         """Догружает страницы публикаций: дата, текст и документ для LLM."""
 
+        is_event_section = section_name == "events"
         if (
-            not self.settings.fetch_item_pages
-            or self.settings.max_item_documents <= 0
+            not (self.settings.fetch_event_pages if is_event_section else self.settings.fetch_item_pages)
             or not self._base_url
         ):
+            return items
+        max_documents = (
+            self.settings.max_event_documents
+            if is_event_section
+            else self.settings.max_item_documents
+        )
+        if max_documents <= 0:
             return items
         enriched: list[dict[str, str]] = []
         fetched = 0
         for item in items:
-            if fetched >= self.settings.max_item_documents:
+            if fetched >= max_documents:
                 enriched.append(item)
                 continue
             item_url = item.get("url", "")
@@ -2667,14 +2670,20 @@ class UniversityParser:
             if item_url.rstrip("/") == (self._base_url or "").rstrip("/"):
                 enriched.append(item)
                 continue
-            doc, _ = self._get_page(item_url, section=section_name)
+            doc, detail_soup = self._get_page(item_url, section=section_name)
             fetched += 1
             if doc is None:
                 enriched.append(item)
                 continue
-            if not item.get("date") and doc.published_at:
+            if section_name == "events" and not item.get("date"):
+                # Event dates are distinct from article publication dates.
+                # Read the event's startDate from its structured markup.
+                event_date = self._event_start_date(detail_soup) if detail_soup else None
+                if event_date:
+                    item["date"] = event_date
+            elif not item.get("date") and doc.published_at:
                 item["date"] = doc.published_at.date().isoformat()
-            if not doc.published_at and item.get("date"):
+            if section_name != "events" and not doc.published_at and item.get("date"):
                 try:
                     doc.published_at = datetime.fromisoformat(item["date"]).replace(
                         tzinfo=timezone.utc
@@ -2689,6 +2698,58 @@ class UniversityParser:
                 item["description"] = truncate_text(doc.text, 700)
             enriched.append(item)
         return enriched
+
+    @staticmethod
+    def _event_start_date(soup: BeautifulSoup | Tag) -> str | None:
+        """Extract the event date, never the date the page/article was published."""
+
+        for node in soup.select('[itemprop~="startDate"], [data-start-date]'):
+            value = (
+                node.get("content")
+                or node.get("data-start-date")
+                or node.get("datetime")
+                or node.get_text(" ", strip=True)
+            )
+            parsed = parse_date(str(value or ""))
+            if parsed:
+                return parsed
+
+        def find_start_date(value: object) -> str | None:
+            if isinstance(value, list):
+                for child in value:
+                    parsed = find_start_date(child)
+                    if parsed:
+                        return parsed
+            elif isinstance(value, dict):
+                types = value.get("@type", [])
+                if isinstance(types, str):
+                    types = [types]
+                if any(str(item).lower().endswith("event") for item in types):
+                    parsed = parse_date(str(value.get("startDate") or ""))
+                    if parsed:
+                        return parsed
+                for child in value.values():
+                    if isinstance(child, (dict, list)):
+                        parsed = find_start_date(child)
+                        if parsed:
+                            return parsed
+            return None
+
+        for script in soup.select('script[type="application/ld+json"]'):
+            try:
+                payload = json.loads(script.string or script.get_text(" ", strip=True))
+            except (TypeError, ValueError):
+                continue
+            parsed = find_start_date(payload)
+            if parsed:
+                return parsed
+
+        for node in soup.select('time[datetime], [data-date]'):
+            value = node.get("datetime") or node.get("data-date") or node.get_text(" ", strip=True)
+            parsed = parse_date(str(value or ""))
+            if parsed:
+                return parsed
+        return None
 
     def _is_old_news(self, value: str) -> bool:
         if not value or self.settings.news_window_months <= 0:
@@ -2841,14 +2902,7 @@ class UniversityParser:
         if title in description:
             description = description.replace(title, " ", 1)
         # Убираем дату из описания, если она уже выделена.
-        date_value = next(
-            (
-                parsed
-                for time_node in container.select("time[datetime]")
-                if (parsed := parse_date(time_node.get("datetime", "")))
-            ),
-            None,
-        ) or parse_date(container_text)
+        date_value = self._event_start_date(container) or parse_date(container_text)
         if date_value:
             description = re.sub(
                 r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b", " ", description
