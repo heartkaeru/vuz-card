@@ -223,14 +223,20 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const partnershipKey = JSON.stringify([run?.run_id, run?.revision, meeting]);
   const partnershipMatches = partnership?.key === partnershipKey ? partnership.matches : null;
   const downloadUrl = material && `${material.download_url}${material.download_url.includes("?") ? "&" : "?"}format=${downloadFormat}`;
-  const retirementIds = [...new Set((currentComparison?.entries ?? []).filter((change) => change.retirement_trigger_ids.some((id) => selected.includes(id)))
-    .flatMap((change) => change.retirement_ids))];
   const reconfirmedIds = new Set(Object.values(run?.reconfirmed_facts ?? {}).flat());
   const candidates = run?.facts.filter((fact) => fact.origin !== "manual_edit" && !run.retired_fact_ids?.includes(fact.fact_id)
     && !reconfirmedIds.has(fact.fact_id)) ?? [];
+  const canAccept = (fact: Fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length;
+  const readyForReview = candidates.filter(canAccept);
+  // Замену прежних сведений считаем только по тем выбранным фактам, которые
+  // действительно уйдут на принятие: сервер требует ровно такой набор замен,
+  // и лишняя замена от непринимаемого факта отклоняет весь запрос.
+  const acceptableSelected = new Set(readyForReview.filter((fact) => selected.includes(fact.fact_id)).map((fact) => fact.fact_id));
+  const retirementIds = [...new Set((currentComparison?.entries ?? [])
+    .filter((change) => change.retirement_trigger_ids.some((id) => acceptableSelected.has(id)))
+    .flatMap((change) => change.retirement_ids))];
   const problematic = candidates.filter((fact) => fact.verification_status === "rejected"
     || fact.verification_status === "conflict" || fact.validation_status === "failed" || fact.issues.length > 0);
-  const blockedSelection = problematic.some((fact) => selected.includes(fact.fact_id));
   const rejected = run?.facts.filter((fact) => fact.verification_status === "rejected").length ?? 0;
   const reconfirmed = Object.keys(run?.reconfirmed_facts ?? {}).length;
   const issueCounts = new Map<string, number>();
@@ -380,27 +386,22 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
 
   async function review(decision: "accept" | "reject" | "revoke") {
     if (!run) return;
-    const decisionIds = decision === "revoke" ? selected.filter((id) => acceptedFactIds.has(id))
+    const fail = (message: string) => setReviewFeedback({ message, failed: true });
+    const chosenIds = decision === "revoke" ? selected.filter((id) => acceptedFactIds.has(id))
       : selected.filter((id) => candidateFactIds.has(id));
-    let validationError = "";
+    const decisionIds = decision === "accept" ? chosenIds.filter((id) => acceptableSelected.has(id)) : chosenIds;
+    const skipped = chosenIds.length - decisionIds.length;
     if (!decisionIds.length) {
-      validationError = decision === "revoke" ? "Выберите принятые сведения для отмены." : "Выберите сведения для решения.";
-    } else if (decision === "accept" && blockedSelection) {
-      validationError = "Снимите отметки со строк «Конфликт» и «Отклонено», прежде чем принимать выбранные сведения.";
-    } else if (!reviewer.trim() || !reason.trim()) {
-      validationError = "Укажите проверяющего и основание решения.";
-    } else if (decision === "accept" && !sourceChecked) {
-      validationError = "Подтвердите проверку по первоисточникам.";
-    } else if (decision === "accept" && !currentComparison) {
-      validationError = "Сравнение сведений пока недоступно. Дождитесь загрузки или обновите карточку.";
-    } else if (decision === "accept" && retirementIds.length > 0 && !replacePrevious) {
-      validationError = "Проверьте сравнение и подтвердите замену прежних сведений.";
-    }
-    if (validationError) {
-      setReviewFeedback({ message: validationError, failed: true });
+      fail(decision === "revoke" ? "Выберите принятые сведения для отмены."
+        : decision === "accept" && chosenIds.length ? "Среди выбранных нет сведений, которые можно принять: они требуют уточнения, уже подтверждены повторным сбором или изменены через чат."
+        : "Выберите сведения для решения.");
       return;
     }
-    setSaving(true); setReviewFeedback(null);
+    if (!reviewer.trim() || !reason.trim()) { fail("Укажите проверяющего и основание решения."); return; }
+    if (decision === "accept" && !sourceChecked) { fail("Поставьте отметку «Я проверил(а) выбранные факты по действующим первоисточникам»."); return; }
+    if (decision === "accept" && !currentComparison) { fail("Сравнение с прежними сведениями ещё загружается. Подождите несколько секунд и нажмите ещё раз."); return; }
+    if (decision === "accept" && retirementIds.length > 0 && !replacePrevious) { fail("Подтвердите замену прежних сведений отметкой выше."); return; }
+    setSaving(true); setError(""); setReviewFeedback(null);
     try {
       const updated = await post<ResearchRun>(`/runs/${run.run_id}/reviews`, {
         expected_revision: run.revision, reviewer,
@@ -408,9 +409,11 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         retirements: decision === "accept" ? retirementIds.map((fact_id) => ({fact_id, source_checked: sourceChecked, reason})) : [],
       });
       setRun(updated); onRunChange(updated); setMaterial(null);
-      const labels = { accept: "Принято", reject: "Отклонено", revoke: "Отменено принятие" };
-      setReviewFeedback({ message: `${labels[decision]} сведений: ${decisionIds.length}.`, failed: false });
-    } catch (failure) { setReviewFeedback({ message: errorText(failure), failed: true }); }
+      const done = decision === "accept" ? "Принято" : decision === "reject" ? "Отклонено" : "Отменено принятие";
+      const message = `${done}: ${decisionIds.length}.` + (skipped > 0
+        ? ` Пропущено ${skipped}: такие сведения нельзя принять без уточнения.` : "");
+      setReviewFeedback({ message, failed: false });
+    } catch (failure) { fail(errorText(failure)); }
     finally { setSaving(false); }
   }
 
@@ -748,20 +751,17 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
       <details className="research-tools">
         <summary>Быстрые действия со списком</summary>
         <div className="research-tool-actions">
-      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(run.facts
-        .filter((fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length)
+      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(readyForReview
         .map((fact) => fact.fact_id))}>Выбрать все факты без ошибок</button>
-      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(run.facts
-        .filter((fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length
-          && fact.subject.person_name && !fact.subject.department)
+      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(readyForReview
+        .filter((fact) => fact.subject.person_name && !fact.subject.department)
         .map((fact) => fact.fact_id))}>Выбрать сотрудников без привязки к подразделению</button>
       {rejected > 0 && <button className="text-button" type="button" onClick={() => setShowRejected((value) => !value)}>
         {showRejected ? "Скрыть" : "Показать"} автоматически отклонённые факты ({rejected})</button>}
         </div>
       </details>
       <div className="research-facts">{visibleFactGroups.map((group) => {
-        const eligibleIds = group.facts.filter((fact) => fact.verification_status === "pending"
-          && fact.validation_status === "passed" && !fact.issues.length).map((fact) => fact.fact_id);
+        const eligibleIds = group.facts.filter(canAccept).map((fact) => fact.fact_id);
         const groupSelected = eligibleIds.length > 0 && eligibleIds.every((id) => selected.includes(id));
         const pendingCount = group.facts.filter((fact) => fact.verification_status === "pending").length;
         return <article className={`research-fact${group.facts.length > 1 ? " research-fact--group" : ""}`} key={group.key}>

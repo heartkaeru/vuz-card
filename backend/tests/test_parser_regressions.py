@@ -17,7 +17,8 @@ from parser.aggregators import (
 )
 from parser.biography import split_biography_sentences
 from parser.cleaner import HTMLCleaner
-from parser.config import PROJECT_TYPE_KEYWORDS, SectionSpec, Settings
+from parser.config import PROJECT_TYPE_KEYWORDS, UNIVERSITY_PROFILES, SectionSpec, Settings
+from parser import main as parser_main
 from parser.main import (
     SvedenTableParser,
     UniversityParser,
@@ -830,3 +831,144 @@ def test_chromium_runs_only_when_needed(monkeypatch):
     assert stealth.network_error_needs_browser(
         "Connection aborted: RemoteDisconnected('Remote end closed connection without response')"
     )
+
+
+# --- проекты и мероприятия: меню, догружаемые списки, ссылки-навигация ----------
+def test_site_menu_blocks_are_removed_from_page_text():
+    html = """<html><body>
+      <div class="section header"><h1 class="title">Студентам</h1><ul class="main-menu">
+        <li><a href="/ru/students/">Студентам</a></li><li><a href="/ru/students/study/scholarships/">Стипендии</a></li>
+        <li><a href="/ru/school/">Курсы подготовки к ОГЭ</a></li></ul>
+        <div class="menu-popup"><a href="/ru/about/">Об университете</a> <a href="/ru/science/">Наука</a></div></div>
+      <div class="section"><h2>Мероприятия</h2><p>Список мероприятий университета на ближайший месяц.</p></div>
+    </body></html>"""
+    doc = HTMLCleaner().to_document(html, url="https://vuz.ru/ru/events/", section="events")
+    assert "Стипендии" not in doc.text and "Курсы подготовки" not in doc.text
+    assert "Список мероприятий университета" in doc.text
+
+
+def test_ajax_event_list_is_loaded_without_browser():
+    from parser.utils import FetchResult
+
+    page = """<html><body><main><h1>Мероприятия</h1>
+      <div class="section events-section"><div class="events-container" data-url="/get-events/ru/events/"
+           data-rows="3" data-offset="0" data-sort-by-pubdate="0"></div></div>
+      <div data-url="/fb/ru/events/"></div>
+    </main></body></html>"""
+    fragment = """<div class="col widget-event event-item"><p class="title"><a href="/ru/events/16852/">Премия «Инновационная звезда»</a></p>
+        <p class="date">16 декабря</p><div class="snippet">Церемония награждения</div></div>
+      <div class="col widget-event event-item"><p class="title"><a href="/ru/events/16774/">Изумруд.Студент</a></p>
+        <p class="date">19 января</p><div class="snippet">Успей подать заявку</div></div>"""
+    requested: list[str] = []
+
+    class Client:
+        last_error = ""
+        last_error_code = ""
+
+        def get(self, url):
+            requested.append(url)
+            return FetchResult(url=url, final_url=url, status_code=200, text=fragment, content_type="text/html")
+
+        def close(self):
+            pass
+
+    parser = UniversityParser(Settings(use_sqlite=False, use_cache=False, enable_playwright=False,
+                                       fetch_event_pages=False), client=Client())
+    parser._base_url = "https://vuz.ru/"
+    doc = HTMLCleaner().to_document(page, url="https://vuz.ru/ru/events/", section="events")
+    soup = _make_soup(page)
+    section = SectionSpec(name="events", url="https://vuz.ru/ru/events/",
+                          item_selectors=parser_main.DEFAULT_ITEM_SELECTORS)
+    try:
+        doc, soup = parser._expand_ajax_lists("https://vuz.ru/ru/events/", doc, soup, section)
+        parser._parse_events(doc, soup, section)
+    finally:
+        parser.close()
+    assert requested[0].startswith("https://vuz.ru/get-events/ru/events/?")
+    assert "rows=6" in requested[0] and "sortByPubdate=0" in requested[0]
+    assert not any("/fb/" in url for url in requested)  # форма обратной связи не грузится
+    titles = {event.title: event.date for event in parser._events}
+    assert titles["Премия «Инновационная звезда»"].endswith("-12-16")
+    # Анонс «19 января» в конце ноября — следующий год, а не прошлый.
+    assert titles["Изумруд.Студент"] > titles["Премия «Инновационная звезда»"]
+    assert "Премия «Инновационная звезда»" in doc.text
+
+
+def test_navigation_links_are_not_events_or_fetched():
+    from parser.main import _is_detail_url
+
+    assert _is_detail_url("https://urfu.ru/ru/events/16852/", "https://urfu.ru/ru/events/")
+    assert _is_detail_url("https://www.hse.ru/news/science/1221832471.html", "https://www.hse.ru/announcements/")
+    assert not _is_detail_url("https://urfu.ru/ru/students/", "https://urfu.ru/ru/events/")
+    assert not _is_detail_url("https://www.hse.ru/org/persons/", "https://www.hse.ru/announcements/")
+    assert not _is_detail_url("https://strategy.hse.ru/", "https://www.hse.ru/announcements/")
+
+    html = """<html><body><main><h1>Мероприятия</h1>
+      <ul><li><a href="/ru/students/">Студентам и выпускникам</a></li>
+          <li><a href="/ru/students/study/scholarships/">Стипендии и стипендиаты</a></li></ul>
+      <p>Курсы подготовки к ОГЭ и ЕГЭ для школьников, олимпиады и конференции</p>
+    </main></body></html>"""
+    doc = HTMLCleaner().to_document(html, url="https://vuz.ru/ru/events/", section="events")
+    parser = UniversityParser(Settings(use_sqlite=False, use_cache=False, enable_playwright=False,
+                                       fetch_event_pages=True))
+    parser._base_url = "https://vuz.ru/"
+    fetched: list[str] = []
+    parser._get_page = lambda url, **kwargs: fetched.append(url) or (None, None)  # type: ignore[method-assign]
+    try:
+        parser._parse_events(doc, _make_soup(html), SectionSpec(name="events", url="https://vuz.ru/ru/events/"))
+    finally:
+        parser.close()
+    assert parser._events == [] and fetched == []
+
+
+def test_projects_link_scoring_prefers_university_projects():
+    from parser.main import _projects_link_bonus
+
+    assert _projects_link_bonus("Прорывные научные проекты", "/ru/science/breakthrough/") > 0
+    assert _projects_link_bonus("Мероприятия и проекты", "/ru/partners/projects/") < 0
+    assert UNIVERSITY_PROFILES["urfu"].sections[[s.name for s in UNIVERSITY_PROFILES["urfu"].sections].index("projects")].url.endswith("/breakthrough/")
+
+
+def test_projects_from_headed_list_page():
+    html = """<html><body><main><h1>Прорывные научные проекты мирового масштаба</h1>
+      <p>Университет реализует шесть мегапроектов вместе с партнёрами.</p>
+      <h3>Перспективные магнитные материалы для новых технологий энергетики</h3>
+      <ul><li>Руководитель проекта: Устинов Владимир Васильевич, академик РАН</li></ul><p><a href="/p/1">О проекте</a></p>
+      <h3>Построение интеллектуальной платформы Smart Grid на основе Big Data</h3>
+      <ul><li>Научный руководитель проекта: Куржанский Александр Борисович</li></ul><p><a href="/p/2">О проекте</a></p>
+    </main></body></html>"""
+    doc = HTMLCleaner().to_document(html, url="https://vuz.ru/science/breakthrough/", section="projects")
+    parser = UniversityParser(Settings(use_sqlite=False, use_cache=False, enable_playwright=False, fetch_item_pages=False))
+    try:
+        parser._parse_projects(doc, _make_soup(html), SectionSpec(name="projects", url=doc.url))
+    finally:
+        parser.close()
+    titles = sorted(project.title for project in parser._projects)
+    assert titles == [
+        "Перспективные магнитные материалы для новых технологий энергетики",
+        "Построение интеллектуальной платформы Smart Grid на основе Big Data",
+    ]
+    assert all("руководитель проекта" in project.description.lower() for project in parser._projects)
+
+
+def test_event_dates_from_day_group_and_short_format():
+    from parser.utils import parse_date
+
+    assert parse_date("1.12 18:10 Встреча клуба", prefer_future=True).endswith("-12-01")
+    assert parse_date("1.12 18:10 Встреча клуба") is None  # без признака анонса — не дата
+    html = """<html><body><main><div class="ann-cards__group">
+      <h2 class="ann-day"><span>Сегодня,</span> <span>27</span> <span>ноября, пятница</span></h2>
+      <div class="ann-cards__item"><div class="ann-card"><h3 class="ann-title">Доклад
+        <a href="https://cs.hse.ru/announcements/1217953512.html">Станислава Морозова «О приближениях матриц»</a></h3></div></div>
+      <div class="ann-cards__item"><div class="ann-card"><h3 class="ann-title">Лекция
+        <a href="https://www.hse.ru/ma/education/announcements/1217395032.html">Виктории Пичугиной «Совместное обучение»</a></h3></div></div>
+    </div></main></body></html>"""
+    doc = HTMLCleaner().to_document(html, url="https://www.hse.ru/announcements/", section="events")
+    parser = UniversityParser(Settings(use_sqlite=False, use_cache=False, enable_playwright=False, fetch_event_pages=False))
+    try:
+        parser._parse_events(doc, _make_soup(html), SectionSpec(name="events", url=doc.url))
+    finally:
+        parser.close()
+    events = {event.title: event.date for event in parser._events}
+    assert events["Доклад Станислава Морозова «О приближениях матриц»"].endswith("-11-27")
+    assert events["Лекция Виктории Пичугиной «Совместное обучение»"].endswith("-11-27")
