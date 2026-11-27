@@ -65,7 +65,6 @@ const errors: Record<string, string> = {
   "Method Not Allowed": "Backend не поддерживает удаление отчётов. Перезапустите backend и повторите.",
   presentation_preview_unavailable: "Предпросмотр презентации недоступен.",
   facts_require_freshness_check: "Истёк срок проверки фактов. Откройте блок «Повторная проверка перед экспортом» в карточке.",
-  fact_already_reconfirmed: "Эти сведения уже подтверждены повторным сбором. Обновите карточку.",
   run_not_ready_for_generation: "Сбор сведений ещё не завершён. Откройте карточку и проверьте статус задания.",
   invalid_selected_fact_ids: "Состав принятых сведений изменился. Обновите карточку и повторите экспорт.",
   partnership_match_requires_selected_accepted_facts: "Основания для предложений изменились. Повторите подбор перед экспортом.",
@@ -97,6 +96,12 @@ const errors: Record<string, string> = {
   collection_cancelled: "Сбор остановлен.",
   job_not_cancellable: "Это задание нельзя остановить этой кнопкой.",
   stale_run_revision: "Данные уже изменились. Обновите карточку и повторите действие.",
+  fact_already_reconfirmed: "Часть выбранных сведений уже подтверждена повторным сбором. Снимите их выбор и повторите.",
+  unknown_review_fact_id: "Часть выбранных сведений не относится к текущему сбору. Обновите карточку и выберите заново.",
+  duplicate_review_fact_id: "Одни и те же сведения выбраны дважды. Обновите карточку и выберите заново.",
+  invalid_retirement_fact_ids: "Не удалось определить, какие прежние сведения заменяются. Обновите сравнение и повторите.",
+  run_not_reviewable: "Этот сбор ещё не завершён или уже недоступен для проверки. Дождитесь окончания сбора или обновите карточку.",
+  review_actor_required: "Укажите проверяющего.",
   card_job_already_running: "Для этой карточки уже выполняется задание.",
   facts_changed_during_generation: "Во время генерации факты изменились. Сформируйте материалы заново.",
   source_check_required: "Подтвердите проверку выбранных фактов по первоисточникам.",
@@ -172,10 +177,21 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
       await fetch("/api/auth/logout", { method: "POST", cache: "no-store" }).catch(() => undefined);
       window.location.replace("/login");
     }
-    throw new Error(typeof body.detail === "string" ? body.detail : "Проверьте введённые данные и доступность сервера.");
+    throw new Error(typeof body.detail === "string" ? body.detail : requestErrorText(response.status, body.detail));
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
+}
+
+/** Понятное сообщение, когда сервер вернул не код ошибки, а проверку полей или сбой. */
+function requestErrorText(status: number, detail: unknown) {
+  if (Array.isArray(detail) && detail.length) {
+    const first = detail[0] as { loc?: unknown[]; msg?: string };
+    const field = Array.isArray(first.loc) ? first.loc.filter((part) => typeof part === "string" && part !== "body").join(".") : "";
+    return `Сервер не принял данные${field ? ` (поле ${field})` : ""}: ${first.msg ?? "проверьте введённые значения"}.`;
+  }
+  if (status >= 500) return `Внутренняя ошибка сервера (HTTP ${status}). Подробности — в журнале backend.`;
+  return `Проверьте введённые данные и доступность сервера (HTTP ${status}).`;
 }
 
 export const post = <T>(path: string, body: unknown) => api<T>(path, { method: "POST", body: JSON.stringify(body) });

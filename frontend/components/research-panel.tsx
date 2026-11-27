@@ -142,6 +142,10 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [sourceChecked, setSourceChecked] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  // Ошибки и итог проверки фактов показываются прямо в окне проверки: основная
+  // панель сбора в этот момент скрыта, и сообщения в ней никто не видит.
+  const [reviewError, setReviewError] = useState("");
+  const [reviewNotice, setReviewNotice] = useState("");
   const [material, setMaterial] = useState<Material | null>(null);
   const [downloadFormat, setDownloadFormat] = useState<"pptx" | "docx">("pptx");
   const [formatPickerOpen, setFormatPickerOpen] = useState(false);
@@ -183,13 +187,18 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const partnershipKey = JSON.stringify([run?.run_id, run?.revision, meeting]);
   const partnershipMatches = partnership?.key === partnershipKey ? partnership.matches : null;
   const downloadUrl = material && `${material.download_url}${material.download_url.includes("?") ? "&" : "?"}format=${downloadFormat}`;
-  const retirementIds = [...new Set((currentComparison?.entries ?? []).filter((change) => change.retirement_trigger_ids.some((id) => selected.includes(id)))
-    .flatMap((change) => change.retirement_ids))];
   const reconfirmedIds = new Set(Object.values(run?.reconfirmed_facts ?? {}).flat());
   const candidates = run?.facts.filter((fact) => fact.origin !== "manual_edit" && !run.retired_fact_ids?.includes(fact.fact_id)
     && !reconfirmedIds.has(fact.fact_id)) ?? [];
   const canAccept = (fact: Fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length;
   const readyForReview = candidates.filter(canAccept);
+  // Замену прежних сведений считаем только по тем выбранным фактам, которые
+  // действительно уйдут на принятие: сервер требует ровно такой набор замен,
+  // и лишняя замена от непринимаемого факта отклоняет весь запрос.
+  const acceptableSelected = new Set(readyForReview.map((fact) => fact.fact_id).filter((id) => selected.includes(id)));
+  const retirementIds = [...new Set((currentComparison?.entries ?? [])
+    .filter((change) => change.retirement_trigger_ids.some((id) => acceptableSelected.has(id)))
+    .flatMap((change) => change.retirement_ids))];
   const problematic = candidates.filter((fact) => fact.verification_status === "rejected"
     || fact.verification_status === "conflict" || fact.validation_status === "failed" || fact.issues.length > 0);
   const blockedSelection = problematic.some((fact) => selected.includes(fact.fact_id));
@@ -330,15 +339,27 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
 
   async function review(decision: "accept" | "reject" | "revoke") {
     if (!run) return;
-    const decisionIds = decision === "revoke" ? selected.filter((id) => acceptedFactIds.has(id))
+    const fail = (message: string) => { setReviewNotice(""); setReviewError(message); };
+    // Принимаются только видимые кандидаты, которые проходят проверку: сервер
+    // принимает решение по всем выбранным фактам разом и отклоняет весь запрос,
+    // если хотя бы один факт принять нельзя (уже подтверждён повторным сбором,
+    // правился через чат, требует уточнения).
+    const acceptableIds = new Set(readyForReview.map((fact) => fact.fact_id));
+    const chosenIds = decision === "revoke" ? selected.filter((id) => acceptedFactIds.has(id))
       : selected.filter((id) => candidateFactIds.has(id));
-    if (!decisionIds.length) { setError(decision === "revoke" ? "Выберите принятые сведения для отмены." : "Выберите сведения для решения."); return; }
-    if (!reviewer.trim() || !reason.trim()) { setError("Укажите проверяющего и основание решения."); return; }
-    if (decision === "accept" && !sourceChecked) { setError("Подтвердите проверку по первоисточникам."); return; }
-    if (decision === "accept" && (!currentComparison || retirementIds.length > 0 && !replacePrevious)) {
-      setError("Проверьте сравнение и подтвердите замену прежних сведений."); return;
+    const decisionIds = decision === "accept" ? chosenIds.filter((id) => acceptableIds.has(id)) : chosenIds;
+    const skipped = chosenIds.length - decisionIds.length;
+    if (!decisionIds.length) {
+      fail(decision === "revoke" ? "Выберите принятые сведения для отмены."
+        : decision === "accept" && chosenIds.length ? "Среди выбранных нет сведений, которые можно принять: они требуют уточнения, уже подтверждены повторным сбором или изменены через чат."
+        : "Выберите сведения для решения.");
+      return;
     }
-    setSaving(true); setError("");
+    if (!reviewer.trim() || !reason.trim()) { fail("Укажите проверяющего и основание решения."); return; }
+    if (decision === "accept" && !sourceChecked) { fail("Поставьте отметку «Я проверил(а) выбранные факты по действующим первоисточникам»."); return; }
+    if (decision === "accept" && !currentComparison) { fail("Сравнение с прежними сведениями ещё загружается. Подождите несколько секунд и нажмите ещё раз."); return; }
+    if (decision === "accept" && retirementIds.length > 0 && !replacePrevious) { fail("Подтвердите замену прежних сведений отметкой выше."); return; }
+    setSaving(true); setError(""); setReviewError(""); setReviewNotice("");
     try {
       const updated = await post<ResearchRun>(`/runs/${run.run_id}/reviews`, {
         expected_revision: run.revision, reviewer,
@@ -346,7 +367,10 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         retirements: decision === "accept" ? retirementIds.map((fact_id) => ({fact_id, source_checked: sourceChecked, reason})) : [],
       });
       setRun(updated); onRunChange(updated); setMaterial(null);
-    } catch (failure) { setError(errorText(failure)); }
+      const done = decision === "accept" ? "Принято" : decision === "reject" ? "Отклонено" : "Отменено принятие";
+      setReviewNotice(`${done}: ${decisionIds.length}.` + (skipped > 0
+        ? ` Пропущено ${skipped}: такие сведения нельзя принять без уточнения.` : ""));
+    } catch (failure) { fail(errorText(failure)); }
     finally { setSaving(false); }
   }
 
@@ -679,18 +703,18 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
             <label>Основание отмены<input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Почему отменяется принятие" /></label>
             <div className="research-controls"><button className="button button--soft" type="button" disabled={Boolean(busy) || !selectedAcceptedCount}
               onClick={() => { void review("revoke"); }}>Отменить принятие ({selectedAcceptedCount})</button></div>
+            {reviewError && <p className="research-error" role="alert">{reviewError}</p>}
+            {reviewNotice && <p className="research-review-empty" role="status">{reviewNotice}</p>}
           </div>
         </> : <p className="research-review-empty" role="status">Пока нет принятых сведений.</p>}
       </div> : <div id="research-candidates-panel" role="tabpanel" aria-labelledby="research-candidates-tab">
       <details className="research-tools">
         <summary>Быстрые действия со списком</summary>
         <div className="research-tool-actions">
-      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(run.facts
-        .filter((fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length)
+      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(readyForReview
         .map((fact) => fact.fact_id))}>Выбрать все факты без ошибок</button>
-      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(run.facts
-        .filter((fact) => fact.verification_status === "pending" && fact.validation_status === "passed" && !fact.issues.length
-          && fact.subject.person_name && !fact.subject.department)
+      <button className="text-button" type="button" disabled={Boolean(busy)} onClick={() => setSelected(readyForReview
+        .filter((fact) => fact.subject.person_name && !fact.subject.department)
         .map((fact) => fact.fact_id))}>Выбрать сотрудников без привязки к подразделению</button>
       {rejected > 0 && <button className="text-button" type="button" onClick={() => setShowRejected((value) => !value)}>
         {showRejected ? "Скрыть" : "Показать"} автоматически отклонённые факты ({rejected})</button>}
@@ -739,6 +763,8 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
           onChange={(event) => setReplacePrevious(event.target.checked)} />Подтверждаю замену: прежних сведений будет архивировано {retirementIds.length}. Их значения и решения останутся в истории.</label>}
         <div className="research-controls"><button className="button button--primary" type="button" disabled={Boolean(busy) || !selectedCandidateCount} onClick={() => { void review("accept"); }}>Принять выбранные ({selectedCandidateCount})</button>
         <button className="button button--soft" type="button" disabled={Boolean(busy) || !selectedCandidateCount} onClick={() => { void review("reject"); }}>Отклонить выбранные</button></div>
+        {reviewError && <p className="research-error" role="alert">{reviewError}</p>}
+        {reviewNotice && <p className="research-review-empty" role="status">{reviewNotice}</p>}
       </div>
       </div>}</section>, reviewOutlet)}
     {formatPickerOpen && typeof document !== "undefined" && createPortal(<div className="report-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeFormatPicker(); }}>
