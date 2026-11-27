@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="210" viewBox="0 0 980 210" font-family="Segoe UI, Arial, sans-serif">
+<rect width="980" height="210" fill="#ffffff"/>
+<text x="40" y="38" font-size="20" font-weight="600" fill="#1f3d2b">Ключевые показатели пилота</text>
+<rect x="40" y="60" width="210" height="120" rx="14" fill="#f4faf5" stroke="#d8ecdc"/>
+<text x="58" y="92" font-size="13" fill="#6b7f72">Сайт найден</text>
+<text x="58" y="132" font-size="30" font-weight="700" fill="#1f3d2b">10 / 10</text>
+<text x="58" y="158" font-size="13" font-weight="600" fill="#21a038">100 %</text>
+<rect x="272" y="60" width="210" height="120" rx="14" fill="#f4faf5" stroke="#d8ecdc"/>
+<text x="290" y="92" font-size="13" fill="#6b7f72">Ректор определён</text>
+<text x="290" y="132" font-size="30" font-weight="700" fill="#1f3d2b">10 / 10</text>
+<text x="290" y="158" font-size="13" font-weight="600" fill="#21a038">100 %</text>
+<rect x="504" y="60" width="210" height="120" rx="14" fill="#f4faf5" stroke="#d8ecdc"/>
+<text x="522" y="92" font-size="13" fill="#6b7f72">Фото ректора</text>
+<text x="522" y="132" font-size="30" font-weight="700" fill="#1f3d2b">8 / 10</text>
+<text x="522" y="158" font-size="13" font-weight="600" fill="#3b7ddd">80 %</text>
+<rect x="736" y="60" width="210" height="120" rx="14" fill="#f4faf5" stroke="#d8ecdc"/>
+<text x="754" y="92" font-size="13" fill="#6b7f72">Сборы без ошибок</text>
+<text x="754" y="132" font-size="30" font-weight="700" fill="#1f3d2b">10 / 10</text>
+<text x="754" y="158" font-size="13" font-weight="600" fill="#21a038">100 %</text>
+</svg>
