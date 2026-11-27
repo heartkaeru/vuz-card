@@ -2443,6 +2443,11 @@ class UniversityParser:
     ) -> None:
         items = self._extract_items(doc, soup, section)
         items = self._enrich_items_with_pages(items, "events")
+        # Some calendars expose event cards as links without an extractable date,
+        # while the date and title are still present together in the document text.
+        # Always consult this fallback; an undated link must not suppress dated
+        # paragraph/list-item candidates from the same page.
+        items.extend(self._items_from_blocks(doc, EVENT_TYPE_KEYWORDS))
         for item in items:
             if not item["date"]:
                 # Мероприятие без даты бесполезно для карточки и часто
@@ -2459,24 +2464,6 @@ class UniversityParser:
                     source_url=doc.url,
                 )
             )
-        if not items:
-            for item in self._items_from_blocks(doc, EVENT_TYPE_KEYWORDS):
-                if not item["date"]:
-                    continue
-                self._events.append(
-                    Event(
-                        title=item["title"],
-                        type=_classify(
-                            item["title"] + " " + item["description"],
-                            EVENT_TYPE_KEYWORDS,
-                            "не определено",
-                        ),
-                        date=item["date"],
-                        description=item["description"],
-                        url=item["url"],
-                        source_url=doc.url,
-                    )
-                )
         self._events = self._dedupe_events(self._events)
         LOGGER.info("Мероприятия: +%s (всего %s)", len(items), len(self._events))
 
@@ -2854,7 +2841,14 @@ class UniversityParser:
         if title in description:
             description = description.replace(title, " ", 1)
         # Убираем дату из описания, если она уже выделена.
-        date_value = parse_date(container_text)
+        date_value = next(
+            (
+                parsed
+                for time_node in container.select("time[datetime]")
+                if (parsed := parse_date(time_node.get("datetime", "")))
+            ),
+            None,
+        ) or parse_date(container_text)
         if date_value:
             description = re.sub(
                 r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b", " ", description

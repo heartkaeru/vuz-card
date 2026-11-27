@@ -68,7 +68,10 @@ def build_card(
             url=website or None,
             name=name,
             short_name=short_name or None,
-            allowed_sections=("about", "leadership", "contacts", "programs"),
+            allowed_sections=(
+                "about", "leadership", "contacts", "programs", "research",
+                "projects", "grants", "partnerships", "news", "events",
+            ),
         )
     finally:
         parser.close()

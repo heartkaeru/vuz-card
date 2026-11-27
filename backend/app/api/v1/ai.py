@@ -101,8 +101,15 @@ def get_collector():
             profile = (UniversityProfile(slug="selected-official-sources", name=name, url=website,
                        sections=(SectionSpec(name="leadership", url=leadership_url),) if leadership_url else (),
                        bio_urls=(biography_url,) if biography_url else ()) if leadership_url or biography_url else None)
+            allowed_sections = (
+                ("about", "leadership", "contacts", "programs", "research", "projects",
+                 "grants", "partnerships", "news", "events")
+                if include_institution
+                else ("about", "leadership", "contacts") if not leadership_url
+                else ("leadership",)
+            )
             result = parser.parse(url=website, name=name, profile=profile,
-                                  allowed_sections=("about", "leadership", "contacts") if include_institution or not leadership_url else ("leadership",))
+                                  allowed_sections=allowed_sections)
             existing = {document.url for document in result.documents}
             reference_documents = parser.collect_institution_documents(institution_urls)
             if len(reference_documents) < len(institution_urls):
@@ -121,9 +128,14 @@ def get_collector():
                     existing.add(document.url)
             if leadership_url:
                 # The homepage was used for discovery, not selected as a fact source.
+                allowed_categories = (
+                    {"organization", "leadership", "contacts", "research", "projects",
+                     "grants", "project_news", "partnerships", "achievements", "other"}
+                    if include_institution
+                    else {"leadership", "contacts"}
+                )
                 result.documents = [document for document in result.documents
-                                    if document.category in {"leadership", "contacts"}
-                                    or include_institution and document.section == "about"]
+                                    if document.category in allowed_categories]
             if include_institution:
                 from parser.institution_context import mark_institution_context
                 for document in result.documents:
@@ -250,7 +262,9 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
         repository.set_latest(card["id"], research.run_id)
         research = await workflow.extract(research.run_id, context_fields=[
             "institution.profile", "institution.type", "institution.location", "institution.founded",
-            "institution.education_areas", "institution.education_levels", "institution.students", "institution.structure"])
+            "institution.education_areas", "institution.education_levels", "institution.students", "institution.structure",
+            "project.name", "project.program", "project.role", "project.status", "project.period", "project.description",
+            "event.name", "event.type", "event.date", "event.status", "event.description"])
         if research.status == "failed" or not research.facts:
             stage_errors = [error.code for result in research.results.values() for error in result.errors]
             if no_documents:

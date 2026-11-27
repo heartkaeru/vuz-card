@@ -17,7 +17,7 @@ from parser.aggregators import (
 )
 from parser.biography import split_biography_sentences
 from parser.cleaner import HTMLCleaner
-from parser.config import PROJECT_TYPE_KEYWORDS, Settings
+from parser.config import PROJECT_TYPE_KEYWORDS, SectionSpec, Settings
 from parser.main import (
     SvedenTableParser,
     UniversityParser,
@@ -431,6 +431,31 @@ def test_undated_news_gets_date_from_article_page():
         SearchHit("Сбер и УрФУ: соглашение", "https://n.ru/a", "", None, "bing", "q"),
     ]
     assert search.search("Уральский федеральный университет", "УрФУ") == []
+
+
+def test_default_sections_include_events_and_event_parser_uses_machine_and_text_dates():
+    assert "events" in Settings().sections
+    html = """<main>
+      <article class="event-card"><h2><a href="/events/forum">Форум науки</a></h2>
+        <time datetime="2026-12-10T10:00:00+05:00">10 декабря</time>
+      </article>
+      <article><h2><a href="/events/lecture">Лекция по робототехнике</a></h2></article>
+      <p>15 декабря 2026 года состоится конференция молодых исследователей.</p>
+    </main>"""
+    parser = UniversityParser(Settings(use_sqlite=False, use_cache=False, fetch_item_pages=False))
+    doc = HTMLCleaner().to_document(html, url="https://vuz.ru/events/", section="events")
+    try:
+        parser._parse_events(
+            doc,
+            _make_soup(html),
+            SectionSpec(name="events", url="https://vuz.ru/events/", item_selectors=("article",)),
+        )
+    finally:
+        parser.close()
+
+    events = {event.title: event.date for event in parser._events}
+    assert events["Форум науки"] == "2026-12-10"
+    assert any("конференция" in title.lower() for title in events)
 
 
 def test_two_word_rector_signature_and_same_person_merge():

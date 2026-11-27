@@ -92,6 +92,7 @@ class Settings:
         "projects",
         "partnerships",
         "news",
+        "events",
     )
     # Сколько человек основного руководства оставлять в карточке.
     max_leadership: int = 20
