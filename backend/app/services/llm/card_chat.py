@@ -310,6 +310,11 @@ async def partnership_reply(provider, run, goal):
         proposals.append(f"{name}\nЧто предложить — {match.proposal}\n"
                          f"Почему это уместно — {match.rationale} [{citations}]\n"
                          f"Что спросить — {match.discussion_question}")
+        if match.event_start:
+            proposals[-1] += f"\nНачало по анонсу — {match.event_start:%d.%m.%Y}. {match.catalog_url}"
+        if match.regional_case:
+            case = match.regional_case
+            proposals[-1] += f"\nПохожий опыт — {case.location}, {case.title}. {case.url}"
     reply = cited_answer("\n\n".join(proposals), (facts[fact_id] for fact_id in source_numbers))
     for source in reply["sources"]:
         source["value"] = f"[{source_numbers[source['fact_id']]}] {source['value']}"

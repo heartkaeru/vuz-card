@@ -17,7 +17,7 @@ from .contacts import contact_statement
 from .leadership_render import leadership_statement
 from .models import (
     DraftOutput, DraftResult, EntitySubject, Evidence, ExtractionOutput, ExtractionRequest,
-    ExtractionResult, Fact, FactField, GenerationRequest, PipelineError, RunInfo,
+    INSTITUTION_METRICS, ExtractionResult, Fact, FactField, GenerationRequest, PipelineError, RunInfo,
 )
 
 PROMPTS = Path(__file__).with_name("prompts")
@@ -470,8 +470,9 @@ class AssistantPipeline:
         if len(ids) != len(set(ids)):
             raise DraftValidationError("duplicate_fact_id")
         for fact in request.facts:
-            if fact.field == FactField.STUDENTS and fact.metric_context is None:
-                raise DraftValidationError("student_metric_context_required")
+            if fact.field in INSTITUTION_METRICS and fact.metric_context is None:
+                raise DraftValidationError("student_metric_context_required" if fact.field == FactField.STUDENTS
+                                           else "institution_metric_context_required")
             context_field = fact.field.value.startswith(("institution.", "project.", "event."))
             if context_field or isinstance(fact.subject, EntitySubject):
                 if request.schema_version != "0.3":

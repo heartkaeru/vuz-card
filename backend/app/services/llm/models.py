@@ -79,6 +79,10 @@ class FactField(str, Enum):
     TITLE = "person.academic_title"
     INTERESTS = "person.interests"
     CAREER = "person.career"
+    BIRTH_DATE = "person.birth_date"
+    BIRTH_PLACE = "person.birth_place"
+    HONORS = "person.honors"
+    EXPERIENCE = "person.experience"
     PROFILE = "institution.profile"
     TYPE = "institution.type"
     LOCATION = "institution.location"
@@ -86,10 +90,15 @@ class FactField(str, Enum):
     EDUCATION_AREAS = "institution.education_areas"
     EDUCATION_LEVELS = "institution.education_levels"
     STUDENTS = "institution.students"
+    STAFF = "institution.teaching_staff"
+    BUDGET_STUDENTS = "institution.budget_students"
+    DORMITORY_CAPACITY = "institution.dormitory_capacity"
+    DORMITORY_OCCUPANCY = "institution.dormitory_occupancy"
     STRUCTURE = "institution.structure"
     PROJECT_NAME = "project.name"
     PROJECT_PROGRAM = "project.program"
     PROJECT_ROLE = "project.role"
+    PROJECT_PARTNER = "project.partner"
     PROJECT_STATUS = "project.status"
     PROJECT_PERIOD = "project.period"
     PROJECT_DESCRIPTION = "project.description"
@@ -161,6 +170,12 @@ class Evidence(EvidenceProposal):
     end_offset: int | None = Field(default=None, gt=0)
     page_number: int | None = Field(default=None, ge=1)
     file_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+INSTITUTION_METRICS = frozenset({
+    FactField.STUDENTS, FactField.STAFF, FactField.BUDGET_STUDENTS,
+    FactField.DORMITORY_CAPACITY, FactField.DORMITORY_OCCUPANCY,
+})
 
 
 class MetricContext(StrictModel):

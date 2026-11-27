@@ -16,16 +16,25 @@ type Props = {
   chatCollectionJobId?: string;
 };
 type ReviewTab = "candidates" | "conflicts" | "accepted";
+type PresentationMatch = PartnershipMatch & {
+  event_start?: string | null;
+  regional_case?: { title: string; location: string; url: string } | null;
+};
 const fields: Record<string, string> = {
   "person.name": "ФИО", "appointment.position": "Должность", "appointment.status": "Статус назначения",
   "appointment.department": "Подразделение", "appointment.responsibilities": "Зона ответственности",
   "contact.phone": "Рабочий телефон", "contact.email": "Рабочая почта",
   "person.career": "Биография", "person.education": "Образование", "person.degree": "Учёная степень",
   "person.academic_title": "Учёное звание", "person.interests": "Научные интересы", "appointment.since": "Назначение",
+  "person.birth_date": "Дата рождения", "person.birth_place": "Место рождения",
+  "person.experience": "Стаж", "person.honors": "Награды",
   "institution.profile": "Профиль учреждения", "institution.type": "Тип учреждения", "institution.location": "Местонахождение",
   "institution.founded": "Основание", "institution.education_areas": "Направления подготовки",
   "institution.education_levels": "Уровни образования", "institution.students": "Обучающиеся", "institution.structure": "Структура и филиалы",
+  "institution.teaching_staff": "Педагогический состав", "institution.budget_students": "Обучающиеся на бюджете",
+  "institution.dormitory_capacity": "Места в общежитиях", "institution.dormitory_occupancy": "Загрузка общежитий",
   "project.name": "Название проекта", "project.program": "Программа", "project.role": "Роль учреждения",
+  "project.partner": "Партнёр по проекту",
   "project.status": "Статус проекта", "project.period": "Период проекта", "project.description": "Описание проекта",
   "event.name": "Название события", "event.type": "Вид события", "event.date": "Дата события",
   "event.status": "Статус события", "event.description": "Описание события",
@@ -47,6 +56,12 @@ const issueMessages: Record<string, string> = {
   student_metric_context_required: "У численности не указан период, состав контингента или единица измерения.",
   student_metric_context_not_in_scope: "Период, состав или единица показателя не подтверждаются этим источником.",
   student_metric_period_required: "Показателю численности нужен опубликованный год или дата.",
+  institution_metric_context_required: "Для показателя нужны период, состав и единица измерения.",
+  institution_metric_context_not_in_scope: "Период, состав или единицу показателя нужно подтвердить в источнике.",
+  institution_metric_period_required: "Для показателя нужен опубликованный год или дата.",
+  institution_metric_number_required: "В источнике нужно указать значение показателя.",
+  institution_metric_scope_required: "Не подтверждено, кого или что учитывает показатель.",
+  institution_metric_unit_mismatch: "Единица измерения не соответствует показателю.",
   research_interests_require_explicit_statement: "Источник не называет научные интересы явно. Перечень публикаций не подтверждает это поле.",
   institution_founding_context_required: "Нужна формулировка об основании учреждения. Отдельный год из истории недостаточен.",
   institution_structure_context_required: "Источник должен описывать структуру или подразделение. Старое название вуза недостаточно.",
@@ -77,7 +92,25 @@ function normalizeGroupPart(value: string) {
   return value.normalize("NFKC").toLocaleLowerCase("ru-RU").replace(/ё/g, "е").replace(/\s+/g, " ").trim();
 }
 
-function groupReviewFacts(facts: Fact[], institutionName: string, identityFacts = facts): FactGroup[] {
+function reviewRole(fact: Fact) {
+  const department = fact.subject.department?.trim();
+  if (department) return `Подразделение: ${department}`;
+  if (fact.field !== "appointment.position") return null;
+  return /^(директор|декан|руководитель|начальник(?: отдела)?|заведующий)$/i.test(fact.value)
+    ? "Подразделение не указано в подтверждающем фрагменте."
+    : null;
+}
+
+function reviewGroupRank(group: FactGroup) {
+  if (group.facts.some((fact) => fact.field === "appointment.position" && !fact.subject.department
+      && /^(?:(?:врио|и\.\s*о\.)\s+)?(?:ректор|директор|проректор(?:\s+по\s+.+)?)$/i.test(fact.value))) return 0;
+  if (group.key.startsWith("institution:")) return 1;
+  if (group.key.startsWith("entity:")) return 2;
+  if (group.key.startsWith("contact:") && /при[её]мная|справочная|контакт[- ]центр|канцелярия/i.test(group.title)) return 3;
+  return 4;
+}
+
+function groupReviewFacts(facts: Fact[], institutionName: string, identityFacts = facts, changedIds = new Set<string>()): FactGroup[] {
   const groups = new Map<string, FactGroup>();
   const aliases = buildPersonAliases(identityFacts.flatMap((fact) => {
     const name = fact.subject.person_name ?? (fact.contact_owner?.kind === "person" ? fact.contact_owner.label : null);
@@ -95,15 +128,15 @@ function groupReviewFacts(facts: Fact[], institutionName: string, identityFacts 
       key = `person:${personIdentityKey(personName, department, aliases)}`;
       title = personName;
       description = department ? `Сведения о сотруднике · ${department}` : "Сведения о сотруднике";
+    } else if (fact.field.startsWith("institution.")) {
+      key = `institution:${normalizeGroupPart(institutionName)}`;
+      title = institutionName;
+      description = "Сведения об учреждении";
     } else if (fact.subject.entity_id && entityName) {
       key = `entity:${fact.subject.entity_kind ?? "entity"}:${fact.subject.entity_id}`;
       title = entityName;
       description = fact.subject.entity_kind === "project" ? "Сведения о проекте"
         : fact.subject.entity_kind === "event" ? "Сведения о мероприятии" : "Сведения об учреждении";
-    } else if (fact.field.startsWith("institution.")) {
-      key = `institution:${normalizeGroupPart(entityName ?? institutionName)}`;
-      title = entityName ?? institutionName;
-      description = "Сведения об учреждении";
     } else if (fact.contact_owner && fact.contact_owner.kind !== "unknown") {
       key = `contact:${fact.contact_owner.kind}:${normalizeGroupPart(fact.contact_owner.label)}`;
       title = fact.contact_owner.label;
@@ -123,7 +156,9 @@ function groupReviewFacts(facts: Fact[], institutionName: string, identityFacts 
     }
     else groups.set(key, { key, title, description, facts: [fact] });
   }
-  return [...groups.values()];
+  const changed = (group: FactGroup) => group.facts.some((fact) => changedIds.has(fact.fact_id));
+  const rank = (group: FactGroup) => reviewGroupRank(group) + (changed(group) ? -1 : 0);
+  return [...groups.values()].sort((a, b) => rank(a) - rank(b));
 }
 
 export const ResearchPanel = forwardRef<ResearchHandle, Props>(function ResearchPanel({
@@ -162,7 +197,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const [showRejected, setShowRejected] = useState(false);
   const [meetingGoal, setMeetingGoal] = useState("");
   const [meetingDate, setMeetingDate] = useState("");
-  const [partnership, setPartnership] = useState<{ key: string; matches: PartnershipMatch[] } | null>(null);
+  const [partnership, setPartnership] = useState<{ key: string; matches: PresentationMatch[] } | null>(null);
   const [matching, setMatching] = useState(false);
   const [includePartnership, setIncludePartnership] = useState(false);
   const [presentationVariant, setPresentationVariant] = useState<"compact" | "detailed">("compact");
@@ -213,9 +248,12 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
   const selectedCandidateCount = selected.filter((id) => candidateFactIds.has(id)).length;
   const identityFacts = [...(run?.facts ?? []), ...acceptedFacts];
   const pending = candidates.filter((fact) => fact.verification_status === "pending").length;
+  const changedIds = new Set(currentComparison?.entries
+    .filter((entry) => entry.kind === "changed" || entry.kind === "head_change")
+    .flatMap((entry) => entry.after.map((fact) => fact.fact_id)) ?? []);
   const visibleFactGroups = run ? groupReviewFacts(
     candidates.filter((fact) => fact.verification_status !== "verified" && (showRejected || fact.verification_status !== "rejected")),
-    university.name, identityFacts,
+    university.name, identityFacts, changedIds,
   ) : [];
   const acceptedFactGroups = acceptedFacts.length ? groupReviewFacts(acceptedFacts, university.name, identityFacts) : [];
 
@@ -348,12 +386,11 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     if (!run || !accepted || busy) return;
     setMatching(true); setError("");
     try {
-      const matches = await post<PartnershipMatch[]>(`/runs/${run.run_id}/partnership-matches`, {
+      const matches = await post<PresentationMatch[]>(`/runs/${run.run_id}/partnership-matches`, {
         expected_revision: run.revision, meeting,
       });
       setPartnership({ key: partnershipKey, matches });
       setIncludePartnership(false);
-      setMaterial(null);
     } catch (failure) { setError(errorText(failure)); }
     finally { setMatching(false); }
   }
@@ -389,7 +426,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         expected_revision: run.revision, request_key: crypto.randomUUID(),
         meeting,
         presentation_variant: presentationVariant,
-        partnership_matches: includePartnership ? partnershipMatches ?? [] : [],
+        partnership_matches: downloadFormat === "pptx" && includePartnership ? partnershipMatches ?? [] : [],
       }));
       return { message: "Задание формирования презентации создано. Ссылка на PPTX появится в карточке после сборки.", queued: true };
     } catch (failure) {
@@ -553,7 +590,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         <div className="research-controls">
           <label>Формат материала<select value={presentationVariant}
             onChange={(event) => setPresentationVariant(event.target.value as "compact" | "detailed")}>
-            <option value="compact">Краткая карточка — 3 слайда</option>
+            <option value="compact">Краткая карточка</option>
             <option value="detailed">Подробная справка — все разделы</option>
           </select></label>
           <label>Цель встречи<input value={meetingGoal} onChange={(event) => setMeetingGoal(event.target.value)}
@@ -654,7 +691,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
                 <span><strong>{fields[fact.field] ?? fact.field}</strong><span>{fact.value}</span></span>
                 <span className="research-status research-status--verified">Принято</span>
               </label>
-              {fact.subject.department && <p>Подразделение: {fact.subject.department}</p>}
+              {reviewRole(fact) && <p>{reviewRole(fact)}</p>}
               <details><summary>Источники ({fact.evidence.length})</summary>{fact.evidence.map((evidence, index) => <div className="research-evidence" key={index}>
                 <a href={evidence.page_number ? `${evidence.url.split("#")[0]}#page=${evidence.page_number}` : evidence.url} target="_blank" rel="noreferrer">{evidence.url}</a>
                 <blockquote>{evidence.quote}</blockquote>
@@ -706,7 +743,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
               <span><strong>{group.facts.length === 1 ? group.title : fields[fact.field] ?? fact.field}</strong><span>{group.facts.length === 1 ? `${fields[fact.field] ?? fact.field}: ${fact.value}` : fact.value}</span></span>
               <span className={`research-status research-status--${fact.verification_status}`}>{statuses[fact.verification_status]}</span>
             </label>
-            {fact.subject.department && <p>Подразделение: {fact.subject.department}</p>}
+            {reviewRole(fact) && <p>{reviewRole(fact)}</p>}
             {fact.metric_context && <p>Период: {fact.metric_context.period} · Состав: {fact.metric_context.scope} · Единица: {fact.metric_context.unit}{fact.metric_context.coverage ? ` · Охват: ${fact.metric_context.coverage}` : ""}</p>}
             {fact.issues.length > 0 && <details className="research-fact__validation">
               <summary>Требует уточнения</summary>
@@ -744,12 +781,43 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
             <span><strong>Word</strong><small>Документ (.docx)</small></span>
           </label>
         </div>
+        {downloadFormat === "pptx" && <fieldset className="research-meeting" disabled={Boolean(busy) || matching}>
+          <label>Вариант презентации<select value={presentationVariant}
+            onChange={(event) => setPresentationVariant(event.target.value as "compact" | "detailed")}>
+            <option value="compact">Краткая карточка</option>
+            <option value="detailed">Подробная справка</option>
+          </select></label>
+          <label>Цель встречи<input value={meetingGoal} onChange={(event) => {
+            setMeetingGoal(event.target.value); setIncludePartnership(false); setMaterial(null);
+          }}
+            maxLength={1000} placeholder="Например: стажировки для студентов" /></label>
+          <button className="button button--soft" type="button" disabled={!run || !accepted}
+            onClick={() => { void recommendPartnership(); }}>{matching ? "Подбираем предложения…" : "Подобрать предложения Сбера"}</button>
+          {partnershipMatches?.length === 0 && <p className="report-format-hint" role="status">
+            Подходящих предложений по принятым сведениям пока нет.</p>}
+          {Boolean(partnershipMatches?.length) && <>
+            <details>
+              <summary>Найденные предложения ({partnershipMatches?.length})</summary>
+              <ul>{partnershipMatches?.map((match) => <li key={match.catalog_url}>
+                <a href={match.catalog_url} target="_blank" rel="noreferrer">{match.product_name}</a>
+                {match.kind === "external_course" && " · внешний курс"}
+                <p>{match.proposal}</p><p>{match.rationale}</p><p>{match.discussion_question}</p>
+                {match.event_start && <p>Дата начала по анонсу: <time dateTime={match.event_start}>{match.event_start}</time></p>}
+                {match.regional_case && <p><a href={match.regional_case.url} target="_blank" rel="noreferrer">
+                  {match.regional_case.location} · {match.regional_case.title}</a></p>}
+              </li>)}</ul>
+            </details>
+            <label className="research-ack"><input type="checkbox" checked={includePartnership}
+              onChange={(event) => { setIncludePartnership(event.target.checked); setMaterial(null); }} />
+              Включить предложения в PPTX</label>
+          </>}
+        </fieldset>}
         {!material && run && accepted > 0 && <p className="report-format-hint">Отчёт ещё не сформирован. После выбора формата он подготовится и откроется для просмотра.</p>}
         {busy && job?.task_type === "material" && <p className="report-format-hint" role="status">{job.message} · {job.progress}%</p>}
         {error && <p className="research-error" role="alert">{error}</p>}
         <div className="report-format-actions">
           <button className="button button--soft" type="button" onClick={closeFormatPicker}>Отмена</button>
-          <button className="button button--primary" type="button" disabled={previewLoading || previewAfterGeneration || (!material && (!run || !accepted)) || (busy && job?.task_type !== "material")} onClick={() => { void continueToPreview(); }}>
+          <button className="button button--primary" type="button" disabled={matching || previewLoading || previewAfterGeneration || (!material && (!run || !accepted)) || (busy && job?.task_type !== "material")} onClick={() => { void continueToPreview(); }}>
             {previewLoading ? "Открываем…" : previewAfterGeneration || (busy && job?.task_type === "material") ? "Ждём завершения…" : material ? "Открыть предпросмотр" : !run || !accepted ? "Нет проверенных данных" : "Сформировать и просмотреть"}
           </button>
         </div>

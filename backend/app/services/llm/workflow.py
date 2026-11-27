@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import re
 from datetime import timedelta
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -12,12 +14,21 @@ from parser.llm_adapter import to_llm_request
 from parser.models import UniversityData
 
 from .client import LLMError
+from .contacts import CONTACT_ROW_OWNER, refine_contact_hints
+from .evidence import literal_value_in_text
 from .fragment_models import parse_extraction_request
-from .models import GenerationRequest, Institution, MeetingContext
+from .models import INSTITUTION_METRICS, FactField, GenerationRequest, Institution, MeetingContext
 from .official_sources import official_program_candidates
 from .pipeline import REVIEW_WINDOW_DAYS, AssistantPipeline, DraftValidationError
 from .workflow_models import ResearchRun, ReviewBatch, WorkflowError
 from .changes import compare_run, effective_facts, head_key, person_aliases, person_identity, reconfirmation_matches
+
+
+DIRECTORY_SCOPE = re.compile(r"(?:/sveden/(?:struct|employees|pedagog)|/(?:structure|directory|staff|employees))(?:/|$)")
+MEETING_DIRECTORY_ROLE = re.compile(
+    r"\b(?:ректор|проректор|при[её]мная\s+(?:ректора|директора)|при[её]мная комиссия|"
+    r"контакт[- ]центр|справочная(?: служба)?|канцелярия)\b", re.I,
+)
 
 
 def documents_for(card, mode):
@@ -42,6 +53,61 @@ def documents_for(card, mode):
     return result
 
 
+def prepare_leadership_documents(documents, *, meeting_profile):
+    selected = []
+    for document in documents:
+        fragments = document["fragments"]
+        for fragment in fragments:
+            refine_contact_hints(fragment, document["text"][fragment["start"]:fragment["end"]])
+        if meeting_profile and DIRECTORY_SCOPE.search(urlsplit(document["url"]).path):
+            relevant = [
+                fragment for fragment in fragments
+                if not fragment.get("subject_department") and MEETING_DIRECTORY_ROLE.search(
+                    document["text"][fragment["start"]:fragment["end"]],
+                )
+            ]
+            referenced = {fid for fragment in relevant for hint in fragment["contact_hints"]
+                          for fid in hint["context_fragment_ids"]}
+            referenced.update(fragment["biography_subject"]["anchor_fragment_id"] for fragment in relevant
+                              if fragment.get("biography_subject"))
+            ids = referenced | {fragment["fragment_id"] for fragment in relevant}
+            if not ids:
+                continue
+            document["fragments"] = [fragment for fragment in fragments if fragment["fragment_id"] in ids]
+            for fragment in document["fragments"]:
+                fragment["contact_hints"] = [hint for hint in fragment["contact_hints"]
+                                             if set(hint["context_fragment_ids"]) <= ids]
+                biography = fragment.get("biography_subject")
+                if biography and biography["anchor_fragment_id"] not in ids:
+                    del fragment["biography_subject"]
+        selected.append(document)
+    return selected
+
+
+def prioritize_review(facts):
+    leadership = {
+        fact.subject.person_name for fact in facts
+        if fact.field == FactField.POSITION and fact.subject.person_name
+        and not getattr(fact.subject, "department", None)
+        and re.fullmatch(r"(?:врио\s+|и\.\s*о\.\s*)?(?:ректор|директор|проректор(?:\s+по\b.*)?)",
+                         fact.value, re.I)
+    }
+    priorities = {
+        FactField.POSITION: 0, FactField.NAME: 1, FactField.EDUCATION_AREAS: 4,
+        **dict.fromkeys(INSTITUTION_METRICS, 4),
+        **dict.fromkeys((FactField.PROFILE, FactField.PROJECT_NAME, FactField.EVENT_NAME), 5),
+    }
+    def rank(fact):
+        if fact.subject.person_name in leadership:
+            return min(priorities.get(fact.field, 2), 2)
+        if fact.contact_owner and CONTACT_ROW_OWNER.search(f"{fact.contact_owner.label}:"):
+            return 3
+        if fact.field in {FactField.POSITION, FactField.NAME}:
+            return 7
+        return priorities.get(fact.field, 6)
+    facts.sort(key=lambda fact: (fact.verification_status == "rejected", rank(fact)))
+
+
 class LLMWorkflow:
     def __init__(self, repository: LLMRepository, pipeline: AssistantPipeline | None = None):
         self.repository = repository
@@ -56,7 +122,7 @@ class LLMWorkflow:
         return self.repository.create(institution, card.model_dump(mode="json"), request_key,
                                       tuple(dict.fromkeys(modes)))
 
-    async def extract(self, run_id: str, *, context_fields=None) -> ResearchRun:
+    async def extract(self, run_id: str, *, context_fields=None, meeting_profile=False) -> ResearchRun:
         if self.pipeline is None:
             raise WorkflowError("llm_provider_required")
         run = self.repository.get(run_id)
@@ -74,6 +140,8 @@ class LLMWorkflow:
         try:
             for mode in run.requested_modes:
                 selected = documents_for(card, mode)
+                if meeting_profile and mode == "0.3":
+                    selected = [doc for doc in selected if not DIRECTORY_SCOPE.search(urlsplit(doc.url).path)]
                 usable = [d for d in selected if d.text.strip() and d.fragments]
                 if len(usable) != len(selected):
                     errors.append(f"{mode}:empty_source_documents")
@@ -86,10 +154,33 @@ class LLMWorkflow:
                                          card_version=run.institution.card_version, schema_version=mode)
                 payload["institution"] = run.institution.model_dump(mode="json")
                 if mode == "0.2":
+                    payload["documents"] = prepare_leadership_documents(
+                        payload["documents"], meeting_profile=meeting_profile,
+                    )
+                    if not payload["documents"]:
+                        errors.append(f"{mode}:no_source_documents")
+                        continue
                     # Proven parser contacts remain candidates even if the LLM omits one.
                     payload["project_structured_contacts"] = True
                 elif context_fields is not None:
                     payload["fields"] = context_fields
+                    # Detail-page URLs come from individual project/event items, not section listings.
+                    detail_urls = {
+                        item.url.rstrip("/"): item.title
+                        for item in (*card.projects, *card.events)
+                        if item.url and item.title
+                    }
+                    for document in payload["documents"]:
+                        title = detail_urls.get(document["url"].rstrip("/"))
+                        if not title or not literal_value_in_text(title, document["title"]):
+                            continue
+                        fragments = document["fragments"]
+                        anchor = next((fragment for fragment in fragments
+                                       if literal_value_in_text(title, document["text"][fragment["start"]:fragment["end"]])), None)
+                        if anchor and not any(fragment.get("entity_scope_id") for fragment in fragments):
+                            for fragment in fragments:
+                                fragment["entity_scope_id"] = document["source_id"]
+                                fragment["entity_anchor_id"] = anchor["fragment_id"]
                 try:
                     request = parse_extraction_request(json.dumps(payload, ensure_ascii=False))
                     results[mode] = await self.pipeline.extract_facts(request)
@@ -109,6 +200,8 @@ class LLMWorkflow:
         def finish(current, db, *, reconfirm=True):
             current.results = results
             current.facts = [f.model_copy(deep=True) for result in results.values() for f in result.facts]
+            if meeting_profile:
+                prioritize_review(current.facts)
             current.errors = errors
             partial = bool(errors or card.errors or any(not r.complete for r in results.values()))
             if not results or not current.facts:

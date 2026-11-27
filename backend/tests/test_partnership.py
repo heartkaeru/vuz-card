@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -10,10 +10,11 @@ from app.services.llm.partnership import OPERATIONAL_TOPICS, match_partnership
 
 
 class MatchProvider:
-    def __init__(self, catalog_id=None, basis=None):
+    def __init__(self, catalog_id=None, basis=None, regional_case_id=None):
         self.catalog_id = catalog_id
         self.basis = basis
         self.catalog = {}
+        self.regional_case_id = regional_case_id
 
     async def complete(self, system, payload, schema):
         self.catalog = {entry["id"]: entry for entry in payload["catalog"]}
@@ -24,6 +25,7 @@ class MatchProvider:
             "proposal": "Обсудить возможность содействия проекту.",
             "rationale": "Вуз уже реализует проект.",
             "discussion_question": "Какой формат подходит вузу?",
+            "regional_case_id": self.regional_case_id,
         }
         return json.dumps({"matches": [proposal] if self.catalog_id else []})
 
@@ -82,3 +84,40 @@ def test_matching_product_is_allowed_only_with_its_own_fact(catalog_id, value):
     provider.basis = [general.fact_id]
     with pytest.raises(LLMError, match="invalid_partnership_response"):
         asyncio.run(match_partnership(provider, [initiative, general], meeting))
+
+
+def test_event_requires_a_relevant_fact_and_a_future_date():
+    event = "sber-ai-transformation-2026-12"
+    topic = fact("specific", FactField.PROJECT_DESCRIPTION, "Вуз внедряет искусственный интеллект в работу преподавателей.")
+    program = fact("program", FactField.EDUCATION_AREAS, "Прикладная информатика")
+    provider = MatchProvider(event, [topic.fact_id])
+    today = date(2026, 11, 27)
+    result, = asyncio.run(match_partnership(provider, [topic, program], MeetingContext(), today=today))
+    assert result.event_start == date(2026, 12, 2)
+    provider.catalog_id = None
+    for facts, meeting in (([program], MeetingContext()), ([topic], MeetingContext(date="2026-12-02"))):
+        assert not asyncio.run(match_partnership(provider, facts, meeting, today=today))
+        assert event not in provider.catalog
+
+
+def test_regional_case_must_belong_to_the_selected_product():
+    program = fact("program", FactField.EDUCATION_AREAS, "Цифровые технологии в клинической практике")
+    provider = MatchProvider("school-21", [program.fact_id], "saratov-medical-school-21")
+    result, = asyncio.run(match_partnership(provider, [program], MeetingContext()))
+    assert result.regional_case.location == "Саратов"
+    assert result.regional_case.url.host == "21-school.ru"
+    provider.regional_case_id = "siberia-university-workshops"
+    with pytest.raises(LLMError, match="invalid_partnership_response"):
+        asyncio.run(match_partnership(provider, [program], MeetingContext()))
+
+
+def test_banking_practice_needs_a_matching_spo_program():
+    banking = "sber-spo-banking-practice"
+    program = fact("banking", FactField.EDUCATION_AREAS, "38.02.07 Банковское дело")
+    provider = MatchProvider(banking, [program.fact_id], "novosibirsk-banking-spo")
+    result, = asyncio.run(match_partnership(provider, [program], MeetingContext()))
+    assert result.regional_case.location == "Новосибирск"
+    provider.catalog_id = None
+    unrelated = fact("other", FactField.EDUCATION_AREAS, "Экономика предприятия")
+    assert not asyncio.run(match_partnership(provider, [unrelated], MeetingContext()))
+    assert banking not in provider.catalog

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -26,12 +26,17 @@ from parser.utils import HttpClient
 from app.services.llm.client import ConfigurationError, GigaChatProvider, GigaChatSettings, LLMError
 from app.auth.security import decode_access_token
 from app.services.llm.card_chat import HISTORY_LIMIT, answer_card
-from app.services.llm.card_intake import plan_collection
+from app.services.llm.card_intake import (
+    continue_intake, intake_options_answer, is_short_name, plan_collection, registry_intake_options,
+    short_creation_request,
+)
 from app.services.llm.collection_intent import named_update_query, refresh_scope, refresh_sources
 from app.services.llm.general_chat import answer_general, registry_answer
 from app.services.llm.models import Institution, MeetingContext, StrictModel
 from app.services.llm.official_sources import official_leadership_document, official_reference_document
-from app.services.llm.partnership import PartnershipMatch, match_partnership, partnership_facts
+from app.services.llm.partnership import (
+    MATCH_CATALOG, REGIONAL_CASES, PartnershipMatch, event_is_upcoming, match_partnership, partnership_facts,
+)
 from app.services.llm.pipeline import AssistantPipeline, DraftValidationError, fact_needs_recheck
 from app.services.llm.render import render_markdown
 from app.services.llm.workflow import LLMWorkflow
@@ -88,7 +93,10 @@ def get_collector():
         settings.max_retries = 1
         settings.timeout = min(settings.timeout, 20)
         settings.max_total_requests = min(settings.max_total_requests, 30)
-        settings.fetch_item_pages = False
+        settings.fetch_item_pages = include_institution and not leadership_url
+        settings.max_pages_per_section = 1
+        settings.max_items_per_section = min(settings.max_items_per_section, 3)
+        settings.max_item_documents = min(settings.max_item_documents, 2)
         settings.max_bios = min(settings.max_bios, 3)
         # SvelteKit-сайты (например, МГУ) отдают пустой HTML без браузера.
         settings.enable_playwright = True
@@ -100,8 +108,12 @@ def get_collector():
             profile = (UniversityProfile(slug="selected-official-sources", name=name, url=website,
                        sections=(SectionSpec(name="leadership", url=leadership_url),) if leadership_url else (),
                        bio_urls=(biography_url,) if biography_url else ()) if leadership_url or biography_url else None)
-            result = parser.parse(url=website, name=name, profile=profile,
-                                  allowed_sections=("about", "leadership", "contacts") if include_institution or not leadership_url else ("leadership",))
+            sections = ("leadership",) if leadership_url and not include_institution else (
+                "about", "leadership", "contacts",
+            )
+            if settings.fetch_item_pages:
+                sections += ("projects", "partnerships", "events")
+            result = parser.parse(url=website, name=name, profile=profile, allowed_sections=sections)
             if not leadership_url:
                 official = official_leadership_document(parser.client, website, result.documents,
                                                         max_chars=settings.max_document_chars)
@@ -113,6 +125,17 @@ def get_collector():
                                                                             max_chars=settings.max_document_chars))]
             if len(reference_documents) < len(institution_urls):
                 result.warnings.append("Часть справочных HTML-страниц не получена. Для PDF используйте отдельное поле отчёта.")
+            if include_institution and not leadership_url:
+                known_paths = {urlsplit(url).path.rstrip("/") for url in (*existing, *institution_urls)}
+                for path in ("/sveden/education", "/sveden/objects"):
+                    if path in known_paths:
+                        continue
+                    reference = official_reference_document(
+                        parser.client, urljoin(website, path + "/"), website, name,
+                        max_chars=settings.max_document_chars,
+                    )
+                    if reference is not None:
+                        reference_documents.append(reference)
             pdf_documents, pdf_errors = parser.collect_pdf_documents(pdf_sources)
             result.errors.extend(pdf_errors)
             reference_documents.extend(pdf_documents)
@@ -256,9 +279,13 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
         research, _ = workflow.create(Institution(id=card["id"], name=card["name"], card_version=card["version"]),
                                        parsed, job_id, modes=("0.2", "0.3") if (source_options or {}).get("include_institution") else ("0.2",))
         repository.set_latest(card["id"], research.run_id)
-        research = await workflow.extract(research.run_id, context_fields=[
+        research = await workflow.extract(research.run_id, meeting_profile=not leadership_url, context_fields=[
             "institution.profile", "institution.type", "institution.location", "institution.founded",
-            "institution.education_areas", "institution.education_levels", "institution.students", "institution.structure"])
+            "institution.education_areas", "institution.education_levels", "institution.students",
+            "institution.teaching_staff", "institution.budget_students", "institution.dormitory_capacity",
+            "institution.dormitory_occupancy", "institution.structure", "project.name", "project.program",
+            "project.role", "project.partner", "project.status", "project.period", "project.description",
+            "event.name", "event.type", "event.date", "event.status", "event.description"])
         has_candidates = any(fact.validation_status == "passed" and not fact.issues for fact in research.facts)
         if research.status == "failed" or not has_candidates:
             stage_errors = [error.code for result in research.results.values() for error in result.errors]
@@ -412,10 +439,28 @@ def chat_history(card_id: str, user_id=Depends(chat_user), repository=Depends(ge
     return [{"id": turn["id"], "question": turn["question"], "answer": turn["answer"]} for turn in turns]
 
 
-async def start_chat_collection(args, payload, user_id, background, repository, pipeline, collector):
+async def intake_confirmation(repository, answer):
+    args = answer.get("collection_request")
+    if args and not args.get("website") and (is_short_name(args["name"]) or answer.get("requires_confirmation")):
+        name = args["name"]
+        choices = registry_intake_options(name, await checked_async(repository.cards))
+        if not choices:
+            try:
+                website = await resolve_intake_website(" ".join(filter(None, (name, args["city"]))), None)
+            except HTTPException as exc:
+                if exc.detail not in {"official_site_not_found", "official_site_discovery_failed", "public_website_required"}:
+                    raise
+            else:
+                choices = [{**args, "website": website}]
+        return {**intake_options_answer(name, choices), "intake_goal": answer.get("intake_goal")}
+    return answer
+
+
+async def start_chat_collection(args, payload, user_id, background, repository, pipeline, collector, *, confirmation=None):
     website = await resolve_intake_website(args["name"], args.get("website"))
+    key = f"confirmed:{confirmation}" if confirmation else payload.request_key
     return await enqueue_card_intake(args["name"], args["city"], website,
-                                     f"chat:{user_id}:{payload.request_key}",
+                                     f"chat:{user_id}:{key}",
                                      background, repository, pipeline, collector)
 
 
@@ -430,23 +475,33 @@ async def general_chat_message(payload: ChatRequest, background: BackgroundTasks
                                collector=Depends(get_collector)):
     turns = repository.general_chat_history(user_id, HISTORY_LIMIT)
     try:
-        answer = await answer_general(pipeline.provider, turns, payload.message)
+        answer = (short_creation_request(payload.message) or await continue_intake(pipeline.provider, payload.message, turns)
+                  or await answer_general(pipeline.provider, turns, payload.message))
     except LLMError as exc:
         raise HTTPException(502, str(exc)) from None
     except WorkflowError as exc:
         raise HTTPException(422, str(exc)) from None
     if "registry_query" in answer:
         answer = registry_answer(await checked_async(lambda: repository.cards()), answer["registry_query"])
+        if answer.get("pending_institution"):
+            answer["intake_goal"] = payload.message
+    answer = await intake_confirmation(repository, answer)
     starts_collection = "collection_request" in answer
     if starts_collection:
+        turn_id = answer.get("confirmed_turn_id")
         collection = await start_chat_collection(
             answer["collection_request"], payload, user_id, background, repository, pipeline, collector,
+            confirmation=f"general:{turn_id}" if turn_id is not None else None,
         )
         job = collection["job"]
+        goal = answer.get("intake_goal")
         answer = {
             "text": job["message"] + ". Ход сбора и результат видны в карточке.",
             "sources": [], "cards": [collection["card"]],
         }
+        if goal:
+            answer["intake_goal"] = goal
+            answer["text"] += " После сбора сверьте сведения, чтобы продолжить подготовку материалов."
     return checked(lambda: repository.save_general_chat_turn(
         user_id, turns[-1]["id"] if turns else None, payload.message, answer, require_current=not starts_collection,
     ))
@@ -457,13 +512,17 @@ async def chat_intake(payload: ChatRequest, background: BackgroundTasks, user_id
                       repository=Depends(get_repository), pipeline=Depends(get_pipeline),
                       collector=Depends(get_collector)):
     try:
-        args = await plan_collection(pipeline.provider, payload.message)
+        explicit = short_creation_request(payload.message)
+        args = explicit["collection_request"] if explicit else await plan_collection(pipeline.provider, payload.message)
     except LLMError as exc:
         raise HTTPException(502, str(exc)) from None
     except WorkflowError as exc:
         raise HTTPException(422, str(exc)) from None
     if args is None:
         return {"message": "Укажите название учреждения и попросите создать карточку. Официальный сайт можно не указывать."}
+    answer = await intake_confirmation(repository, {"collection_request": args})
+    if "collection_request" not in answer:
+        return {"message": answer["text"] + "\nДля подтверждения откройте чат агента."}
     return {"collection": await start_chat_collection(args, payload, user_id, background, repository, pipeline, collector)}
 
 
@@ -477,18 +536,30 @@ async def chat_message(card_id: str, payload: ChatRequest, background: Backgroun
     registry = await checked_async(repository.cards) if named_update_query(payload.message) else None
     direction = refresh_scope(payload.message, card, registry) if registry is not None else None
     try:
-        answer = direction or await answer_card(pipeline.provider, card, run, context, payload.message)
+        answer = (short_creation_request(payload.message) or await continue_intake(pipeline.provider, payload.message, turns)
+                  or direction or await answer_card(pipeline.provider, card, run, context, payload.message))
     except LLMError as exc:
         raise HTTPException(502, str(exc)) from None
     except WorkflowError as exc:
         raise HTTPException(422, str(exc)) from None
     if "registry_query" in answer:
         answer = registry_answer(await checked_async(repository.cards), answer["registry_query"])
+        if answer.get("pending_institution"):
+            answer["intake_goal"] = payload.message
+    answer = await intake_confirmation(repository, answer)
+    last_id = turns[-1]["id"] if turns else None
     if "collection_request" in answer:
+        turn_id = answer.get("confirmed_turn_id")
+        if turn_id is not None:
+            acknowledgement = {"text": "Запускаю сбор по подтверждённому учреждению.", "sources": [],
+                               "intake_goal": answer.get("intake_goal")}
+            checked(lambda: repository.save_chat_turn(
+                card_id, user_id, run_id, revision, last_id, payload.message, acknowledgement,
+            ))
         return {"collection": await start_chat_collection(
             answer["collection_request"], payload, user_id, background, repository, pipeline, collector,
+            confirmation=f"{card_id}:{turn_id}" if turn_id is not None else None,
         )}
-    last_id = turns[-1]["id"] if turns else None
     if "refresh_request" in answer:
         if registry is None:
             registry = await checked_async(repository.cards)
@@ -665,10 +736,20 @@ def materials(run_id: str, payload: MaterialRequest, background: BackgroundTasks
     except DraftValidationError as exc:
         raise HTTPException(422, str(exc)) from None
     accepted_ids = {fact.fact_id for fact in selected}
+    now = datetime.now(timezone.utc)
     for match in payload.partnership_matches:
         if not set(match.basis_fact_ids) <= accepted_ids:
             raise HTTPException(422, "partnership_match_requires_selected_accepted_facts")
-    now = datetime.now(timezone.utc)
+        entry = next((item for item in MATCH_CATALOG.values() if item.url == match.catalog_url), None)
+        if match.regional_case and (not entry or not any(
+            case == match.regional_case and product_id == entry.id
+            for product_id, case in REGIONAL_CASES.values()
+        )):
+            raise HTTPException(422, "invalid_partnership_response")
+        if match.event_start or (entry and entry.event_start):
+            if (not entry or not entry.event_start or entry.event_start != match.event_start
+                    or not event_is_upcoming(entry.event_start, payload.meeting, now.date())):
+                raise HTTPException(422, "invalid_partnership_response")
     if any(fact_needs_recheck(fact, now, pipeline.review_window_days) for fact in selected):
         raise HTTPException(409, "facts_require_freshness_check")
     job, created = checked(lambda: repository.new_job(run.institution.id, payload.request_key, "material",

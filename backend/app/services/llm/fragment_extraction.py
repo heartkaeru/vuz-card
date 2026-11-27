@@ -7,13 +7,14 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from .client import LLMError
+from .contacts import CONTACT_FIELDS, reconcile_contact_candidates
 from .fragment_models import FragmentExtractionOutput, FragmentExtractionRequest
 from .models import Evidence, ExtractionResult, Fact, FactField, PipelineError, Subject, NonPersonSubject
 from .names import folded, person_name_in_quote
 from .evidence import literal_value_in_text
 
-CONTACT_FIELDS = {FactField.EMAIL, FactField.PHONE}
 BIOGRAPHY_FIELDS = {FactField.EDUCATION, FactField.DEGREE, FactField.TITLE, FactField.CAREER,
+                    FactField.BIRTH_DATE, FactField.BIRTH_PLACE, FactField.EXPERIENCE, FactField.HONORS,
                     FactField.INTERESTS, FactField.RESPONSIBILITIES, FactField.APPOINTED_AT}
 
 
@@ -308,6 +309,7 @@ async def extract_with_fragments(pipeline, request: FragmentExtractionRequest):
                         evidence=evidence, origin="parser_projection", validation_status="passed",
                         verification_status="pending",
                     ))
+    facts = reconcile_contact_candidates(facts, request.documents)
     # Derive an atomic name only from a supported person fact, never from an office label.
     named = {(normalized(f.subject.person_name), f.subject.department) for f in facts
              if f.subject.person_name and f.field == FactField.NAME and f.validation_status == "passed"}

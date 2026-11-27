@@ -16,10 +16,15 @@ class ContextField(str, Enum):
     EDUCATION_AREAS = "institution.education_areas"
     EDUCATION_LEVELS = "institution.education_levels"
     STUDENTS = "institution.students"
+    STAFF = "institution.teaching_staff"
+    BUDGET_STUDENTS = "institution.budget_students"
+    DORMITORY_CAPACITY = "institution.dormitory_capacity"
+    DORMITORY_OCCUPANCY = "institution.dormitory_occupancy"
     STRUCTURE = "institution.structure"
     PROJECT_NAME = "project.name"
     PROJECT_PROGRAM = "project.program"
     PROJECT_ROLE = "project.role"
+    PROJECT_PARTNER = "project.partner"
     PROJECT_STATUS = "project.status"
     PROJECT_PERIOD = "project.period"
     PROJECT_DESCRIPTION = "project.description"
@@ -36,6 +41,7 @@ class ContextFragment(StrictModel):
     end: int = Field(gt=0)
     # Parser-defined scope: one article/project/event, not a whole university website.
     entity_scope_id: str | None = Field(default=None, min_length=1)
+    entity_anchor_id: str | None = Field(default=None, min_length=1)
     # Only dedicated institutional reference pages, never project/news pages.
     institution_anchor_id: str | None = Field(default=None, min_length=1)
     page_number: int | None = Field(default=None, ge=1)
@@ -58,6 +64,8 @@ class ContextDocument(SourceDocument):
             previous_end = fragment.end
         if any(f.institution_anchor_id and f.institution_anchor_id not in ids for f in self.fragments):
             raise ValueError("Unknown institution anchor fragment")
+        if any(f.entity_anchor_id and f.entity_anchor_id not in ids for f in self.fragments):
+            raise ValueError("Unknown entity anchor fragment")
         return self
 
 

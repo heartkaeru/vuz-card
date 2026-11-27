@@ -2,7 +2,7 @@
 
 import re
 from collections.abc import Iterable
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -25,10 +25,18 @@ class MatchArgument(StrictModel):
     basis_fact_ids: list[str] = Field(min_length=1, max_length=10)
 
 
+class RegionalCase(StrictModel):
+    title: str
+    location: str
+    url: HttpUrl
+
+
 class PartnershipMatch(MatchArgument):
     product_name: str = Field(min_length=1, max_length=100)
     catalog_url: HttpUrl
     kind: CatalogKind = "sber_product"
+    regional_case: RegionalCase | None = None
+    event_start: date | None = None
 
     @field_validator("catalog_url")
     @classmethod
@@ -49,6 +57,7 @@ class CatalogEntry(StrictModel):
     available_for_matching: bool = True
     requires_operational_context: bool = False
     checked_on: date = date(2026, 11, 13)
+    event_start: date | None = None
 
 
 CATALOG = {entry.id: entry for entry in (
@@ -70,6 +79,24 @@ CATALOG = {entry.id: entry for entry in (
         audience="Студенты очной формы российского вуза, начиная со второго курса бакалавриата или специалитета, а также магистранты и аспиранты.",
         terms="Зависят от города, доступных направлений и отбора. Работа в офисе или в гибридном формате.",
         url="https://student.sber.ru/internship",
+    ),
+    CatalogEntry(
+        id="sber-spo-banking-practice", kind="sber_product", name="Сбер · практическая подготовка по банковскому делу",
+        audience="Колледжи и подразделения СПО с программой «Банковское дело».",
+        terms="Возможный формат для переговоров с территориальной командой Сбера. "
+              "Учебная площадка, места практики и формат зависят от отдельной договорённости.",
+        url="https://www.sberbank.ru/ru/sberpress/all/article?blockID=1303&lang=ru&newsID=b949a60a-e1ec-4741-a180-bf49b02c479d&regionID=77&type=NEWS",
+        checked_on=date(2026, 11, 27),
+    ),
+    CatalogEntry(
+        id="sber-ai-transformation-2026-12", kind="sber_product",
+        name="СберУниверситет · ИИ-трансформация университетов",
+        audience="Руководители и команды вузов, внедряющие ИИ в образовательные или управленческие процессы.",
+        terms="Интенсив 2–3 декабря 2026 года. Возможность участия и регистрации уточнить у организатора.",
+        url="https://sberuniversity.ru/learning/program/ai-transformatsiya-universitetov/",
+        matching_guidance="Выбирай только при подтверждённой задаче применения ИИ в работе университета "
+                          "или развитии компетенций преподавателей и руководителей. Общего ИТ-профиля мало.",
+        event_start=date(2026, 12, 2), checked_on=date(2026, 11, 27),
     ),
     CatalogEntry(
         id="netology-data-viz", kind="external_course", name="Нетология · Основы визуализации данных",
@@ -120,12 +147,33 @@ CATALOG = {entry.id: entry for entry in (
     ),
 )}
 MATCH_CATALOG = {key: entry for key, entry in CATALOG.items() if entry.available_for_matching}
+REGIONAL_CASES = {
+    "novosibirsk-banking-spo": ("sber-spo-banking-practice", RegionalCase(
+        title="Совместная программа по финансам для студентов СПО НГУЭУ",
+        location="Новосибирск",
+        url="https://bi.nsuem.ru/employee/news-and-classifieds/detail.php?ELEMENT_ID=147740",
+    )),
+    "saratov-medical-school-21": ("school-21", RegionalCase(
+        title="Соглашение о цифровой подготовке студентов медицинского университета",
+        location="Саратов",
+        url="https://21-school.ru/news/vraci-pisut-kod-skola-cifrovyx-texnologii-poiavitsia-v-saratove",
+    )),
+    "siberia-university-workshops": ("sber-university-academic-center", RegionalCase(
+        title="Практикумы по ИИ для руководителей университетов Сибири",
+        location="Сибирь",
+        url="https://sberuniversity.ru/news/Sber-i-universitety-Sibiri-obedinili-ekspertizu-dlya-poiska-otvetov-na-vyzovy-vysshego-obrazovaniya/",
+    )),
+}
+EVENT_TOPIC = re.compile(r"\b(?:искусственн\w* интеллект\w*|ии|нейросет\w*)\b")
+EVENT_NEED = re.compile(r"\b(?:преподавател\w*|руководител\w*|управлен\w*|внедр\w*|повышен\w* квалификац\w*)")
+SPO_LEVEL = re.compile(r"\bспо\b|средне\w* профессиональн\w* образован\w*|\bколледж\w*\b")
+SPO_BANKING = re.compile(r"\b38\.02\.07\b|\bбанковск\w* дел\w*\b")
 
 MATCH_FIELDS = {
     FactField.PROFILE, FactField.TYPE, FactField.LOCATION, FactField.EDUCATION_AREAS,
     FactField.EDUCATION_LEVELS, FactField.STUDENTS, FactField.STRUCTURE,
     FactField.PROJECT_NAME, FactField.PROJECT_PROGRAM, FactField.PROJECT_ROLE,
-    FactField.PROJECT_STATUS, FactField.PROJECT_PERIOD, FactField.PROJECT_DESCRIPTION,
+    FactField.PROJECT_PARTNER, FactField.PROJECT_STATUS, FactField.PROJECT_PERIOD, FactField.PROJECT_DESCRIPTION,
     FactField.EVENT_NAME, FactField.EVENT_TYPE, FactField.EVENT_DATE,
     FactField.EVENT_STATUS, FactField.EVENT_DESCRIPTION,
 }
@@ -174,6 +222,7 @@ PROMPT = (Path(__file__).parent / "prompts" / "match_partnership.txt").read_text
 
 class MatchProposal(MatchArgument):
     catalog_id: str = Field(json_schema_extra={"enum": list(MATCH_CATALOG)})
+    regional_case_id: str | None = None
 
 
 class MatchOutput(StrictModel):
@@ -201,8 +250,16 @@ def operational_initiative(fact: Fact, topics: tuple[re.Pattern[str], ...]) -> s
     return None
 
 
+def event_is_upcoming(event_start: date, meeting: MeetingContext, today: date) -> bool:
+    try:
+        meeting_date = date.fromisoformat(meeting.date) if meeting.date else today
+    except ValueError:
+        meeting_date = today
+    return event_start > max(today, meeting_date)
+
+
 async def match_partnership(
-    provider: JSONProvider, facts: list[Fact], meeting: MeetingContext
+    provider: JSONProvider, facts: list[Fact], meeting: MeetingContext, *, today: date | None = None,
 ) -> list[PartnershipMatch]:
     if not has_partnership_basis(facts):
         return []
@@ -211,9 +268,29 @@ async def match_partnership(
               and (initiative := operational_initiative(fact, topics))}
         for key, topics in OPERATIONAL_TOPICS.items()
     }
+    event_basis = {
+        fact.fact_id for fact in facts
+        if fact.field not in CONTEXT_ONLY_FIELDS and
+        EVENT_TOPIC.search(normalized(fact.value)) and EVENT_NEED.search(normalized(fact.value))
+    }
+    has_spo_level = any(
+        fact.field in {FactField.TYPE, FactField.EDUCATION_LEVELS} and SPO_LEVEL.search(normalized(fact.value))
+        for fact in facts
+    )
+    spo_basis = {
+        fact.fact_id for fact in facts if fact.field == FactField.EDUCATION_AREAS
+        and SPO_BANKING.search(normalized(fact.value))
+        and (has_spo_level or SPO_LEVEL.search(normalized(fact.value)) or "38.02.07" in fact.value)
+    }
+    required_basis = {
+        **{key: set(items) for key, items in operational_basis.items()},
+        "sber-ai-transformation-2026-12": event_basis, "sber-spo-banking-practice": spo_basis,
+    }
+    today = today or datetime.now(timezone.utc).date()
     catalog = {
         key: entry for key, entry in MATCH_CATALOG.items()
-        if not entry.requires_operational_context or operational_basis[key]
+        if (key not in required_basis or required_basis[key])
+        and (entry.event_start is None or event_is_upcoming(entry.event_start, meeting, today))
     }
     schema = MatchOutput.model_json_schema()
     schema["$defs"]["MatchProposal"]["properties"]["catalog_id"]["enum"] = list(catalog)
@@ -221,7 +298,11 @@ async def match_partnership(
         "meeting": meeting.model_dump(mode="json"),
         "catalog": [
             {**entry.model_dump(mode="json", exclude={"available_for_matching", "requires_operational_context"}),
-             **({"required_basis_fact_ids": sorted(operational_basis[key])} if entry.requires_operational_context else {})}
+             "regional_cases": [
+                 {"id": case_id, **case.model_dump(mode="json")}
+                 for case_id, (product_id, case) in REGIONAL_CASES.items() if product_id == key
+             ],
+             **({"required_basis_fact_ids": sorted(required_basis[key])} if key in required_basis else {})}
             for key, entry in catalog.items()
         ],
         "facts": [{
@@ -252,6 +333,11 @@ async def match_partnership(
         if not basis & basis_ids:
             continue
         entry = catalog[catalog_id]
+        if catalog_id in required_basis and not basis & required_basis[catalog_id]:
+            raise LLMError("invalid_partnership_response")
+        case_ref = REGIONAL_CASES.get(proposal.regional_case_id)
+        if proposal.regional_case_id and (case_ref is None or case_ref[0] != catalog_id):
+            raise LLMError("invalid_partnership_response")
         rationale = proposal.rationale
         if entry.requires_operational_context:
             initiatives = [operational_basis[catalog_id][fact_id] for fact_id in proposal.basis_fact_ids
@@ -262,9 +348,10 @@ async def match_partnership(
             if planned:
                 rationale = planned if len(planned) <= 220 else "В источнике указаны планы вуза по этой инициативе."
         matches.append(PartnershipMatch(
-            **proposal.model_dump(exclude={"catalog_id", "basis_fact_ids", "rationale"}),
+            **proposal.model_dump(exclude={"catalog_id", "basis_fact_ids", "rationale", "regional_case_id"}),
             rationale=rationale,
             basis_fact_ids=list(dict.fromkeys(proposal.basis_fact_ids)),
             product_name=entry.name, catalog_url=entry.url, kind=entry.kind,
+            regional_case=case_ref[1] if case_ref else None, event_start=entry.event_start,
         ))
     return matches

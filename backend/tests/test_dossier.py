@@ -172,6 +172,24 @@ def metric_extract(context=None, refs=None):
 METRIC = {"period": "2025 году", "scope": "студентов очной формы головного вуза", "unit": "человек"}
 
 
+def test_profile_dormitory_capacity_keeps_its_unit_and_period():
+    request = metric_request()
+    text = "Учебный университет. В 2026 году вместимость общежитий — 274 места."
+    request.documents[0].text = text
+    request.documents[0].fragments = [request.documents[0].fragments[0].model_copy(update={"end": len(text)})]
+    request.fields = [ContextField.DORMITORY_CAPACITY, ContextField.PROJECT_NAME]
+    payload = {"subject": {"entity_kind": "institution", "entity_name": "Учебный университет",
+                           "entity_fragment_id": "current"},
+               "field": "institution.dormitory_capacity", "value": "274", "value_fragment_id": "current",
+               "fragment_ids": ["current"], "metric_context": {
+                   "period": "2026 году", "scope": "вместимость общежитий", "unit": "места"}}
+    result, = asyncio.run(AssistantPipeline(FixtureProvider([{"facts": [payload], "gaps": []}])).extract_facts(request)).facts
+    assert result.verification_status == "pending" and result.metric_context.unit == "места"
+    payload["metric_context"]["unit"] = "человек"
+    result, = asyncio.run(AssistantPipeline(FixtureProvider([{"facts": [payload], "gaps": []}])).extract_facts(request)).facts
+    assert "institution_metric_unit_mismatch" in result.issues
+
+
 def test_qualified_metric_remains_candidate_and_preserves_population():
     fact = metric_extract(METRIC).facts[0]
     assert fact.validation_status == "passed" and fact.verification_status == "pending"

@@ -10,11 +10,17 @@ from pydantic import ValidationError
 from .client import LLMError
 from .context_models import ContextExtractionOutput, ContextExtractionRequest
 from .evidence import literal_value_in_text
-from .models import EntitySubject, Evidence, ExtractionResult, Fact, FactField, PipelineError
+from .models import INSTITUTION_METRICS, EntitySubject, Evidence, ExtractionResult, Fact, FactField, PipelineError
 from .names import folded
 
 
 INSTITUTION_NOUN = r"(?:университет|институт|академия|колледж|техникум|училище|школа|вуз|учреждение|образовательная организация)"
+METRIC_TOPICS = {
+    "institution.teaching_staff": r"преподавател|педагог|профессорско",
+    "institution.budget_students": r"бюджет",
+    "institution.dormitory_capacity": r"общежити",
+    "institution.dormitory_occupancy": r"общежити",
+}
 FOUNDING_ACTION = r"(?:основан|учрежд[её]н|создан|образован)(?:а|о)?"
 FOUNDING_CONTEXT = re.compile(
     r"\b(?:дата\s+(?:создания|основания)|год\s+основания)(?:\s+образовательной\s+организации)?\s*(?=[:|–—-]|\d)"
@@ -30,7 +36,8 @@ def normalize(value):
 
 def batches(document, size):
     """Keep one entity scope together; never silently split its title from the text."""
-    anchors = {f.institution_anchor_id for f in document.fragments if f.institution_anchor_id}
+    anchors = {anchor for f in document.fragments
+               if (anchor := f.institution_anchor_id or f.entity_anchor_id)}
     if len(anchors) == 1:
         anchor = next(f for f in document.fragments if f.fragment_id == next(iter(anchors)))
         batch, length = [anchor], anchor.end - anchor.start
@@ -77,13 +84,14 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
 
     request = ContextExtractionRequest.model_validate_json(request.model_dump_json())
     prompt = (PROMPTS / "extract_context.txt").read_text(encoding="utf-8")
-    reference_selection = bool(request.fields and all(f.value.startswith("institution.") for f in request.fields))
-    metric_requested = request.fields is not None and any(f.value == "institution.students" for f in request.fields)
-    if reference_selection:
-        prompt = (("Для institution.students укажи value_fragment_id блока со значением и value как дословное "
-                  "число или выражение численности из него. Для остальных полей указывай value_fragment_id без value. "
-                  if metric_requested else "Для этого запроса ОБЯЗАТЕЛЬНО выбирай value_fragment_id, не возвращай value. ") +
-                  "Для полей, кроме institution.students, выбирай один целый исходный абзац по его ID; текст перенесёт сервис. "
+    has_institution_fields = bool(request.fields and any(f.value.startswith("institution.") for f in request.fields))
+    only_institution_fields = has_institution_fields and all(f.value.startswith("institution.") for f in request.fields)
+    metric_requested = request.fields is not None and any(f.value in INSTITUTION_METRICS for f in request.fields)
+    if has_institution_fields:
+        prompt = (("Для численных показателей укажи value_fragment_id блока со значением и value как дословное "
+                  "число или выражение численности из него. "
+                  if metric_requested else "") +
+                  "Для остальных полей institution.* выбирай один целый исходный абзац по его ID; текст перенесёт сервис. "
                   "Не собирай собственные перечисления из разных абзацев. "
                   "metric_context для численности остаётся обязательным.\n\n" + prompt)
     facts, gaps, errors, seen = [], [], [], set()
@@ -121,7 +129,7 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
             }
             if request.fields is not None:
                 schema["$defs"]["ContextFactProposal"]["properties"]["field"]["enum"] = [f.value for f in request.fields]
-            if reference_selection:
+            if only_institution_fields:
                 definition = schema["$defs"]["ContextFactProposal"]
                 if not metric_requested:
                     del definition["properties"]["value"]
@@ -143,11 +151,13 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
             gaps.extend(output.gaps)
             for item in output.facts:
                 issues = []
-                is_metric = item.field.value == "institution.students"
+                reference_selection = has_institution_fields and item.field.value.startswith("institution.")
+                is_metric = item.field.value in INSTITUTION_METRICS
+                metric_prefix = "student_metric" if item.field.value == "institution.students" else "institution_metric"
                 if reference_selection and not is_metric and item.value_fragment_id is None:
                     issues.append("invalid_context_value_selection")
                 if is_metric and item.value is None:
-                    issues.append("student_metric_number_required")
+                    issues.append(f"{metric_prefix}_number_required")
                 if item.value_fragment_id is not None:
                     if item.value_fragment_id not in item.fragment_ids or item.value_fragment_id not in text:
                         issues.append("invalid_context_value_selection")
@@ -186,7 +196,7 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                     issues.append("context_entity_value_scope_mismatch")
                 if is_metric:
                     if item.metric_context is None:
-                        issues.append("student_metric_context_required")
+                        issues.append(f"{metric_prefix}_context_required")
                     else:
                         # All qualifiers must be supported by the very same occurrence.
                         qualified = [ref for ref in refs if ref in fragments and anchor is not None and (
@@ -195,13 +205,24 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                             or subject.entity_kind == "institution"
                             and fragments[ref].institution_anchor_id == anchor.fragment_id)]
                         metric_text = " ".join(text[ref] for ref in qualified)
-                        if "student_metric_number_required" not in issues and not re.search(r"\d", item.value):
-                            issues.append("student_metric_number_required")
+                        if f"{metric_prefix}_number_required" not in issues and not re.search(r"\d", item.value):
+                            issues.append(f"{metric_prefix}_number_required")
                         if not re.search(r"\b(?:19|20)\d{2}\b", item.metric_context.period):
-                            issues.append("student_metric_period_required")
+                            issues.append(f"{metric_prefix}_period_required")
                         if any(not literal_value_in_text(value, metric_text)
                                for value in item.metric_context.model_dump(exclude_none=True).values()):
-                            issues.append("student_metric_context_not_in_scope")
+                            issues.append(f"{metric_prefix}_context_not_in_scope")
+                        topic = METRIC_TOPICS.get(item.field.value)
+                        if topic and not re.search(topic, item.metric_context.scope, re.I):
+                            issues.append("institution_metric_scope_required")
+                        if item.field.value == "institution.dormitory_occupancy" and not re.search(
+                            r"%|процент", item.metric_context.unit, re.I,
+                        ):
+                            issues.append("institution_metric_unit_mismatch")
+                        if item.field.value == "institution.dormitory_capacity" and not re.search(
+                            r"\bмест", item.metric_context.unit, re.I,
+                        ):
+                            issues.append("institution_metric_unit_mismatch")
                 elif item.metric_context is not None:
                     issues.append("metric_context_on_non_metric_fact")
                 if item.field.value == "institution.founded":
@@ -250,7 +271,7 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
     # Multiple incompatible values in one source occurrence are review flags.
     groups = {}
     for fact in facts:
-        if fact.validation_status == "passed" and fact.field.value == "institution.students" and fact.metric_context:
+        if fact.validation_status == "passed" and fact.field in INSTITUTION_METRICS and fact.metric_context:
             metric = fact.metric_context
             key = (fact.subject.entity_id, fact.field, normalize(metric.period), normalize(metric.scope),
                    normalize(metric.coverage or ""), normalize(metric.unit))
