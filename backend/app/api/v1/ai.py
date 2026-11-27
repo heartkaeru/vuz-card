@@ -258,11 +258,25 @@ async def collect_job(repository, pipeline, collector, card, job_id, leadership_
         research, _ = workflow.create(Institution(id=card["id"], name=card["name"], card_version=card["version"]),
                                        parsed, job_id, modes=("0.2", "0.3") if (source_options or {}).get("include_institution") else ("0.2",))
         repository.set_latest(card["id"], research.run_id)
+        repository.update_job(job_id, progress=55, message="GigaChat обрабатывает первый запрос")
+
+        def update_extraction_progress(mode, processed, total, _chunk_id):
+            progress = min(94, 55 + int(39 * processed / max(1, total)))
+            try:
+                repository.update_job(
+                    job_id,
+                    progress=progress,
+                    message=f"Извлечение через GigaChat: схема {mode}, запрос {processed} из примерно {total}",
+                )
+            except Exception:
+                LOGGER.exception("Не удалось обновить прогресс извлечения: задание=%s", job_id)
+
         research = await workflow.extract(research.run_id, context_fields=[
             "institution.profile", "institution.type", "institution.location", "institution.founded",
             "institution.education_areas", "institution.education_levels", "institution.students", "institution.structure",
             "project.name", "project.program", "project.role", "project.status", "project.period", "project.description",
-            "event.name", "event.type", "event.date", "event.status", "event.description"])
+            "event.name", "event.type", "event.date", "event.status", "event.description"],
+            progress_callback=update_extraction_progress)
         stage_errors = list(research.errors)
         for result in research.results.values():
             stage_errors.extend(error.code for error in result.errors)

@@ -81,7 +81,10 @@ class GigaChatProvider:
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ], response_format={"type": "json_schema", "schema": schema, "strict": True})
         if choice.finish_reason != "stop":
-            LOGGER.error("Запрос к GigaChat завершился ошибкой: %s", describe_error("incomplete_model_response"))
+            LOGGER.error(
+                "GigaChat вернул неполный ответ: причина завершения=%s",
+                choice.finish_reason or "не указана",
+            )
             raise LLMError("incomplete_model_response")
         if not choice.message.content:
             LOGGER.error("Запрос к GigaChat завершился ошибкой: %s", describe_error("empty_model_response"))

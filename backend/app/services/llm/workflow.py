@@ -55,7 +55,7 @@ class LLMWorkflow:
         return self.repository.create(institution, card.model_dump(mode="json"), request_key,
                                       tuple(dict.fromkeys(modes)))
 
-    async def extract(self, run_id: str, *, context_fields=None) -> ResearchRun:
+    async def extract(self, run_id: str, *, context_fields=None, progress_callback=None) -> ResearchRun:
         if self.pipeline is None:
             raise WorkflowError("llm_provider_required")
         run = self.repository.get(run_id)
@@ -70,6 +70,18 @@ class LLMWorkflow:
         run = self.repository.mutate(run_id, run.revision, start)
         card = UniversityData.model_validate(self.repository.source_card(run_id))
         results, errors, cancelled = {}, [], False
+        processed_chunks = 0
+        total_chunks = self.pipeline.max_chunks * sum(
+            max(1, (len(context_fields) + 2) // 3) if mode == "0.3" and context_fields else 1
+            for mode in run.requested_modes
+        )
+
+        def report_progress(mode, chunk_id):
+            nonlocal processed_chunks
+            processed_chunks += 1
+            if progress_callback is not None:
+                progress_callback(mode, processed_chunks, total_chunks, chunk_id)
+
         try:
             for mode in run.requested_modes:
                 selected = documents_for(card, mode)
@@ -91,7 +103,13 @@ class LLMWorkflow:
                     payload["fields"] = context_fields
                 try:
                     request = parse_extraction_request(json.dumps(payload, ensure_ascii=False))
-                    results[mode] = await self.pipeline.extract_facts(request)
+                    if progress_callback is None:
+                        results[mode] = await self.pipeline.extract_facts(request)
+                    else:
+                        results[mode] = await self.pipeline.extract_facts(
+                            request,
+                            progress_callback=lambda chunk_id, current_mode=mode: report_progress(current_mode, chunk_id),
+                        )
                 except ValidationError:
                     errors.append(f"{mode}:invalid_parser_llm_contract")
                 except LLMError as exc:

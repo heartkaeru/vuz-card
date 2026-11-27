@@ -72,7 +72,7 @@ def batches(document, size):
         yield batch
 
 
-async def extract_context(pipeline, request: ContextExtractionRequest):
+async def extract_context(pipeline, request: ContextExtractionRequest, *, progress_callback=None):
     from .pipeline import PROMPTS, complete_validated
 
     request = ContextExtractionRequest.model_validate_json(request.model_dump_json())
@@ -139,7 +139,11 @@ async def extract_context(pipeline, request: ContextExtractionRequest):
                 errors.append(PipelineError(source_id=document.source_id, chunk_id=chunk_id,
                                             code=str(exc) if isinstance(exc, LLMError)
                                             else "invalid_context_json"))
+                if progress_callback:
+                    progress_callback(chunk_id)
                 continue
+            if progress_callback:
+                progress_callback(chunk_id)
             gaps.extend(output.gaps)
             for item in output.facts:
                 issues = []
