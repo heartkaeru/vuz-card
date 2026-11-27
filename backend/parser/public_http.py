@@ -85,6 +85,9 @@ class PublicSiteAdapter(requests.adapters.HTTPAdapter):
 def public_site_session():
     session = requests.Session()
     session.trust_env = False
+    # Признак для парсера: резервные загрузчики (curl_cffi, Playwright)
+    # тоже должны обращаться только к публичной сети.
+    session.public_only = True
     adapter = PublicSiteAdapter()
     session.mount("http://", adapter)
     session.mount("https://", adapter)

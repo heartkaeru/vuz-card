@@ -3,6 +3,7 @@
 import re
 
 from .models import BiographySubject
+from .utils import sentence_boundaries
 
 
 def split_biography_sentences(document):
@@ -13,7 +14,7 @@ def split_biography_sentences(document):
         if fragment.contact_hints or text == fragment.heading or len(text) < 180:
             fragments.append(fragment)
             continue
-        starts = [0, *[match.end() for match in re.finditer(r"(?<=[а-яёA-Za-z»)])\.\s+(?=[А-ЯЁA-Z])", text)]]
+        starts = [0, *sentence_boundaries(text)]
         if len(starts) == 1:
             fragments.append(fragment)
             continue

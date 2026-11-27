@@ -1,17 +1,16 @@
 # Развёртывание на VPS
 
-Инструкция рассчитана на один Linux-сервер с Docker Compose и внешний Supabase. Домен необязателен: Caddy может получить короткоживущий сертификат и для публичного IPv4.
+Инструкция рассчитана на один Linux-сервер с Docker Compose и SQLite в постоянном Docker-томе. Домен необязателен: Caddy может получить короткоживущий сертификат и для публичного IPv4.
 
 ## Что подготовить
 
 1. VPS с публичным IPv4 и SSH-доступом.
 2. Публичный IPv4 сервера. Если есть домен, в DNS добавьте для него A-запись на этот адрес.
-3. Строку PostgreSQL `DATABASE_URL` из Supabase Dashboard → Connect.
-4. Значения GigaChat и `JWT_SECRET_KEY` для backend. Секреты храните только в env-файле на сервере.
+3. Значения GigaChat и `JWT_SECRET_KEY` для backend. Секреты храните только в env-файле на сервере.
 
 ## Файлы с настройками
 
-В корне репозитория создайте `backend/.env` из шаблона и заполните `DATABASE_URL`, `JWT_SECRET_KEY`, `GIGACHAT_CREDENTIALS`, `GIGACHAT_MODEL` и `GIGACHAT_SCOPE`:
+В корне репозитория создайте `backend/.env` из шаблона и заполните `JWT_SECRET_KEY`, `GIGACHAT_CREDENTIALS`, `GIGACHAT_MODEL` и `GIGACHAT_SCOPE`:
 
 ```sh
 cp backend/.env.example backend/.env
@@ -37,18 +36,61 @@ SITE_ADDRESS=203.0.113.10
 chmod 600 backend/.env deploy/site.env
 ```
 
+## Ресурсы сервера и Chromium
+
+Парсер использует headless-Chromium (Playwright) для SPA-сайтов вузов и
+проверок «вы не бот» на агрегаторах. Ориентиры для сервера 1 vCPU / 2 ГБ / 100 ГБ:
+
+| Что | Память | Диск |
+| --- | --- | --- |
+| Система и Docker | ~250–350 МБ | — |
+| Backend (FastAPI, парсер, словари pymorphy3) | ~250–400 МБ | образ ~1,5 ГБ, из них Chromium с библиотеками ~0,6 ГБ |
+| Chromium во время рендеринга | ~250–400 МБ | — |
+| Frontend (Next.js) | ~150–250 МБ | ~0,5 ГБ |
+| Caddy | ~30 МБ | ~0,1 ГБ |
+
+Итого в пике около 1–1,4 ГБ из 2 ГБ: Chromium помещается, если одновременно
+работает **один** браузер. Это задано по умолчанию (`PARSER_MAX_BROWSERS=1`):
+параллельные задания ждут очереди, а не запускают второй браузер. Картинки,
+видео и шрифты в браузере не загружаются. При сборке образа нужно ещё
+~2–3 ГБ свободного диска и ~1 ГБ памяти, поэтому собирайте, когда на сервере
+не идёт сбор.
+
+Перед запуском проверьте свободные ресурсы:
+
+```sh
+free -h
+df -h /
+docker system df
+```
+
+На 2 ГБ памяти рекомендуется файл подкачки на 2 ГБ: он страхует сборку образа и
+пиковые моменты от остановки процессов из-за нехватки памяти.
+
+```sh
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+Проверить, что Chromium в контейнере запускается (при сборке это делается
+автоматически — в логе должна быть строка `chromium ok`):
+
+```sh
+docker compose exec backend python -c "from parser.stealth import StealthFetcher; f = StealthFetcher(enable_playwright=True); print(f._playwright_get('https://example.com', 30).status_code); f.close()"
+```
+
 ## Запуск
 
 После установки Docker Engine и Compose Plugin из официальной инструкции для ОС сервера, в каталоге репозитория выполните:
 
 ```sh
 docker compose up -d --build
-docker compose exec backend python -m database.postgres migrate
 docker compose ps
 docker compose logs --tail=100
 ```
-
-`migrate` applies any new versioned Supabase schema changes. It does not remove card data; data is purged only when the authenticated API receives an explicit `DELETE /api/v1/ai/cards/{card_id}` request.
 
 Откройте `https://<публичный-ip>` или `https://<домен>`. Caddy использует профиль Let's Encrypt `shortlived` и автоматически обновляет сертификат. Публичный IPv4 должен быть постоянным, а входящие порты 80 и 443 — доступны снаружи. Let’s Encrypt выдаёт такие сертификаты на 160 часов, поэтому автоматическое продление важно. См. [объявление Let’s Encrypt](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability) и [документацию Caddy](https://caddyserver.com/docs/caddyfile/directives/tls#issuers).
 

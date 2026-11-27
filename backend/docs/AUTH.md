@@ -30,4 +30,4 @@
 
 Успешный вход возвращает `access_token`, `token_type` и срок действия в секундах. Неверные данные возвращают `401`.
 
-Передавайте токен в заголовке `Authorization: Bearer <access_token>`. Middleware требует действующий JWT для `POST`, `PUT`, `PATCH` и `DELETE` по `/api/v1/universities` и `/api/v1/universities/{university_id}`. GET-запросы к карточкам и реестру остаются открытыми.
+Передавайте токен в заголовке `Authorization: Bearer <access_token>` для API-операций, требующих авторизации, например истории и сообщений чата.

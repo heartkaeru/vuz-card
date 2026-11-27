@@ -43,7 +43,7 @@ export type PartnershipMatch = {
   catalog_url: string; basis_fact_ids: string[]; kind: "sber_product" | "external_course";
 };
 export type Material = { material_id: string; download_url: string; brief_url: string; presentation_variant?: PresentationVariant };
-export type SavedMaterial = { id: string; name: string; format: string; created_at: string; stale: boolean; download_url: string; preview_url: string; brief_url: string };
+export type SavedMaterial = { id: string; material_id: string; name: string; format: "PPTX" | "DOCX"; created_at: string; stale: boolean; download_url: string; preview_url: string; brief_url: string };
 export type Job = {
   job_id: string; status: string; task_type: string; progress: number; message: string;
   identity?: { expected_revision?: number; leadership_url?: string | null; biography_url?: string | null;
@@ -94,6 +94,8 @@ const errors: Record<string, string> = {
   official_site_not_found: "Не удалось найти официальный сайт по этому названию. Уточните название или укажите сайт вручную.",
   official_site_discovery_failed: "Не удалось выполнить поиск официального сайта. Повторите попытку позже или укажите сайт вручную.",
   collection_failed: "Сбор завершился ошибкой. Сервер сохранил технический журнал задания; проверьте доступность сайта и настройки ИИ.",
+  collection_cancelled: "Сбор остановлен.",
+  job_not_cancellable: "Это задание нельзя остановить этой кнопкой.",
   stale_run_revision: "Данные уже изменились. Обновите карточку и повторите действие.",
   card_job_already_running: "Для этой карточки уже выполняется задание.",
   facts_changed_during_generation: "Во время генерации факты изменились. Сформируйте материалы заново.",
@@ -131,8 +133,10 @@ const errors: Record<string, string> = {
   incomplete_model_response: "Ответ модели прерван. Часть сведений не обработана; повторите сбор или уточните источник.",
 };
 
+export const BACKEND_CONNECTION_ERROR = "Не удалось подключиться к серверу. Убедитесь, что backend запущен.";
+
 export function errorText(error: unknown) {
-  if (error instanceof TypeError && /fetch|network/i.test(error.message)) return "Не удалось подключиться к серверу. Убедитесь, что backend запущен.";
+  if (error instanceof TypeError && /fetch|network/i.test(error.message)) return BACKEND_CONNECTION_ERROR;
   return error instanceof Error ? errors[error.message] ?? (/^[a-z0-9_:.-]+$/.test(error.message)
     ? `Не удалось выполнить действие (код: ${error.message}).` : error.message) : "Не удалось выполнить действие.";
 }
