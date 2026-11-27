@@ -43,7 +43,7 @@ export type PartnershipMatch = {
   catalog_url: string; basis_fact_ids: string[]; kind: "sber_product" | "external_course";
 };
 export type Material = { material_id: string; download_url: string; brief_url: string; presentation_variant?: PresentationVariant };
-export type SavedMaterial = { id: string; name: string; format: string; created_at: string; stale: boolean; download_url: string; preview_url: string; brief_url: string };
+export type SavedMaterial = { id: string; material_id: string; name: string; format: "PPTX" | "DOCX"; created_at: string; stale: boolean; download_url: string; preview_url: string; brief_url: string };
 export type Job = {
   job_id: string; status: string; task_type: string; progress: number; message: string;
   identity?: { expected_revision?: number; leadership_url?: string | null; biography_url?: string | null;

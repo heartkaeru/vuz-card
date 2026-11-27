@@ -138,7 +138,7 @@ def to_llm_request(
 def to_officials(
     card: UniversityData, *, institution_id: str, require_person_name: bool = False
 ) -> list[dict[str, object]]:
-    """Руководство в формате ``app.schemas.university.Official``.
+    """Преобразует сведения о руководстве в API-представление.
 
     ``require_person_name`` отбрасывает записи, где вместо ФИО оказался
     абзац или заголовок страницы (для автоматического заполнения CRM).
@@ -176,7 +176,7 @@ def to_university_detail(
     university_id: int = 1,
     short_name: str | None = None,
 ) -> dict[str, object]:
-    """Карточка в формате ``app.schemas.university.UniversityDetail``."""
+    """Преобразует собранные сведения в API-представление карточки."""
 
     return {
         "id": university_id,

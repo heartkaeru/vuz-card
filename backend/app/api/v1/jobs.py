@@ -1,8 +1,6 @@
-"""Compatibility routes for the Supabase-backed AI refresh workflow."""
+"""Compatibility route for checking background task status."""
 
-from uuid import UUID, uuid4
-
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, HTTPException
 
 from app.schemas.job import JobResponse, JobStatusEnum
 
@@ -27,30 +25,6 @@ def _job_response(job: dict, university_id: str | None = None):
         "completed_at": job.get("completed_at"),
         "result": job.get("result"),
     }
-
-
-@router.post(
-    "/universities/{university_id}/refresh",
-    response_model=JobResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Запустить AI-сбор и проверку сведений в Supabase-карточке",
-)
-async def trigger_university_refresh(university_id: UUID, background_tasks: BackgroundTasks):
-    from app.api.v1.ai import checked_async, collect_job, get_collector, get_pipeline, get_repository
-
-    repository = get_repository()
-    card_id = str(university_id)
-    card = await checked_async(lambda: repository.card(card_id))
-    pipeline, collector = get_pipeline(), get_collector()
-    source_options = {"include_institution": True, "public_site_only": True}
-    request_key = f"legacy-refresh:{uuid4().hex}"
-    job, created = repository.new_job(card_id, request_key, "collect", {
-        "version": card["version"], "leadership_url": None, **source_options,
-    })
-    if created:
-        background_tasks.add_task(collect_job, repository, pipeline, collector,
-                                  card, job["job_id"], source_options=source_options)
-    return _job_response(job, card_id)
 
 
 @router.get("/jobs/{job_id}", response_model=JobResponse, summary="Проверить статус фоновой задачи")

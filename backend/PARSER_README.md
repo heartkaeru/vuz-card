@@ -102,7 +102,7 @@ POST /api/v1/ai/cards/intake
 → 202 + card + job (сервер находит сайт и запускает парсер и извлечение фактов)
 ```
 
-Поле `website` можно передать, если официальный адрес уже известен. Без него backend вызывает тот же автоопределитель, что и парсер, затем сохраняет карточку и ставит фоновое задание в активное хранилище `DemoRepository`/Postgres. Статус и результаты доступны через `/api/v1/ai/cards/{card_id}` и `/api/v1/ai/jobs/{job_id}`. Старые `/api/v1/universities/*` помечены deprecated и используют демонстрационное хранилище.
+Поле `website` можно передать, если официальный адрес уже известен. Без него backend вызывает тот же автоопределитель, что и парсер, затем сохраняет карточку и ставит фоновое задание в SQLite-хранилище `DemoRepository`. Статус и результаты доступны через `/api/v1/ai/cards/{card_id}` и `/api/v1/ai/jobs/{job_id}`.
 
 В API сбор идёт только по публичной сети: это касается и резервной загрузки
 через `curl_cffi`/Playwright (адреса, разрешающиеся во внутренние IP,
@@ -230,7 +230,7 @@ context_request = to_llm_request(
     card, institution_id="hse", schema_version="0.3"
 )
 
-# Формат app.schemas.university.Official
+# Представление руководителей для API
 officials = to_officials(card, institution_id="hse")
 ```
 

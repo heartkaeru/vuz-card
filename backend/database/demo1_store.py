@@ -12,6 +12,7 @@ from parser.public_http import website_key
 from app.services.llm.card_chat import refresh_reply
 from app.services.llm.card_edits import edited_fact
 from app.services.llm.changes import effective_facts, normalized
+from app.services.llm.models import DraftResult
 from app.services.llm.workflow_models import WorkflowError
 
 LOGGER = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ class DemoRepository(LLMRepository):
 
     def __init__(self, path):
         super().__init__(path)
+        expired_reports = []
         with closing(connect(self.path)) as db, db:
             execute_statements(db, '''
             CREATE TABLE IF NOT EXISTS llm_card (
@@ -43,6 +45,12 @@ class DemoRepository(LLMRepository):
               payload TEXT NOT NULL CHECK(json_valid(payload)), UNIQUE(card_id,request_key));
             CREATE TABLE IF NOT EXISTS llm_saved_material (
               material_id TEXT PRIMARY KEY REFERENCES llm_material(material_id), saved_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS llm_saved_report (
+              report_id TEXT PRIMARY KEY,
+              material_id TEXT NOT NULL REFERENCES llm_material(material_id),
+              format TEXT NOT NULL CHECK(format IN ('PPTX','DOCX')),
+              saved_at TEXT NOT NULL,
+              UNIQUE(material_id,format));
             CREATE TABLE IF NOT EXISTS llm_report_migration (
               key TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS llm_purge_context (
@@ -89,6 +97,32 @@ class DemoRepository(LLMRepository):
             if not db.execute("SELECT 1 FROM llm_report_migration WHERE key='legacy_reports' ").fetchone():
                 db.execute("INSERT OR IGNORE INTO llm_saved_material(material_id,saved_at) SELECT material_id,created_at FROM llm_material")
                 db.execute("INSERT INTO llm_report_migration(key) VALUES ('legacy_reports')")
+            if not db.execute("SELECT 1 FROM llm_report_migration WHERE key='format_reports'").fetchone():
+                db.execute("""INSERT OR IGNORE INTO llm_saved_report(report_id,material_id,format,saved_at)
+                    SELECT material_id || ':PPTX', material_id, 'PPTX', saved_at FROM llm_saved_material""")
+                for row in db.execute("SELECT material_id,created_at FROM llm_material").fetchall():
+                    if (self.path.parent / "presentations" / f"{row['material_id']}.docx").is_file():
+                        db.execute("""INSERT OR IGNORE INTO llm_saved_report(report_id,material_id,format,saved_at)
+                            VALUES (?,?,'DOCX',?)""", (f"{row['material_id']}:DOCX", row["material_id"], row["created_at"]))
+                db.execute("INSERT INTO llm_report_migration(key) VALUES ('format_reports')")
+            cards = db.execute("""SELECT DISTINCT r.institution_id FROM llm_saved_report s
+                JOIN llm_material m ON m.material_id=s.material_id
+                JOIN llm_run r ON r.run_id=m.run_id""").fetchall()
+            for (card_id,) in cards:
+                old_rows = db.execute("""SELECT s.report_id,s.material_id,s.format FROM llm_saved_report s
+                    JOIN llm_material m ON m.material_id=s.material_id
+                    JOIN llm_run r ON r.run_id=m.run_id WHERE r.institution_id=?
+                    ORDER BY s.saved_at DESC,s.rowid DESC LIMIT -1 OFFSET 2""", (card_id,)).fetchall()
+                for old in old_rows:
+                    db.execute("DELETE FROM llm_saved_report WHERE report_id=?", (old["report_id"],))
+                    if old["format"] == "PPTX":
+                        db.execute("DELETE FROM llm_saved_material WHERE material_id=?", (old["material_id"],))
+                    expired_reports.append((old["material_id"], old["format"].lower()))
+        for material_id, extension in expired_reports:
+            try:
+                (self.path.parent / "presentations" / f"{material_id}.{extension}").unlink(missing_ok=True)
+            except OSError:
+                LOGGER.exception("Could not remove expired %s report %s", extension, material_id)
 
     def general_chat_history(self, user_id, limit):
         with closing(connect(self.path)) as db:
@@ -216,6 +250,19 @@ class DemoRepository(LLMRepository):
         if card is not None and card[0] and card[0] != run.run_id:
             raise WorkflowError("research_superseded_by_new_collection")
 
+    def material(self, material_id):
+        # A generated report is an immutable snapshot. A newer collection makes it
+        # archival, but must not make the saved file inaccessible.
+        with closing(connect(self.path)) as db:
+            row = db.execute("SELECT run_id,fact_revision,payload FROM llm_material WHERE material_id=?", (material_id,)).fetchone()
+            if row is None:
+                raise WorkflowError("material_not_found")
+            run = self._read(db, row[0])
+            LLMRepository._check_run(self, db, run)
+            card = db.execute("SELECT latest_run FROM llm_card WHERE id=?", (run.institution.id,)).fetchone()
+            superseded = card is not None and card[0] is not None and card[0] != run.run_id
+            return DraftResult.model_validate_json(row[2]), run.revision != row[1] or superseded
+
     def create_card(self, name, city, website):
         with closing(connect(self.path)) as db, db:
             db.execute("BEGIN IMMEDIATE")
@@ -295,6 +342,9 @@ class DemoRepository(LLMRepository):
                 WHERE json_extract(saved_card.value, '$.id')=?
             )""", (card_id,))
             db.execute("""DELETE FROM llm_saved_material WHERE material_id IN (
+                SELECT m.material_id FROM llm_material m JOIN llm_run r ON r.run_id=m.run_id WHERE r.institution_id=?
+            )""", (card_id,))
+            db.execute("""DELETE FROM llm_saved_report WHERE material_id IN (
                 SELECT m.material_id FROM llm_material m JOIN llm_run r ON r.run_id=m.run_id WHERE r.institution_id=?
             )""", (card_id,))
             db.execute("""DELETE FROM llm_material_fact WHERE material_id IN (
@@ -388,14 +438,15 @@ class DemoRepository(LLMRepository):
 
     def materials(self):
         with closing(connect(self.path)) as db:
-            rows = db.execute("""SELECT m.material_id,m.created_at,m.run_id,m.payload,c.name
-                FROM llm_material m JOIN llm_run r ON r.run_id=m.run_id
+            rows = db.execute("""SELECT s.report_id,s.format,s.saved_at,m.material_id,m.run_id,m.payload,c.name
+                FROM llm_saved_report s JOIN llm_material m ON m.material_id=s.material_id
+                JOIN llm_run r ON r.run_id=m.run_id
                 JOIN llm_card c ON c.id=r.institution_id
-                JOIN llm_saved_material s ON s.material_id=m.material_id
-                ORDER BY m.rowid DESC""").fetchall()
+                ORDER BY s.saved_at DESC,s.rowid DESC""").fetchall()
         result = []
         for row in rows:
-            path = self.path.parent / "presentations" / f"{row['material_id']}.pptx"
+            extension = row["format"].lower()
+            path = self.path.parent / "presentations" / f"{row['material_id']}.{extension}"
             if not path.is_file():
                 continue
             try:
@@ -405,24 +456,60 @@ class DemoRepository(LLMRepository):
             # Old/superseded material payloads retain their variant independently of current research.
             variant = json.loads(row["payload"]).get("presentation_variant", "detailed")
             label = "Краткая карточка" if variant == "compact" else "Подробная справка"
-            result.append({"id": row["material_id"], "name": f"{label}: {row['name']}", "presentation_variant": variant,
-                "format": "PPTX", "created_at": row["created_at"], "stale": stale,
-                "download_url": f"/api/v1/ai/materials/{row['material_id']}/download",
+            result.append({"id": row["report_id"], "material_id": row["material_id"],
+                "name": f"{label}: {row['name']}", "presentation_variant": variant,
+                "format": row["format"], "created_at": row["saved_at"], "stale": stale,
+                "download_url": f"/api/v1/ai/materials/{row['material_id']}/download?format={extension}",
                 "preview_url": f"/api/v1/ai/materials/{row['material_id']}/preview",
                 "brief_url": f"/api/v1/ai/materials/{row['material_id']}/brief"})
         return result
 
-    def save_material_to_reports(self, material_id):
+    def save_material_to_reports(self, material_id, format="PPTX"):
+        format = format.upper()
+        if format not in {"PPTX", "DOCX"}:
+            raise WorkflowError("unsupported_report_format")
+        report_id = f"{material_id}:{format}"
+        removed = []
         with closing(connect(self.path)) as db, db:
-            if not db.execute("SELECT 1 FROM llm_material WHERE material_id=?", (material_id,)).fetchone():
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT r.institution_id FROM llm_material m
+                JOIN llm_run r ON r.run_id=m.run_id WHERE m.material_id=?""", (material_id,)).fetchone()
+            if row is None:
                 raise WorkflowError("material_not_found")
-            db.execute("INSERT OR IGNORE INTO llm_saved_material(material_id,saved_at) VALUES (?,?)",
-                       (material_id, stamp().isoformat()))
-        return {"saved": True}
+            db.execute("""INSERT OR IGNORE INTO llm_saved_report(report_id,material_id,format,saved_at)
+                VALUES (?,?,?,?)""", (report_id, material_id, format, stamp().isoformat()))
+            saved = db.execute("""SELECT s.report_id,s.material_id,s.format FROM llm_saved_report s
+                JOIN llm_material m ON m.material_id=s.material_id
+                JOIN llm_run r ON r.run_id=m.run_id
+                WHERE r.institution_id=? ORDER BY s.saved_at DESC,s.rowid DESC""", (row[0],)).fetchall()
+            for old in saved[2:]:
+                db.execute("DELETE FROM llm_saved_report WHERE report_id=?", (old["report_id"],))
+                if old["format"] == "PPTX":
+                    db.execute("DELETE FROM llm_saved_material WHERE material_id=?", (old["material_id"],))
+                removed.append((old["material_id"], old["format"].lower()))
+        folder = self.path.parent / "presentations"
+        for old_material_id, extension in removed:
+            try:
+                (folder / f"{old_material_id}.{extension}").unlink(missing_ok=True)
+            except OSError:
+                LOGGER.exception("Could not remove expired %s report %s", extension, old_material_id)
+        return {"saved": True, "report_id": report_id, "removed": len(removed)}
 
-    def remove_material_from_reports(self, material_id):
+    def remove_material_from_reports(self, report_id):
+        if ":" in report_id:
+            material_id, format = report_id.rsplit(":", 1)
+            format = format.upper()
+        else:
+            material_id, format = report_id, "PPTX"
         with closing(connect(self.path)) as db, db:
-            if not db.execute("SELECT 1 FROM llm_saved_material WHERE material_id=?", (material_id,)).fetchone():
+            row = db.execute("SELECT 1 FROM llm_saved_report WHERE material_id=? AND format=?", (material_id, format)).fetchone()
+            if row is None:
                 raise WorkflowError("report_not_found")
-            db.execute("DELETE FROM llm_saved_material WHERE material_id=?", (material_id,))
+            db.execute("DELETE FROM llm_saved_report WHERE material_id=? AND format=?", (material_id, format))
+            if format == "PPTX":
+                db.execute("DELETE FROM llm_saved_material WHERE material_id=?", (material_id,))
+        try:
+            (self.path.parent / "presentations" / f"{material_id}.{format.lower()}").unlink(missing_ok=True)
+        except OSError:
+            LOGGER.exception("Could not remove report %s", report_id)
         return {"deleted": True}

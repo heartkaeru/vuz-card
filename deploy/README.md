@@ -1,17 +1,16 @@
 # Развёртывание на VPS
 
-Инструкция рассчитана на один Linux-сервер с Docker Compose и внешний Supabase. Домен необязателен: Caddy может получить короткоживущий сертификат и для публичного IPv4.
+Инструкция рассчитана на один Linux-сервер с Docker Compose и SQLite в постоянном Docker-томе. Домен необязателен: Caddy может получить короткоживущий сертификат и для публичного IPv4.
 
 ## Что подготовить
 
 1. VPS с публичным IPv4 и SSH-доступом.
 2. Публичный IPv4 сервера. Если есть домен, в DNS добавьте для него A-запись на этот адрес.
-3. Строку PostgreSQL `DATABASE_URL` из Supabase Dashboard → Connect.
-4. Значения GigaChat и `JWT_SECRET_KEY` для backend. Секреты храните только в env-файле на сервере.
+3. Значения GigaChat и `JWT_SECRET_KEY` для backend. Секреты храните только в env-файле на сервере.
 
 ## Файлы с настройками
 
-В корне репозитория создайте `backend/.env` из шаблона и заполните `DATABASE_URL`, `JWT_SECRET_KEY`, `GIGACHAT_CREDENTIALS`, `GIGACHAT_MODEL` и `GIGACHAT_SCOPE`:
+В корне репозитория создайте `backend/.env` из шаблона и заполните `JWT_SECRET_KEY`, `GIGACHAT_CREDENTIALS`, `GIGACHAT_MODEL` и `GIGACHAT_SCOPE`:
 
 ```sh
 cp backend/.env.example backend/.env
@@ -89,12 +88,9 @@ docker compose exec backend python -c "from parser.stealth import StealthFetcher
 
 ```sh
 docker compose up -d --build
-docker compose exec backend python -m database.postgres migrate
 docker compose ps
 docker compose logs --tail=100
 ```
-
-`migrate` applies any new versioned Supabase schema changes. It does not remove card data; data is purged only when the authenticated API receives an explicit `DELETE /api/v1/ai/cards/{card_id}` request.
 
 Откройте `https://<публичный-ip>` или `https://<домен>`. Caddy использует профиль Let's Encrypt `shortlived` и автоматически обновляет сертификат. Публичный IPv4 должен быть постоянным, а входящие порты 80 и 443 — доступны снаружи. Let’s Encrypt выдаёт такие сертификаты на 160 часов, поэтому автоматическое продление важно. См. [объявление Let’s Encrypt](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability) и [документацию Caddy](https://caddyserver.com/docs/caddyfile/directives/tls#issuers).
 

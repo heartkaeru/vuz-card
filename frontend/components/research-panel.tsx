@@ -424,7 +424,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
         })
         : api<PptxPreviewData>(`/materials/${encodeURIComponent(currentMaterial.material_id)}/preview`);
       const [previewResult, reportsResult] = await Promise.allSettled([previewRequest, api<SavedMaterial[]>("/materials")]);
-      if (reportsResult.status === "fulfilled" && reportsResult.value.some((report) => report.id === currentMaterial.material_id)) {
+      if (reportsResult.status === "fulfilled" && reportsResult.value.some((report) => report.material_id === currentMaterial.material_id && report.format === downloadFormat.toUpperCase())) {
         setSavedMaterialId(currentMaterial.material_id);
       }
       if (previewResult.status === "rejected") throw previewResult.reason;
@@ -463,7 +463,7 @@ export const ResearchPanel = forwardRef<ResearchHandle, Props>(function Research
     setSavingToReports(true);
     setPreviewActionError("");
     try {
-      await api<{ saved: boolean }>(`/materials/${encodeURIComponent(material.material_id)}/report`, { method: "PUT" });
+      await api<{ saved: boolean }>(`/materials/${encodeURIComponent(material.material_id)}/report?format=${downloadFormat}`, { method: "PUT" });
       setSavedMaterialId(material.material_id);
     } catch (failure) {
       setPreviewActionError(errorText(failure));

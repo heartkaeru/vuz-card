@@ -680,16 +680,6 @@ def test_site_lookup_names_and_origin():
     assert _origin("http", "vuz.ru:8080") == "http://vuz.ru:8080/"
 
 
-def test_list_universities_sql_casts_optional_filters():
-    import inspect
-
-    from database.postgres import api_repository
-
-    source = inspect.getsource(api_repository.ApiRepository.list_universities) if hasattr(
-        api_repository, "ApiRepository") else inspect.getsource(api_repository)
-    assert "CAST(:region AS text) IS NULL" in source and "CAST(:search AS text) IS NULL" in source
-
-
 def test_llm_documents_keep_only_key_leadership_fragments():
     rows = "".join(
         f"<tr><td>Центр {index}</td><td>Сотрудников Сотрудник Сотрудникович{index % 10}</td>"

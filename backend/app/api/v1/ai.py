@@ -39,7 +39,6 @@ from app.services.llm.changes import compare_run, effective_facts
 from app.services.meeting_pptx import build_meeting_presentation
 from app.services.dossier_preview import build_dossier_preview
 from app.services.pptx_preview import preview_presentation
-from database.postgres.api_repository import SupabaseUniversityRepository
 
 router = APIRouter(prefix="/ai", tags=["Демо 1: сбор, проверка и презентация"])
 chat_bearer = HTTPBearer(auto_error=False)
@@ -59,10 +58,6 @@ def chat_user(credentials: HTTPAuthorizationCredentials | None = Depends(chat_be
 def get_repository():
     default = Path(__file__).resolve().parents[3] / "output/mvp/registry.sqlite3"
     sqlite_path = Path(os.environ.get("VUZ_MVP_DB", str(default)))
-    if os.environ.get("DATABASE_URL", "").strip():
-        from database.postgres.runtime_store import SupabaseDemoRepository
-
-        return SupabaseDemoRepository(sqlite_path)
     return DemoRepository(sqlite_path)
 
 
@@ -240,13 +235,6 @@ async def checked_async(operation):
         raise HTTPException(404 if code.endswith("not_found") else 409, code) from None
 
 
-async def resolve_registry_card_id(repository, workflow_card_id: str) -> str:
-    resolver = getattr(repository, "resolve_registry_id", None)
-    if resolver is None:
-        return workflow_card_id
-    return await checked_async(lambda: resolver(workflow_card_id))
-
-
 async def collect_job(repository, pipeline, collector, card, job_id, leadership_url=None, source_options=None):
     try:
         repository.update_job(job_id, status="running", progress=15, message="Сбор официальных страниц руководства")
@@ -315,6 +303,7 @@ async def material_job(repository, pipeline, run_id, payload, job_id):
         _, stale = repository.material(material_id)
         if stale:
             raise WorkflowError("facts_changed_during_generation")
+        repository.save_material_to_reports(material_id, "PPTX")
         repository.update_job(job_id, status="completed", progress=100, message="Презентация сформирована",
             result={"material_id": material_id, "download_url": f"/api/v1/ai/materials/{material_id}/download",
                     "brief_url": f"/api/v1/ai/materials/{material_id}/brief",
@@ -515,19 +504,6 @@ async def chat_message(card_id: str, payload: ChatRequest, background: Backgroun
 async def confirm_chat_edit(card_id: str, turn_id: int, user_id=Depends(chat_user),
                             repository=Depends(get_repository)):
     checked(lambda: repository.confirm_chat_edit(card_id, user_id, turn_id))
-    if os.environ.get("DATABASE_URL", "").strip():
-        card = await checked_async(lambda: repository.card(card_id))
-        run = repository.get(card["latest_run"]) if card.get("latest_run") else None
-        fact = next((item for item in reversed(run.facts)
-                     if item.origin == "manual_edit" and item.reviewed_by == user_id), None) if run else None
-        if fact:
-            try:
-                await SupabaseUniversityRepository().apply_ai_review(
-                    await resolve_registry_card_id(repository, card_id), [fact.model_dump(mode="json")],
-                    actor_label=f"chat-user:{user_id}", actor_type="human")
-            except Exception as exc:
-                LOGGER.error("Supabase chat edit sync failed (%s)", type(exc).__name__)
-                raise HTTPException(status_code=503, detail="supabase_edit_sync_failed") from None
     return {"status": "applied"}
 
 
@@ -605,18 +581,6 @@ async def review(run_id: str, payload: ReviewRequest, repository=Depends(get_rep
     result = checked(lambda: LLMWorkflow(repository).review(run_id, ReviewBatch(
         expected_revision=payload.expected_revision, decisions=payload.decisions,
         retirements=payload.retirements), actor=payload.reviewer))
-    accepted_ids = {decision.fact_id for decision in payload.decisions if decision.decision == "accept"}
-    if accepted_ids and os.environ.get("DATABASE_URL", "").strip():
-        accepted_facts = [fact.model_dump(mode="json") for fact in effective_facts(result)
-                          if fact.fact_id in accepted_ids]
-        if accepted_facts:
-            try:
-                await SupabaseUniversityRepository().apply_ai_review(
-                    await resolve_registry_card_id(repository, result.institution.id), accepted_facts,
-                    actor_label=f"ai-review:{run_id}:{payload.reviewer}")
-            except Exception as exc:
-                LOGGER.error("Supabase AI review sync failed (%s)", type(exc).__name__)
-                raise HTTPException(status_code=503, detail="supabase_ai_sync_failed") from None
     return result
 
 
@@ -663,20 +627,16 @@ def materials(run_id: str, payload: MaterialRequest, background: BackgroundTasks
 @router.get("/materials/{material_id}/download")
 def download(material_id: str, format: Literal["pptx", "docx"] = "pptx",
              repository=Depends(get_repository)):
-    draft, stale = checked(lambda: repository.material(material_id))
-    if stale:
-        raise HTTPException(409, "material_stale_after_review")
+    draft, _ = checked(lambda: repository.material(material_id))
     directory = repository.path.parent / "presentations"
     path = directory / f"{material_id}.{format}"
     if format == "docx" and not path.is_file():
         from app.services.llm.docx_export import build_word_document
         directory.mkdir(parents=True, exist_ok=True)
         build_word_document(draft, path)
-        _, stale = checked(lambda: repository.material(material_id))
-        if stale:
-            raise HTTPException(409, "material_stale_after_review")
     if not path.is_file():
         raise HTTPException(404, "material_file_not_found")
+    repository.save_material_to_reports(material_id, format.upper())
     media_types = {
         "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -692,8 +652,18 @@ def material_list(repository=Depends(get_repository)):
 
 
 @router.put("/materials/{material_id}/report")
-def save_material_to_reports(material_id: str, repository=Depends(get_repository)):
-    return checked(lambda: repository.save_material_to_reports(material_id))
+def save_material_to_reports(material_id: str, format: Literal["pptx", "docx"] = "pptx",
+                             repository=Depends(get_repository)):
+    draft, _ = checked(lambda: repository.material(material_id))
+    directory = repository.path.parent / "presentations"
+    path = directory / f"{material_id}.{format}"
+    if format == "docx" and not path.is_file():
+        from app.services.llm.docx_export import build_word_document
+        directory.mkdir(parents=True, exist_ok=True)
+        build_word_document(draft, path)
+    if not path.is_file():
+        raise HTTPException(404, "material_file_not_found")
+    return checked(lambda: repository.save_material_to_reports(material_id, format.upper()))
 
 
 @router.delete("/materials/{material_id}/report")
@@ -703,9 +673,7 @@ def remove_material_from_reports(material_id: str, repository=Depends(get_reposi
 
 @router.get("/materials/{material_id}/preview")
 def material_preview(material_id: str, repository=Depends(get_repository)):
-    _, stale = checked(lambda: repository.material(material_id))
-    if stale:
-        raise HTTPException(409, "material_stale_after_review")
+    checked(lambda: repository.material(material_id))
     path = repository.path.parent / "presentations" / f"{material_id}.pptx"
     if not path.is_file():
         raise HTTPException(404, "material_file_not_found")
@@ -714,7 +682,5 @@ def material_preview(material_id: str, repository=Depends(get_repository)):
 
 @router.get("/materials/{material_id}/brief")
 def brief(material_id: str, repository=Depends(get_repository)):
-    draft, stale = checked(lambda: repository.material(material_id))
-    if stale:
-        raise HTTPException(409, "material_stale_after_review")
+    draft, _ = checked(lambda: repository.material(material_id))
     return Response(render_markdown(draft, repository.material_facts(material_id)), media_type="text/markdown; charset=utf-8")
