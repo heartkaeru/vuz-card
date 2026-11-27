@@ -134,9 +134,16 @@ def test_ui_api_full_path_and_pptx_download(api_client):
         import sqlite3
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             db.execute("DELETE FROM llm_material_fact")
-    assert client.get("/api/v1/ai/materials").json() == []
+    reports = client.get("/api/v1/ai/materials").json()
+    assert len(reports) == 1 and reports[0]["material_id"] == job["result"]["material_id"]
+    assert reports[0]["format"] == "PPTX" and reports[0]["stale"] is False
     saved = client.put(f"/api/v1/ai/materials/{job['result']['material_id']}/report")
-    assert saved.status_code == 200 and saved.json() == {"saved": True}
+    assert saved.status_code == 200
+    assert saved.json() == {
+        "saved": True,
+        "report_id": f"{job['result']['material_id']}:PPTX",
+        "removed": 0,
+    }
     reports = client.get("/api/v1/ai/materials").json()
     assert len(reports) == 1 and reports[0]["stale"] is False
 
@@ -819,7 +826,7 @@ def test_new_collection_does_not_allow_reviewing_obsolete_run(api_client):
     assert repository.get(old_run["run_id"]).facts
 
 
-def test_pptx_is_not_current_after_rejection(api_client):
+def test_saved_pptx_remains_downloadable_and_marked_stale_after_rejection(api_client):
     client, repository, calls = api_client
     card, run = collected(client)
     run = client.post(f"/api/v1/ai/runs/{run['run_id']}/reviews", json=review_payload(run)).json()
@@ -828,7 +835,9 @@ def test_pptx_is_not_current_after_rejection(api_client):
     result = client.get(f"/api/v1/ai/jobs/{job['job_id']}").json()["result"]
     assert client.put(f"/api/v1/ai/materials/{result['material_id']}/report").status_code == 200
     client.post(f"/api/v1/ai/runs/{run['run_id']}/reviews", json=review_payload(run, "reject"))
-    assert client.get(result["download_url"]).status_code == 409
+    # Saved materials are archival snapshots and remain downloadable after a
+    # fact review changes; they are marked stale in the report list instead.
+    assert client.get(result["download_url"]).status_code == 200
     assert client.get("/api/v1/ai/materials").json()[0]["stale"] is True
 
 

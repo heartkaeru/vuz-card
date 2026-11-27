@@ -1,5 +1,6 @@
 from pathlib import Path
 import unittest
+from unittest.mock import Mock
 
 try:  # запуск из backend/ (pytest)
     from parser import main as parser_main
@@ -63,7 +64,13 @@ class SvedenParserTests(unittest.TestCase):
             self.html, url="https://example.ru/sveden/struct/", section="leadership"
         )
         self.soup = parser_main._make_soup(self.html)
-        self.parser = UniversityParser(Settings(fetch_bios=False))
+        # Parser unit tests use local HTML fixtures; don't access live websites
+        # when a parser method probes linked leadership pages.
+        client = Mock(cancel_event=None, last_error="fixture: network disabled", last_error_code="")
+        client.get.return_value = None
+        self.parser = UniversityParser(
+            Settings(fetch_bios=False, enable_playwright=False), client=client
+        )
         self.parser.profile = UNIVERSITY_PROFILES["spbu"]
 
     def tearDown(self) -> None:

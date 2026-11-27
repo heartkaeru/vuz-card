@@ -2441,7 +2441,7 @@ class UniversityParser:
                     Event(
                         title=item["title"],
                         type=_classify(haystack, EVENT_TYPE_KEYWORDS, "не определено"),
-                        date=item["date"],
+                        date=item["date"] or None,
                         description=item["description"],
                         url=item["url"],
                         source_url=doc.url,
@@ -2472,7 +2472,7 @@ class UniversityParser:
                 Event(
                     title=item["title"],
                     type=_classify(text, EVENT_TYPE_KEYWORDS, "не определено"),
-                    date=item["date"],
+                    date=item["date"] or None,
                     description=item["description"],
                     url=item["url"],
                     source_url=doc.url,

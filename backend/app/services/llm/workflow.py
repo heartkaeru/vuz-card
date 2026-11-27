@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from datetime import timedelta
 from uuid import uuid4
 
@@ -17,6 +18,9 @@ from .models import GenerationRequest, Institution, MeetingContext
 from .pipeline import REVIEW_WINDOW_DAYS, AssistantPipeline, DraftValidationError
 from .workflow_models import ResearchRun, ReviewBatch, WorkflowError
 from .changes import compare_run, effective_facts, head_key, person_aliases, person_identity, reconfirmation_matches
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def documents_for(card, mode):
@@ -116,6 +120,7 @@ class LLMWorkflow:
             errors.append("extraction_cancelled")
         except Exception:
             # Keep the source snapshot and failure; do not expose source/SDK details.
+            LOGGER.exception("Непредвиденная ошибка извлечения: задание=%s, схема=%s", run_id, mode)
             errors.append("unexpected_extraction_error")
         def finish(current, db, *, reconfirm=True):
             current.results = results

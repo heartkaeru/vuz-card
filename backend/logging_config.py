@@ -43,7 +43,10 @@ def configure_logging() -> None:
     # В терминале сервера показываем проблемы, а не каждую успешно прочитанную страницу.
     logging.getLogger("parser").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").disabled = True
-    logging.getLogger("uvicorn.error").disabled = True
+    server_errors = logging.getLogger("uvicorn.error")
+    server_errors.disabled = False
+    server_errors.setLevel(logging.INFO)
+    server_errors.propagate = True
     for name in ("httpx", "httpcore", "urllib3", "gigachat", "pymorphy3"):
         logging.getLogger(name).setLevel(logging.WARNING)
 

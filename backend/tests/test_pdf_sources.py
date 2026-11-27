@@ -126,7 +126,8 @@ class Response:
 def client_for(response):
     client = HttpClient(Settings(respect_robots=False, max_retries=1, max_response_bytes=1000))
     client.session.get = lambda *args, **kwargs: response
-    client.limiter.wait = lambda *args: None
+    # RateLimiter.wait returns False only when a collection was cancelled.
+    client.limiter.wait = lambda *args: True
     return client
 
 

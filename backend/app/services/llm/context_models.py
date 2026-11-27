@@ -42,6 +42,10 @@ class ContextFragment(StrictModel):
 
 
 class ContextDocument(SourceDocument):
+    # Keep source classification so the service can prioritize relevant pages
+    # when it splits a large context request into smaller field groups.
+    section: str = ""
+    category: str = "other"
     fragments: list[ContextFragment] = Field(min_length=1)
 
     @model_validator(mode="after")

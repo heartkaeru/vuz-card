@@ -108,14 +108,16 @@ def to_llm_request(
     """
 
     if schema_version == "0.3":
-        documents = [
-            to_llm_document(
+        documents = []
+        for document in card.documents:
+            item = to_llm_document(
                 document,
                 include_fragments=True,
                 include_contact_hints=False,
             )
-            for document in card.documents
-        ]
+            item["section"] = document.section
+            item["category"] = document.category
+            documents.append(item)
     else:
         documents = to_llm_documents(card.documents)
 

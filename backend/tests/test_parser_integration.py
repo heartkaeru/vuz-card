@@ -79,7 +79,9 @@ def test_cached_html_keeps_original_retrieval_date(tmp_path, age_days):
     cache = CrawlCache(tmp_path / "pages.json", 24)
     cache.set_page(url, "<main><h1>Ректор</h1><p>Иванов Иван Иванович</p></main>", url, "text/html")
     cache._data[url]["retrieved_at"] = stamp.isoformat()
-    client = Mock(last_error="timeout")
+    # Mock must explicitly disable cancellation: an unspecified Mock attribute
+    # is itself truthy and would make the parser treat the run as cancelled.
+    client = Mock(cancel_event=None, last_error="timeout", last_error_code="")
     client.get.return_value = None
     parser = UniversityParser(Settings(use_sqlite=False, enable_playwright=False), client=client)
     parser._cache = cache
