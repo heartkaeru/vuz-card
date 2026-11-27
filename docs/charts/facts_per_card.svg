@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="284" viewBox="0 0 900 284" font-family="Segoe UI, Arial, sans-serif">
+<rect width="900" height="284" fill="#ffffff"/>
+<text x="170" y="38" font-size="20" font-weight="600" fill="#1f3d2b">Извлечённые факты по карточкам</text>
+<text x="170" y="60" font-size="13" fill="#6b7f72">кандидаты после сбора и автопроверки</text>
+<text x="158" y="108" text-anchor="end" font-size="14" fill="#1f3d2b">УрФУ</text>
+<rect x="170" y="86" width="670.0" height="30" rx="4" fill="#21a038"/>
+<text x="850.0" y="107" font-size="14" font-weight="600" fill="#1f3d2b">451</text>
+<text x="158" y="164" text-anchor="end" font-size="14" fill="#1f3d2b">ЮУрГУ</text>
+<rect x="170" y="142" width="242.2" height="30" rx="4" fill="#21a038"/>
+<text x="422.2" y="163" font-size="14" font-weight="600" fill="#1f3d2b">163</text>
+<text x="158" y="220" text-anchor="end" font-size="14" fill="#1f3d2b">МГУ</text>
+<rect x="170" y="198" width="28.2" height="30" rx="4" fill="#21a038"/>
+<text x="208.2" y="219" font-size="14" font-weight="600" fill="#1f3d2b">19</text>
+</svg>
