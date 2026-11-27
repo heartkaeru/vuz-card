@@ -3,7 +3,10 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import timedelta
+from os.path import commonprefix
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -11,16 +14,40 @@ from pydantic import ValidationError
 from database.llm_store import LLMRepository, stamp
 from parser.llm_adapter import to_llm_request
 from parser.models import UniversityData
+from parser.utils import looks_like_person_name
 
 from .client import LLMError
-from .fragment_models import parse_extraction_request
-from .models import GenerationRequest, Institution, MeetingContext
+from .contacts import CONTACT_ROW_OWNER, refine_contact_hints
+from .evidence import literal_value_in_text
+from .fragment_models import FragmentDocument, FragmentExtractionRequest, parse_extraction_request
+from .models import INSTITUTION_METRICS, FactField, GenerationRequest, Institution, MeetingContext
+from .official_sources import official_basic_candidates, official_catalog_candidates, official_program_candidates
 from .pipeline import REVIEW_WINDOW_DAYS, AssistantPipeline, DraftValidationError
+from .render import render_accepted_facts_draft
 from .workflow_models import ResearchRun, ReviewBatch, WorkflowError
 from .changes import compare_run, effective_facts, head_key, person_aliases, person_identity, reconfirmation_matches
 
 
 LOGGER = logging.getLogger(__name__)
+DIRECTORY_SCOPE = re.compile(r"(?:/sveden/(?:struct|employees|pedagog)|/(?:structure|directory|staff|employees))(?:/|$)")
+REFERENCE_FIELDS = {
+    "education": ["institution.education_areas", "institution.education_levels", "institution.students",
+                  "institution.budget_students", "institution.teaching_staff"],
+    "objects": ["institution.dormitory_capacity", "institution.dormitory_occupancy"],
+}
+ACTING_HEAD_PREFIX = r"(?:и\.\s*о\.|врио|(?:временно\s+)?исполняющ(?:ий|ая)\s+обязанности)\s*"
+RECTORATE_ROW = re.compile(r"ректорат\s*\|\s*(?P<name>[^|]+)\|\s*(?P<position>[^|]+)(?:\|.*)?", re.I | re.S)
+DEPUTY_POSITION = re.compile(rf"(?:{ACTING_HEAD_PREFIX})?проректор(?:\s+по\b.+)?", re.I)
+RECTOR_POSITION = re.compile(rf"ректор|{ACTING_HEAD_PREFIX}ректор[а]?", re.I)
+MEETING_DIRECTORY_ROLE = re.compile(
+    rf"\b(?:{ACTING_HEAD_PREFIX}(?:ректор[а]?|директор[а]?)|ректор|проректор|"
+    r"при[её]мная\s+(?:ректора|директора)|при[её]мная комиссия|"
+    r"контакт[- ]центр|справочная(?: служба)?|канцелярия)\b", re.I,
+)
+NAVIGATION_LABELS = re.compile(
+    r"\b(?:абитуриентам|поступающим|студентам|сотрудникам|преподавателям|"
+    r"расписание|личный кабинет)\b"
+)
 
 
 def documents_for(card, mode):
@@ -28,7 +55,7 @@ def documents_for(card, mode):
     for document in card.documents:
         labels = {document.category, document.section}
         leadership = bool(labels & {"leadership", "contacts", "biography"})
-        context = bool(labels & {"organization", "about", "homepage", "research", "projects",
+        context = bool(labels & {"organization", "about", "homepage", "programs", "research", "projects",
                                 "grants", "project_news", "partnerships", "achievements", "events", "news"})
         unknown = not leadership and not context
         hints = any(f.contact_hints for f in document.fragments)
@@ -45,6 +72,98 @@ def documents_for(card, mode):
     return result
 
 
+def prepare_leadership_documents(documents, *, meeting_profile):
+    selected = []
+    for document in documents:
+        fragments = document["fragments"]
+        path = urlsplit(document["url"]).path.rstrip("/")
+        for fragment in fragments:
+            quote = document["text"][fragment["start"]:fragment["end"]]
+            refine_contact_hints(fragment, quote)
+            if path == "/sveden/struct" and not fragment.get("leadership_position") and not fragment.get("subject_department"):
+                row = RECTORATE_ROW.fullmatch(quote.strip())
+                if row:
+                    name, position = row["name"].strip(), row["position"].strip()
+                    if looks_like_person_name(name) and (RECTOR_POSITION.fullmatch(position)
+                                                         or DEPUTY_POSITION.fullmatch(position)):
+                        fragment["leadership_position"] = {"person_name": name, "position": position}
+        if meeting_profile and DIRECTORY_SCOPE.search(path):
+            relevant = [
+                fragment for fragment in fragments
+                if not fragment.get("subject_department") and (fragment.get("leadership_position")
+                    or MEETING_DIRECTORY_ROLE.search(document["text"][fragment["start"]:fragment["end"]]))
+            ]
+            referenced = {fid for fragment in relevant for hint in fragment["contact_hints"]
+                          for fid in hint["context_fragment_ids"]}
+            referenced.update(fragment["biography_subject"]["anchor_fragment_id"] for fragment in relevant
+                              if fragment.get("biography_subject"))
+            ids = referenced | {fragment["fragment_id"] for fragment in relevant}
+            if not ids:
+                continue
+            document["fragments"] = [fragment for fragment in fragments if fragment["fragment_id"] in ids]
+            for fragment in document["fragments"]:
+                fragment["contact_hints"] = [hint for hint in fragment["contact_hints"]
+                                             if set(hint["context_fragment_ids"]) <= ids]
+                biography = fragment.get("biography_subject")
+                if biography and biography["anchor_fragment_id"] not in ids:
+                    del fragment["biography_subject"]
+        selected.append(document)
+    return selected
+
+
+def skip_shared_navigation(documents):
+    """Omit repeated navigation fragments from prompts while preserving source offsets."""
+    by_prefix = {}
+    for document in documents:
+        text = document["text"]
+        if len(text) >= 1024:
+            host = (urlsplit(document["url"]).hostname or "").removeprefix("www.")
+            by_prefix.setdefault((host, text[:1024]), []).append(document)
+    for group in by_prefix.values():
+        if len({document["url"] for document in group}) < 2:
+            continue
+        prefix = commonprefix([document["text"] for document in group])
+        if len(set(NAVIGATION_LABELS.findall(prefix.casefold()))) < 3:
+            continue
+        for document in group:
+            fragments = document["fragments"]
+            if not any(fragment["end"] > len(prefix) for fragment in fragments):
+                continue
+            anchors = {fragment.get(field) for fragment in fragments
+                       for field in ("institution_anchor_id", "entity_anchor_id")}
+            anchors.update(fragment["biography_subject"]["anchor_fragment_id"] for fragment in fragments
+                           if fragment.get("biography_subject"))
+            anchors.update(fid for fragment in fragments for hint in fragment.get("contact_hints", ())
+                           for fid in hint.get("context_fragment_ids", ()))
+            document["fragments"] = [fragment for fragment in fragments
+                                     if fragment["end"] > len(prefix) or fragment["fragment_id"] in anchors
+                                     or fragment.get("leadership_position") or fragment.get("biography_subject")
+                                     or fragment.get("contact_hints")]
+
+
+def prioritize_review(facts):
+    leadership = {
+        fact.subject.person_name for fact in facts
+        if fact.field == FactField.POSITION and fact.subject.person_name
+        and not getattr(fact.subject, "department", None)
+        and (head_key(fact) or DEPUTY_POSITION.fullmatch(fact.value))
+    }
+    priorities = {
+        FactField.POSITION: 0, FactField.NAME: 1, FactField.EDUCATION_AREAS: 4,
+        **dict.fromkeys(INSTITUTION_METRICS, 4),
+        **dict.fromkeys((FactField.PROFILE, FactField.PROJECT_NAME, FactField.EVENT_NAME), 5),
+    }
+    def rank(fact):
+        if fact.subject.person_name in leadership:
+            return min(priorities.get(fact.field, 2), 2)
+        if fact.contact_owner and CONTACT_ROW_OWNER.search(f"{fact.contact_owner.label}:"):
+            return 3
+        if fact.field in {FactField.POSITION, FactField.NAME}:
+            return 7
+        return priorities.get(fact.field, 6)
+    facts.sort(key=lambda fact: (fact.verification_status == "rejected", rank(fact)))
+
+
 class LLMWorkflow:
     def __init__(self, repository: LLMRepository, pipeline: AssistantPipeline | None = None):
         self.repository = repository
@@ -59,7 +178,8 @@ class LLMWorkflow:
         return self.repository.create(institution, card.model_dump(mode="json"), request_key,
                                       tuple(dict.fromkeys(modes)))
 
-    async def extract(self, run_id: str, *, context_fields=None, progress_callback=None) -> ResearchRun:
+    async def extract(self, run_id: str, *, context_fields=None, meeting_profile=False,
+                      progress_callback=None) -> ResearchRun:
         if self.pipeline is None:
             raise WorkflowError("llm_provider_required")
         run = self.repository.get(run_id)
@@ -86,6 +206,8 @@ class LLMWorkflow:
         try:
             for mode in run.requested_modes:
                 selected = documents_for(card, mode)
+                if meeting_profile and mode == "0.3":
+                    selected = [doc for doc in selected if not DIRECTORY_SCOPE.search(urlsplit(doc.url).path)]
                 usable = [d for d in selected if d.text.strip() and d.fragments]
                 if len(usable) != len(selected):
                     errors.append(f"{mode}:empty_source_documents")
@@ -98,12 +220,59 @@ class LLMWorkflow:
                                          card_version=run.institution.card_version, schema_version=mode)
                 payload["institution"] = run.institution.model_dump(mode="json")
                 if mode == "0.2":
+                    payload["documents"] = prepare_leadership_documents(
+                        payload["documents"], meeting_profile=meeting_profile,
+                    )
+                    if not payload["documents"]:
+                        errors.append(f"{mode}:no_source_documents")
+                        continue
+                    if meeting_profile:
+                        skip_shared_navigation(payload["documents"])
                     # Proven parser contacts remain candidates even if the LLM omits one.
                     payload["project_structured_contacts"] = True
                 elif context_fields is not None:
                     payload["fields"] = context_fields
+                    if meeting_profile:
+                        skip_shared_navigation(payload["documents"])
+                    # Detail-page URLs come from individual project/event items, not section listings.
+                    detail_urls = {
+                        item.url.rstrip("/"): item.title
+                        for item in (*card.projects, *card.events)
+                        if item.url and item.title
+                    }
+                    for document in payload["documents"]:
+                        if meeting_profile:
+                            section = re.match(r"^/sveden/(education|objects)(?:/|$)", urlsplit(document["url"]).path)
+                            if section:
+                                document["fields"] = REFERENCE_FIELDS[section[1]]
+                            elif document.get("section") == "programs":
+                                document["fields"] = ["institution.education_areas", "institution.education_levels"]
+                        title = detail_urls.get(document["url"].rstrip("/"))
+                        if not title or not literal_value_in_text(title, document["title"]):
+                            continue
+                        fragments = document["fragments"]
+                        anchor = next((fragment for fragment in fragments
+                                       if literal_value_in_text(title, document["text"][fragment["start"]:fragment["end"]])), None)
+                        if anchor and not any(fragment.get("entity_scope_id") for fragment in fragments):
+                            for fragment in fragments:
+                                fragment["entity_scope_id"] = document["source_id"]
+                                fragment["entity_anchor_id"] = anchor["fragment_id"]
                 try:
-                    request = parse_extraction_request(json.dumps(payload, ensure_ascii=False))
+                    if mode == "0.2":
+                        valid_documents = []
+                        for document in payload["documents"]:
+                            try:
+                                valid_documents.append(FragmentDocument.model_validate(document))
+                            except ValidationError:
+                                LOGGER.warning("Документ исключён из извлечения руководства: запуск=%s, источник=%s",
+                                               run_id, document["source_id"])
+                        if len(valid_documents) != len(payload["documents"]):
+                            errors.append(f"{mode}:invalid_parser_llm_contract")
+                        if not valid_documents:
+                            continue
+                        request = FragmentExtractionRequest.model_validate({**payload, "documents": valid_documents})
+                    else:
+                        request = parse_extraction_request(json.dumps(payload, ensure_ascii=False))
                     if progress_callback is None:
                         results[mode] = await self.pipeline.extract_facts(request)
                     else:
@@ -111,6 +280,14 @@ class LLMWorkflow:
                             request,
                             progress_callback=lambda chunk_id, current_mode=mode: report_progress(current_mode, chunk_id),
                         )
+                    if mode == "0.3":
+                        facts = results[mode].facts
+                        fields = set(context_fields) if context_fields is not None else set(FactField)
+                        facts.extend(f for f in official_basic_candidates(stage_card.documents, run.institution, facts)
+                                     if f.field in fields)
+                        if FactField.EDUCATION_AREAS in fields:
+                            facts.extend(official_program_candidates(stage_card.documents, run.institution, facts))
+                        facts.extend(official_catalog_candidates(stage_card, run.institution, facts, fields))
                 except ValidationError:
                     errors.append(f"{mode}:invalid_parser_llm_contract")
                 except LLMError as exc:
@@ -125,6 +302,8 @@ class LLMWorkflow:
         def finish(current, db, *, reconfirm=True):
             current.results = results
             current.facts = [f.model_copy(deep=True) for result in results.values() for f in result.facts]
+            if meeting_profile:
+                prioritize_review(current.facts)
             current.errors = errors
             partial = bool(errors or card.errors or any(not r.complete for r in results.values()))
             if not results or not current.facts:
@@ -321,7 +500,14 @@ class LLMWorkflow:
         run, selected = self.material_facts(run_id, expected_revision, fact_ids)
         request = GenerationRequest(schema_version="0.3", institution=run.institution,
                                     facts=selected, meeting=meeting or MeetingContext())
-        draft = await self.pipeline.generate_materials(request)
+        try:
+            draft = await self.pipeline.generate_materials(request)
+        except DraftValidationError as exc:
+            if str(exc) != "unsupported_number":
+                raise
+            LOGGER.warning("Черновик модели отклонён из-за неподтверждённого числа; использованы принятые факты: запуск=%s",
+                           run_id)
+            draft = render_accepted_facts_draft(request)
         draft.presentation_variant = presentation_variant
         if run.target_kind == "draft":
             draft.warnings.append("Черновое исследование: личность и реквизиты учреждения не подтверждены в реестре CRM.")

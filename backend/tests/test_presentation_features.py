@@ -99,6 +99,8 @@ def test_presentation_places_rectors_photo_and_renders_grounded_match(tmp_path, 
     import app.services.meeting_card_pptx as renderer
 
     draft, facts, match = _rector_fixture(variant)
+    match["regional_case"] = {"title": "Пилот образовательной программы",
+                              "location": "Саратов", "url": "https://sber.example/cases/saratov"}
     monkeypatch.setattr(renderer, "download_official_portrait",
         lambda url, hosts: (_portrait_png(), (120, 180)))
     path = build_card_presentation(draft, tmp_path / f"{variant}.pptx", facts,
@@ -115,5 +117,9 @@ def test_presentation_places_rectors_photo_and_renders_grounded_match(tmp_path, 
     text = "\n".join(shape.text for shape in partnership[0].shapes if shape.has_text_frame)
     assert "Образовательная программа" in text
     assert "Какие направления приоритетны?" in text
+    assert "Похожий опыт · Саратов" in text
+    assert any(run.hyperlink.address == match["regional_case"]["url"]
+               for shape in partnership[0].shapes if shape.has_text_frame
+               for paragraph in shape.text_frame.paragraphs for run in paragraph.runs)
     assert "position" in partnership[0].notes_slide.notes_text_frame.text
     assert all(shape.top + shape.height <= deck.slide_height for slide in deck.slides for shape in slide.shapes)

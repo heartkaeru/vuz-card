@@ -4,8 +4,9 @@ from pydantic import Field, ValidationError
 
 from .card_chat import CONTEXT_LIMIT
 from .card_intake import COLLECT_PROMPT, COLLECT_TOOL, collection_arguments
-from .changes import normalized
+from .card_lookup import lookup_query, search_cards
 from .client import LLMError
+from .collection_intent import collection_blocker, collection_help, named_update_query
 from .models import StrictModel
 
 
@@ -25,6 +26,8 @@ GENERAL_PROMPT = """Ты помощник ВУЗ-CRM. Это общий чат �
 Сбор идёт в фоне, результат и ход видны в карточке.
 Назови «Проверить факты» для сверки с источниками и «Принять выбранные» для подтверждения.
 Для презентации по принятым сведениям предложи кнопку «Презентация» в чате открытой карточки.
+Если просьба о справке или презентации называет вуз и карточка ещё не выбрана, вызови find_cards
+с названием вуза. Если сотрудник назвал город, сохрани его в запросе после названия.
 Для подбора партнёрств предложи открыть чат нужного вуза и сообщить цель встречи.
 При просьбе собрать или обновить сведения без названия учреждения попроси уточнить, о каком вузе речь.
 Для обновления уже существующей карточки воспользуйся find_cards, если известно её название.
@@ -38,6 +41,17 @@ GENERAL_PROMPT = """Ты помощник ВУЗ-CRM. Это общий чат �
 
 
 async def answer_general(provider, history, question):
+    lookup = lookup_query(question)
+    if lookup:
+        return {"registry_query": lookup}
+    help_text = collection_help(question)
+    if help_text:
+        return {"text": help_text, "sources": []}
+    update = named_update_query(question)
+    if update is not None:
+        return {"registry_query": update} if update else {
+            "text": "Укажите название вуза или откройте его карточку, чтобы запустить обновление.", "sources": [],
+        }
     messages = [{"role": "system", "content": f"{GENERAL_PROMPT}\n{COLLECT_PROMPT}"}]
     for turn in history[-CONTEXT_LIMIT:]:
         answer = turn["answer"]
@@ -52,6 +66,9 @@ async def answer_general(provider, history, question):
     call = choice.message.function_call
     if choice.finish_reason == "function_call" and call:
         if call.name == COLLECT_TOOL["name"]:
+            blocked = collection_blocker(question)
+            if blocked:
+                return {"text": blocked, "sources": []}
             return {"collection_request": collection_arguments(choice, question)}
         if call.name == REGISTRY_TOOL["name"]:
             try:
@@ -64,10 +81,12 @@ async def answer_general(provider, history, question):
 
 
 def registry_answer(cards, query):
-    query = normalized(query)
-    matches = [card for card in cards if query in normalized(f"{card['name']} {card['city']}")]
+    matches = search_cards(cards, query)
     if not matches:
-        text = "Подходящих карточек в реестре нет." if query else "В реестре пока нет карточек."
+        if query:
+            return {"text": "Подходящей карточки в реестре нет. Могу подобрать официальный сайт и создать карточку.",
+                    "sources": [], "cards": [], "pending_institution": query[:300]}
+        text = "В реестре пока нет карточек."
     elif len(matches) > 10:
         text = f"Найдено карточек: {len(matches)}. Показаны первые 10. Уточните название или город."
     else:

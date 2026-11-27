@@ -1,8 +1,11 @@
 """Provider boundary: SDK details are confined to this file."""
 
+import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -74,6 +77,33 @@ class GigaChatProvider:
     def __init__(self, settings: GigaChatSettings):
         self.settings = settings
         self.model = settings.model
+        # Personal credentials allow one in-flight request. Wait between requests,
+        # so a chat or match can run while a collection session is still open.
+        self._request_lock = asyncio.Lock() if settings.scope == "GIGACHAT_API_PERS" else nullcontext()
+        self._session: ContextVar[GigaChat | None] = ContextVar("gigachat_session", default=None)
+
+    @asynccontextmanager
+    async def session(self):
+        """Reuse the SDK's transport and authorization within a single collection job."""
+        current = self._session.get()
+        if current is not None:
+            yield current
+            return
+        async with GigaChat(
+            credentials=self.settings.credentials,
+            model=self.model,
+            scope=self.settings.scope,
+            base_url=self.settings.base_url,
+            timeout=self.settings.timeout,
+            max_retries=self.settings.max_retries,
+            verify_ssl_certs=True,
+            ca_bundle_file=self.settings.ca_bundle_file,
+        ) as client:
+            token = self._session.set(client)
+            try:
+                yield client
+            finally:
+                self._session.reset(token)
 
     async def complete(self, system: str, payload: dict, schema: dict) -> str:
         choice = await self.chat([
@@ -93,16 +123,7 @@ class GigaChatProvider:
 
     async def chat(self, messages: list[dict], **options):
         try:
-            async with GigaChat(
-                credentials=self.settings.credentials,
-                model=self.model,
-                scope=self.settings.scope,
-                base_url=self.settings.base_url,
-                timeout=self.settings.timeout,
-                max_retries=self.settings.max_retries,
-                verify_ssl_certs=True,
-                ca_bundle_file=self.settings.ca_bundle_file,
-            ) as client:
+            async with self._request_lock, self.session() as client:
                 response = await client.achat({
                     "model": self.model,
                     "messages": messages,

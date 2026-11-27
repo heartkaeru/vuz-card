@@ -10,6 +10,8 @@ def leadership_statement(facts: list[Fact]) -> str | None:
         FactField.APPOINTED_AT: "Назначение", FactField.EDUCATION: "Образование",
         FactField.DEGREE: "Учёная степень", FactField.TITLE: "Учёное звание",
         FactField.CAREER: "Карьера", FactField.INTERESTS: "Научные интересы",
+        FactField.BIRTH_DATE: "Дата рождения", FactField.BIRTH_PLACE: "Место рождения",
+        FactField.EXPERIENCE: "Стаж", FactField.HONORS: "Награды",
         FactField.RESPONSIBILITIES: "Зона ответственности",
     }
     if not facts or any(f.field not in labels or not f.subject.person_name for f in facts):

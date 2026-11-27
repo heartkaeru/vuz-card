@@ -11,8 +11,9 @@ from app.services.llm import AssistantPipeline
 from app.services.llm.client import FixtureProvider
 from app.services.llm.context_models import ContextExtractionRequest, ContextField
 from app.services.llm.fragment_models import parse_extraction_request
-from app.services.llm.models import EntitySubject, ExtractionRequest, GenerationRequest
+from app.services.llm.models import EntitySubject, ExtractionRequest, FactField, GenerationRequest
 from app.services.llm.pipeline import DraftValidationError
+from app.services.llm.workflow import skip_shared_navigation
 from examples.llm.context_demo import example_request
 
 EXAMPLES = Path(__file__).parents[1] / "examples" / "llm"
@@ -171,6 +172,106 @@ def test_context_field_filter_and_duplicate_outputs():
     assert "field_not_requested" in result.facts[0].issues
 
 
+def test_unrelated_reference_page_does_not_consume_project_extraction_budget():
+    request = example_request()
+    source = request.documents[0]
+    reference = source.model_copy(update={"source_id": "reference-page", "fields": [ContextField.PROFILE]})
+    request.documents = [reference, source]
+    request.fields = [ContextField.PROJECT_STATUS]
+    result = extract([proposal()], request, max_chunks=1)
+    fact, = result.facts
+    assert fact.validation_status == "passed"
+    assert fact.evidence[0].source_id == source.source_id
+    assert not result.errors
+
+
+def test_linked_event_and_project_fields_reach_dedicated_sources_within_budget():
+    request = example_request()
+    source = request.documents[0]
+
+    def document(source_id, section, count):
+        paragraphs = [f"{source_id} {i} " + "Источник " * 10 for i in range(count)]
+        fragments, offset = [], 0
+        for i, paragraph in enumerate(paragraphs):
+            fragments.append({"fragment_id": str(i), "start": offset, "end": offset + len(paragraph)})
+            offset += len(paragraph) + 1
+        return type(source).model_validate({
+            **source.model_dump(), "source_id": source_id, "section": section,
+            "text": "\n".join(paragraphs), "fragments": fragments,
+        })
+
+    request.documents = [
+        document("profile", "about", 12), document("project-index", "projects", 12),
+        document("project-page", "projects", 2), document("news-index", "news", 12),
+        document("event-page", "events", 2),
+    ]
+    request.fields = [
+        ContextField.PROFILE, ContextField.TYPE, ContextField.PROJECT_NAME, ContextField.PROJECT_ROLE,
+        ContextField.PROJECT_DESCRIPTION, ContextField.EVENT_NAME, ContextField.PROJECT_STATUS,
+        ContextField.EVENT_STATUS, ContextField.EVENT_DATE,
+    ]
+    calls = []
+
+    class Recorder(FixtureProvider):
+        async def complete(self, system, payload, schema):
+            calls.append((payload["source_id"], payload["fields"]))
+            return '{"facts":[],"gaps":[]}'
+
+    asyncio.run(AssistantPipeline(Recorder([]), chunk_size=125, overlap=10, max_chunks=8).extract_facts(request))
+
+    assert len(calls) == 8
+    assert [source_id for source_id, fields in calls if "project.name" in fields] == ["project-index", "project-page"]
+    assert all("project.role" in fields and "project.status" in fields for _, fields in calls if "project.name" in fields)
+    assert [source_id for source_id, fields in calls if "event.name" in fields] == ["event-page", "event-page"]
+    assert all("event.date" in fields and "event.status" in fields for _, fields in calls if "event.name" in fields)
+
+
+def test_shared_menu_is_excluded_but_the_original_text_and_anchors_stay():
+    menu = "Поступающим Студентам Расписание Личный кабинет " * 40
+    title = "Название учреждения"
+    prefix = menu + title + "\n"
+    documents = []
+    for key, value in (("one", "Первый проект"), ("two", "Второй проект")):
+        documents.append({
+            "url": f"https://institution.example/{key}", "text": prefix + value,
+            "fragments": [
+                {"fragment_id": "menu", "start": 0, "end": len(menu)},
+                {"fragment_id": "anchor", "start": len(menu), "end": len(prefix) - 1},
+                {"fragment_id": "content", "start": len(prefix), "end": len(prefix) + len(value),
+                 "institution_anchor_id": "anchor"},
+            ],
+        })
+    skip_shared_navigation(documents)
+    for document in documents:
+        assert [f["fragment_id"] for f in document["fragments"]] == ["anchor", "content"]
+        assert document["text"].startswith(prefix)
+
+
+def test_shared_menu_keeps_leadership_and_contact_evidence():
+    menu = "Поступающим Студентам Расписание Личный кабинет " * 40
+    contact_heading = "Приёмная"
+    leader = "Иванов Иван Иванович — ректор"
+    repeated = menu + contact_heading + "\n" + leader + "\n"
+    documents = []
+    for key in ("one", "two"):
+        content = f"office-{key}@example.test"
+        documents.append({
+            "url": f"https://institution.example/{key}", "text": repeated + content,
+            "fragments": [
+                {"fragment_id": "menu", "start": 0, "end": len(menu)},
+                {"fragment_id": "heading", "start": len(menu), "end": len(menu + contact_heading)},
+                {"fragment_id": "leader", "start": len(menu + contact_heading) + 1, "end": len(repeated) - 1,
+                 "leadership_position": {"person_name": "Иванов Иван Иванович", "position": "ректор"}},
+                {"fragment_id": "contact", "start": len(repeated), "end": len(repeated + content),
+                 "contact_hints": [{"context_fragment_ids": ["heading"]}]},
+            ],
+        })
+    skip_shared_navigation(documents)
+    for document in documents:
+        assert [f["fragment_id"] for f in document["fragments"]] == ["heading", "leader", "contact"]
+        assert document["text"].startswith(repeated)
+
+
 def test_incompatible_values_flag_conflict_without_auto_selection():
     items = [proposal(), proposal(value="планирует подать заявку")]
     result = extract(items)
@@ -269,6 +370,29 @@ def test_one_context_statement_cannot_mix_entities():
     output["slides"][0]["theses"][0] = {"text": "Сводные сведения.", "fact_ids": ["fact_2", "fact_6"]}
     with pytest.raises(DraftValidationError, match="context_statement_requires_single_entity"):
         asyncio.run(AssistantPipeline(FixtureProvider([output])).generate_materials(request))
+
+
+def test_one_institution_statement_can_use_facts_from_multiple_sources():
+    request = reviewed_request()
+    profile = request.facts[0]
+    program = profile.model_copy(update={
+        "fact_id": "another-official-source",
+        "subject": profile.subject.model_copy(update={"entity_id": "another-source-entity"}),
+        "field": FactField.EDUCATION_AREAS,
+        "value": "Прикладная информатика",
+    })
+    request.facts.append(program)
+    output = responses()[1]
+    output["slides"][0]["theses"][0] = {
+        "text": "Сведения об учреждении.", "fact_ids": ["fact_1", program.fact_id],
+    }
+
+    draft = asyncio.run(AssistantPipeline(FixtureProvider([output])).generate_materials(request))
+
+    statement = draft.slides[0].theses[0]
+    assert statement.fact_ids == [profile.fact_id, program.fact_id]
+    assert "Прикладная информатика" in statement.text
+    assert profile.value.rstrip(". ") in statement.text
 
 
 def test_brief_limit_also_applies_after_context_template_expansion():

@@ -30,6 +30,7 @@ type AgentChatProps = {
   onClose: () => void;
   onEditApplied?: () => void;
   onCollection: (card: ApiCard, job: Job) => void;
+  onCollectionQueued: (cardId: string, jobId: string) => void;
   onAction?: (action: "refresh" | "presentation") => Promise<CardActionResult>;
   onShowRecheck?: () => void;
 };
@@ -89,7 +90,7 @@ function CollectionProgress({ jobId, initialText }: { jobId: string; initialText
 }
 
 export function AgentChat({ open, universityName, cardId, mode, onModeChange, onOpenCard, onClose, onAction,
-  onEditApplied, onCollection, onShowRecheck }: AgentChatProps) {
+  onEditApplied, onCollection, onCollectionQueued, onShowRecheck }: AgentChatProps) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [draft, setDraft] = useState("");
   const [pendingQuestion, setPendingQuestion] = useState("");
@@ -172,7 +173,10 @@ export function AgentChat({ open, universityName, cardId, mode, onModeChange, on
             : `✅ Карточка ${card.name} создана. Сбор сведений запущен.`;
         addActionNotice({ path: `/cards/${encodeURIComponent(card.id)}/chat`, tone, message });
         onCollection(card, job);
-      } else setTurns((current) => current.some((saved) => saved.id === result.id) ? current : [...current, result].slice(-20));
+      } else {
+        if (inCard && cardId && result.answer.job_id) onCollectionQueued(cardId, result.answer.job_id);
+        setTurns((current) => current.some((saved) => saved.id === result.id) ? current : [...current, result].slice(-20));
+      }
       requestKey.current = null;
       setDraft("");
     } catch (failure) {

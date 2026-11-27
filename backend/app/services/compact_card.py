@@ -52,8 +52,9 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
         (name, _), items = head
         put(slide, name, .7, 1.58, 8.55 if portrait else 11.9, .6, 25, bold=True)
         primary = []
-        for field in ("appointment.position", "appointment.status", "contact.phone", "contact.email",
-                      "person.degree", "person.academic_title", "person.education", "appointment.since"):
+        for field in ("appointment.position", "appointment.status", "person.degree", "person.academic_title",
+                      "person.education", "person.birth_date", "person.birth_place", "person.experience",
+                      "appointment.since", "contact.phone", "contact.email"):
             values = list(dict.fromkeys(f.value for f in items if f.field.value == field))
             for value in values[:1]:
                 ids = [f.fact_id for f in items if f.field.value == field and f.value == value]
@@ -76,7 +77,7 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
         careers.sort(key=year, reverse=True)
         secondary = [("Карьерный этап: " + f.value, [f.fact_id], 5) for f in careers[:2]]
         secondary.extend((labels[f.field.value] + ": " + f.value, [f.fact_id], 4) for f in items
-                         if f.field.value in {"appointment.responsibilities", "person.interests"})
+                         if f.field.value in {"person.honors", "appointment.responsibilities", "person.interests"})
         if not secondary:
             secondary = [("Карьерная история и зоны ответственности не подтверждены в выбранных материалах.", [], 4)]
         if portrait:
@@ -95,11 +96,14 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
     put(slide, "\n".join(name_lines[:2]), .7, 1.55, 11.9, .73, 20, bold=True)
     institutional = [f for f in facts if f.field.value.startswith("institution.")]
     left, right = [], []
-    for field in ("institution.students", "institution.type", "institution.location", "institution.founded",
-                  "institution.education_areas", "institution.education_levels", "institution.structure", "institution.profile"):
+    metrics = ("institution.students", "institution.budget_students", "institution.teaching_staff",
+               "institution.dormitory_capacity", "institution.dormitory_occupancy")
+    for field in (*metrics, "institution.type", "institution.location", "institution.founded",
+                  "institution.education_levels", "institution.structure", "institution.education_areas", "institution.profile"):
         group = [f for f in institutional if f.field.value == field]
-        target = left if field in {"institution.students", "institution.type", "institution.location", "institution.founded"} else right
-        for f in group[:2]:
+        target = left if field in metrics else right
+        limit = {"institution.education_areas": 5, "institution.education_levels": 2}.get(field, 1)
+        for f in group[:limit]:
             # Never truncate a population/year/unit qualifier to fit a number.
             target.append((CONTEXT_LABELS[field] + ": " + context_value(f), [f.fact_id], 7 if f.metric_context else 5))
     if not left:
@@ -121,7 +125,8 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
             group = [item for item in contextual if item.subject.entity_id == f.subject.entity_id
                      and item.subject.entity_kind == f.subject.entity_kind]
             qualifiers = [CONTEXT_LABELS[item.field.value] + ": " + item.value for item in group
-                          if item.field.value in {"project.status", "project.role", "project.period", "event.status", "event.date"}]
+                          if item.field.value in {"project.program", "project.partner", "project.status",
+                                                  "event.status", "event.date"}]
             prefix = "Проект: " if f.field.value.startswith("project.") else "Мероприятие: "
             entries.append((prefix + f.value + ("\n" + "; ".join(qualifiers) if qualifiers else ""),
                             [item.fact_id for item in group], 7))
@@ -129,8 +134,9 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
         entries = [("Проекты и мероприятия не подтверждены в выбранных материалах.", [], 4)]
     questions = [("Вопрос: " + q.question, q.basis_fact_ids, 4) for q in draft.questions[:3]]
     if not questions:
-        questions = [("Какие образовательные задачи приоритетны для учреждения?", [], 3),
-                     ("В каких проектах и мероприятиях возможно участие учебного центра?", [], 3)]
+        questions = [("В каких федеральных проектах участвует учреждение?", [], 3),
+                     ("Какие проекты идут с банками и крупными работодателями региона?", [], 3),
+                     ("Что уже сделано со Сбером и что можно обсудить дальше?", [], 3)]
     omitted = column(slide, entries, .7) + column(slide, questions, 6.9)
     # Include all facts (also other staff) so compact selection loses no provenance.
     footer(slide, [f.fact_id for f in facts], omitted=len(omitted))
@@ -144,13 +150,22 @@ def render_compact(draft, facts, head, *, page, put, notes, citations, sources, 
             put(slide, "Гипотеза для обсуждения: " + match["proposal"], .7, 2.35, 11.9, 1.05, 17)
             put(slide, "Основание: " + match["rationale"] + " " + citations(match["basis_fact_ids"]),
                 .7, 3.65, 11.9, 1.05, 17)
-            put(slide, "Вопрос для встречи: " + match["discussion_question"], .7, 4.95, 11.9, .85, 17)
+            put(slide, "Вопрос для встречи: " + match["discussion_question"], .7, 4.75, 11.9, .85, 17)
+            event = match.get("event_start")
+            if event:
+                put(slide, f"Дата начала по анонсу: {event}", .7, 5.63, 11.9, .28, 12)
+            case = match.get("regional_case")
+            if case:
+                frame = put(slide, f"Похожий опыт · {case['location']} · {case['title']}", .7, 5.63, 11.9, .42, 12)
+                frame.paragraphs[0].runs[0].hyperlink.address = case["url"]
             footer(slide, match["basis_fact_ids"], extra_link=(match["catalog_url"],
-                   "Страница курса" if external else "Каталог Сбера"))
+                   "Страница курса" if external else "Анонс Сбера" if event else "Каталог Сбера"))
             slide.notes_slide.notes_text_frame.text += (
                 f"\n\nЗапись каталога: {match['catalog_url']}"
                 "\nСовпадение — гипотеза для обсуждения, не подтверждение партнёрства или доступности продукта."
             )
+            if case:
+                slide.notes_slide.notes_text_frame.text += f"\nОпыт другого региона: {case['url']}"
     else:
         slide = page("Предложения и партнерство со Сбером")
         put(slide, "Предложения из каталога в эту презентацию не включены.",

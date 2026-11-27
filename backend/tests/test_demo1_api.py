@@ -10,7 +10,7 @@ from pptx import Presentation
 from app.api.v1.ai import get_collector, get_pipeline, get_repository
 from app.auth.security import create_access_token
 from app.main import app
-from app.services.llm.models import EntitySubject, FactField
+from app.services.llm.models import ContactOwner, EntitySubject, FactField
 from app.services.llm.pipeline import AssistantPipeline
 from database.demo1_store import DemoRepository
 from database.llm_store import stamp
@@ -76,6 +76,7 @@ def test_ai_collection_crawls_the_official_site(monkeypatch):
             # Сборщик для LLM обходит официальный сайт и не тратит время на
             # агрегаторы и поиск новостей.
             assert not settings.use_aggregators and not settings.use_news_search
+            self.client = client
 
         def parse(self, *, url, name, profile, allowed_sections):
             assert url == "https://university.example" and "leadership" in allowed_sections
@@ -91,8 +92,114 @@ def test_ai_collection_crawls_the_official_site(monkeypatch):
             pass
 
     monkeypatch.setattr("app.api.v1.ai.UniversityParser", Parser)
+    monkeypatch.setattr("app.api.v1.ai.official_leadership_document", lambda *args, **kwargs: None)
     result = get_collector()("https://university.example", "Учебный пример")
     assert result.documents == snapshot.documents
+
+
+def test_collection_replaces_existing_document_with_an_explicit_official_reference(monkeypatch):
+    snapshot = example_card()
+    old = snapshot.documents[0]
+    reference = old.model_copy(update={"title": "Уточнённый официальный источник"})
+
+    class Parser:
+        def __init__(self, settings, client):
+            self.client = client
+
+        def parse(self, **kwargs):
+            return snapshot
+
+        def collect_pdf_documents(self, sources):
+            return [], []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("app.api.v1.ai.UniversityParser", Parser)
+    monkeypatch.setattr("app.api.v1.ai.official_leadership_document", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.api.v1.ai.official_reference_document",
+                        lambda client, url, *args, **kwargs: reference if url == old.url else None)
+    monkeypatch.setattr("app.api.v1.ai.official_self_study_url", lambda *args: None)
+    result = get_collector()("https://university.example", "Учебный пример",
+                             institution_urls=(old.url,), include_institution=True)
+
+    matches = [document for document in result.documents if document.url == old.url]
+    assert matches == [reference]
+
+
+def test_collection_reports_failure_when_every_record_is_rejected(api_client):
+    client, repository, _ = api_client
+    card = repository.create_card("Учебный университет", "", "https://university.example")
+
+    class RejectedProvider(DemoProvider):
+        async def complete(self, system, payload, schema):
+            return json.dumps({"facts": [{
+                "subject": {"person_name": "Иванов Иван Иванович"},
+                "field": "appointment.position", "value": "Несуществующая должность",
+                "fragment_ids": [payload["fragments"][0]["fragment_id"]],
+            }], "gaps": []})
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(RejectedProvider())
+    response = client.post(f"/api/v1/ai/cards/{card['id']}/refresh", json={
+        "version": card["version"], "request_key": "rejected-results",
+    })
+    assert response.status_code == 202, response.text
+    job = repository.job(response.json()["job_id"])
+    assert job["status"] == "failed" and "Все найденные записи отклонены" in job["message"]
+    observed = repository.get(job["result"]["run_id"])
+    assert observed.facts and all(fact.verification_status == "rejected" for fact in observed.facts)
+
+
+def test_collection_keeps_missing_document_diagnostic(api_client):
+    client, repository, _ = api_client
+    card = repository.create_card("Учебный университет", "", "https://university.example")
+    parsed = example_card().model_copy(update={"documents": [], "errors": ["Страница недоступна"]})
+    app.dependency_overrides[get_collector] = lambda: lambda *args, **kwargs: parsed
+
+    response = client.post(f"/api/v1/ai/cards/{card['id']}/refresh", json={
+        "version": card["version"], "request_key": "missing-documents",
+    })
+
+    assert response.status_code == 202, response.text
+    job = repository.job(response.json()["job_id"])
+    assert job["status"] == "failed" and job["result"]["code"] == "no_source_documents"
+    assert "Страница недоступна" in job["message"]
+
+
+def test_export_uses_accepted_facts_after_draft_has_unsupported_number(api_client):
+    client, repository, _ = api_client
+    _, run = collected(client)
+    reviewed = client.post(f"/api/v1/ai/runs/{run['run_id']}/reviews", json=review_payload(run))
+    assert reviewed.status_code == 200
+    run = reviewed.json()
+    calls = []
+
+    class UnsupportedNumberProvider(DemoProvider):
+        async def complete(self, system, payload, schema):
+            calls.append(payload)
+            output = json.loads(await super().complete(system, payload, schema))
+            output["slides"][0]["theses"][0]["text"] += " Бюджет 987654321 рублей."
+            return json.dumps(output)
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(UnsupportedNumberProvider())
+    response = client.post(f"/api/v1/ai/runs/{run['run_id']}/materials", json={
+        "expected_revision": run["revision"], "request_key": "unsupported-number-fallback",
+        "presentation_variant": "compact",
+    })
+    assert response.status_code == 202, response.text
+    job = repository.job(response.json()["job_id"])
+    assert job["status"] == "completed", job
+    draft, _ = repository.material(job["result"]["material_id"])
+    assert len(calls) == 1
+    assert draft.run.provider == "accepted-facts" and not draft.questions
+    assert set(draft.sources) == {fact["fact_id"] for fact in run["facts"]}
+    brief = client.get(job["result"]["brief_url"]).text
+    assert "Иванов Иван Иванович" in brief and "987654321" not in brief
+    download = client.get(job["result"]["download_url"])
+    assert download.status_code == 200
+    presentation = Presentation(io.BytesIO(download.content))
+    text = "\n".join(shape.text for slide in presentation.slides for shape in slide.shapes if shape.has_text_frame)
+    assert "Иванов Иван Иванович" in text and "987654321" not in text
 
 
 def test_ui_api_full_path_and_pptx_download(api_client):
@@ -475,6 +582,176 @@ def test_card_chat_guides_user_and_refreshes_the_open_card(api_client, monkeypat
     assert calls == ["https://university.example", "https://university.example"]
     updated_head = client.post(path, headers=headers, json={"message": "Кто руководит вузом?"}).json()["answer"]
     assert updated_head == head
+
+
+@pytest.mark.parametrize("async_registry", [False, True], ids=["sqlite", "async-registry"])
+def test_chat_scopes_refresh_and_resolves_registry_abbreviations(api_client, monkeypatch, async_registry):
+    client, repository, calls = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('employee')[0]}"}
+    bgu = repository.create_card("Байкальский государственный университет", "Иркутск", "https://bgu.example")
+    mephi = repository.create_card("НИЯУ МИФИ", "Москва", "https://mephi.example")
+    path = f"/api/v1/ai/cards/{bgu['id']}/chat"
+    if async_registry:
+        list_cards = repository.cards
+
+        async def cards():
+            return list_cards()
+
+        monkeypatch.setattr(repository, "cards", cards)
+
+    class RefreshProvider(DemoProvider):
+        async def chat(self, messages, **options):
+            return Choices(index=0, finish_reason="function_call", message=Messages(
+                role="assistant", function_call={"name": "refresh_card", "arguments": {}},
+            ))
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(RefreshProvider())
+    for question in ("Как обновить данные?", "Подскажи, как запустить сбор", "Пока не обновляй данные",
+                     "Обнови сведения о Северном технологическом институте", "Можешь показать принятые сведения?"):
+        answer = client.post(path, headers=headers, json={"message": question}).json()["answer"]
+        assert "job_id" not in answer, question
+    answer = client.post(path, headers=headers, json={"message": "Обнови сведения о МИФИ"}).json()["answer"]
+    assert [card["id"] for card in answer["cards"]] == [mephi["id"]]
+    assert "job_id" not in answer and calls == []
+    assert repository.card_job(bgu["id"]) is None and repository.card_job(mephi["id"]) is None
+
+    for scope in (path, "/api/v1/ai/chat/general"):
+        found = client.post(scope, headers=headers, json={"message": "Найди карточку БГУ?"}).json()["answer"]
+        assert [card["id"] for card in found["cards"]] == [bgu["id"]]
+    found = client.post("/api/v1/ai/chat/general", headers=headers,
+                        json={"message": "Обнови сведения о МИФИ"}).json()["answer"]
+    assert [card["id"] for card in found["cards"]] == [mephi["id"]] and calls == []
+    response = client.post(path, headers=headers, json={"message": "Собери сведения с https://bgu.example/about"})
+    assert response.status_code == 200, response.text
+    job = repository.job(response.json()["answer"]["job_id"])
+    assert job["identity"]["institution_urls"] == ["https://bgu.example/about"]
+    wrong = client.post(path, headers=headers, json={"message": "Собери сведения с https://other.example/about"}).json()
+    assert "job_id" not in wrong["answer"] and len(calls) == 1
+
+
+def test_chat_resolves_accepted_head_contacts_without_using_other_owners(api_client, monkeypatch):
+    client, repository, _ = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('employee')[0]}"}
+    card, run = collected(client)
+    path = f"/api/v1/ai/cards/{card['id']}/chat"
+
+    def add_contact(research, _):
+        position = next(f for f in research.facts if f.field == FactField.POSITION)
+        research.facts.append(position.model_copy(update={
+            "fact_id": "head-email", "field": FactField.EMAIL, "value": "rector@example.com",
+            "contact_owner": ContactOwner(kind="person", label=position.subject.person_name),
+        }))
+
+    run = repository.mutate(run["run_id"], run["revision"], add_contact).model_dump(mode="json")
+    pending = client.post(path, headers=headers, json={"message": "Как связаться с ректором?"}).json()["answer"]
+    assert pending["sources"] == []
+    reviewed = client.post(f"/api/v1/ai/runs/{run['run_id']}/reviews", json=review_payload(run))
+    assert reviewed.status_code == 200, reviewed.text
+    result = client.post(path, headers=headers, json={"message": "Как связаться с ректором?"}).json()["answer"]
+    assert "rector@example.com" in result["text"] and len(result["sources"]) == 1
+    assert result["sources"][0]["fact_id"] == "head-email"
+    office = client.post(path, headers=headers, json={"message": "Почта приёмной ректора"}).json()["answer"]
+    assert office["sources"] == []
+
+
+@pytest.mark.parametrize("scope", ["general", "card"])
+def test_chat_asks_to_confirm_short_name_before_creating_card(api_client, monkeypatch, scope):
+    client, repository, calls = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('employee')[0]}"}
+    path = "/api/v1/ai/chat/general"
+    if scope == "card":
+        bgu = repository.create_card("Байкальский государственный университет", "Иркутск", "https://bgu.example")
+        path = f"/api/v1/ai/cards/{bgu['id']}/chat"
+    initial_cards = len(repository.cards())
+    monkeypatch.setattr("app.api.v1.ai.resolve_site", lambda name: "https://mpei.example/" if name == "МЭИ" else "")
+
+    class IntakeProvider(DemoProvider):
+        async def complete(self, system, payload, schema):
+            if "options" in payload:
+                assert payload["reply"] == "Да, именно этот"
+                return '{"action":"confirm","option":1}'
+            return await super().complete(system, payload, schema)
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(IntakeProvider())
+    request = client.post(path, headers=headers, json={"message": "Не по этому университету. Создай карточку МЭИ"})
+    assert request.status_code == 200, request.text
+    assert request.json()["answer"]["intake_options"][0]["name"] == "МЭИ"
+    assert "https://mpei.example" in request.json()["answer"]["text"]
+    assert len(repository.cards()) == initial_cards and calls == []
+
+    confirmation = client.post(path, headers=headers, json={"message": "Да, именно этот"})
+    assert confirmation.status_code == 200, confirmation.text
+    assert len(repository.cards()) == initial_cards + 1
+    assert len(calls) == 1 and calls[0].rstrip("/") == "https://mpei.example"
+    assert "intake_options" not in client.get(path, headers=headers).json()[-1]["answer"]
+
+
+def test_chat_requires_selection_between_registry_matches(api_client, monkeypatch):
+    client, repository, calls = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('employee')[0]}"}
+    path = "/api/v1/ai/chat/general"
+    first = repository.create_card("Байкальский государственный университет", "Иркутск", "https://bgu.example")
+    second = repository.create_card("Бурятский государственный университет", "Улан-Удэ", "https://bsu.example")
+
+    reply = client.post(path, headers=headers, json={"message": "Создай карточку бгу"}).json()["answer"]
+    options = reply["intake_options"]
+    assert {item["city"] for item in options} == {"Иркутск", "Улан-Удэ"}
+    assert calls == []
+    reply = client.post(path, headers=headers, json={"message": "Да"}).json()["answer"]
+    assert reply["intake_options"] == options and calls == []
+
+    choice = next(index for index, item in enumerate(options, 1) if item["name"] == first["name"])
+    confirmed = client.post(path, headers=headers, json={"message": str(choice)}).json()["answer"]
+    assert confirmed["cards"][0]["id"] == first["id"]
+    assert repository.card_job(first["id"]) and repository.card_job(second["id"]) is None
+
+
+def test_chat_requests_name_or_site_for_unknown_short_name(api_client, monkeypatch):
+    client, repository, calls = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('employee')[0]}"}
+    path = "/api/v1/ai/chat/general"
+    monkeypatch.setattr("app.api.v1.ai.resolve_site", lambda name: "")
+
+    response = client.post(path, headers=headers, json={"message": "Создай карточку ФВВ"})
+
+    assert response.status_code == 200, response.text
+    answer = response.json()["answer"]
+    assert "полное название" in answer["text"]
+    assert "intake_options" not in answer and repository.cards() == [] and calls == []
+
+
+def test_general_chat_keeps_missing_card_and_goal_through_confirmation(api_client, monkeypatch):
+    client, repository, calls = api_client
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-chat-key-used-only-for-this-test")
+    headers = {"Authorization": f"Bearer {create_access_token('employee')[0]}"}
+    question = "Собери материал для презентации об УрФУ в Екатеринбурге"
+    monkeypatch.setattr("app.api.v1.ai.resolve_site", lambda name: "https://urfu.example" if name == "УрФУ Екатеринбург" else "")
+
+    class IntakeProvider(DemoProvider):
+        async def chat(self, messages, **options):
+            return Choices(index=0, finish_reason="function_call", message=Messages(
+                role="assistant", function_call={"name": "find_cards", "arguments": {"query": "УрФУ Екатеринбург"}},
+            ))
+
+        async def complete(self, system, payload, schema):
+            if payload.get("reply") == "Создай её":
+                assert payload["missing_card"] == "УрФУ Екатеринбург"
+                return '{"action":"create"}'
+            return await super().complete(system, payload, schema)
+
+    app.dependency_overrides[get_pipeline] = lambda: AssistantPipeline(IntakeProvider())
+    path = "/api/v1/ai/chat/general"
+    assert client.post(path, headers=headers, json={"message": question}).json()["answer"]["intake_goal"] == question
+    option, = client.post(path, headers=headers, json={"message": "Создай её"}).json()["answer"]["intake_options"]
+    assert option["website"] == "https://urfu.example"
+    assert repository.cards() == [] and calls == []
+    answer = client.post(path, headers=headers, json={"message": "Да"}).json()["answer"]
+    assert answer["intake_goal"] == question and len(calls) == 1
 
 
 def test_card_chat_matches_partnership_after_review_and_goal_clarification(api_client, monkeypatch):

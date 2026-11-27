@@ -2,24 +2,144 @@
 
 import asyncio
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 from pptx import Presentation
 
 from app.services.llm.client import FixtureProvider
-from app.services.llm.context_models import ContextExtractionRequest, ContextField
+from app.services.llm.context_extraction import select_report_measures
+from app.services.llm.context_models import ContextDocument, ContextExtractionRequest, ContextField
 from app.services.llm.fragment_models import FragmentExtractionRequest
-from app.services.llm.models import DraftResult, GenerationRequest
+from app.services.llm.models import DraftResult, GenerationRequest, Institution
 from app.services.llm.pipeline import AssistantPipeline, DraftValidationError
+from app.services.llm.official_sources import (
+    official_basic_candidates, official_catalog_candidates, official_program_candidates,
+    official_reference_document, official_self_study_url,
+)
 from app.services.meeting_pptx import build_meeting_presentation
 from parser.biography import mark_biography_subject
 from parser.cleaner import HTMLCleaner
 from parser.llm_adapter import to_llm_document
 from parser.institution_context import mark_institution_context
+from parser.models import UniversityData
 
 NAME = "Иванов Иван Иванович"
 INSTITUTION = {"id": "draft:dossier-test", "name": "Учебный университет", "card_version": 1}
+
+
+def test_official_catalog_needs_exact_code_and_name_on_the_same_official_row():
+    url = "https://programs.university.example/catalog/"
+    quote = "Математика | 01.03.01 Математика | Естественные науки | бакалавриат"
+    document = HTMLCleaner().to_document(f"<main><p>{quote}</p><p>09.03.04 Соседнее направление</p></main>",
+                                         url=url, section="programs")
+    card = UniversityData.model_validate({"university": {"name": INSTITUTION["name"], "url": "https://university.example"},
+        "documents": [document], "specialties": [
+            {"code": "01.03.01", "name": "Математика", "level": "бакалавриат", "source_url": url},
+            {"code": "09.03.04", "name": "Математика", "level": "магистратура", "source_url": url},
+            {"code": "01.03.01", "name": "Математика", "source_url": "https://elsewhere.example/catalog/"},
+        ]})
+    institution = Institution.model_validate(INSTITUTION)
+    facts = list(official_catalog_candidates(card, institution, [], {"institution.education_areas", "institution.education_levels"}))
+    assert {f.value for f in facts} == {"01.03.01 Математика", "бакалавриат"}
+    assert all(f.verification_status == "pending" and f.evidence[0].quote == quote and f.evidence[0].url == url for f in facts)
+
+
+def test_official_common_fields_use_disclosed_name_and_values():
+    url = "https://university.example/sveden/common/"
+    owner = "Федеральное образовательное учреждение высшего образования «Учебный университет»"
+    page = SimpleNamespace(final_url=url, text=f"""<main><p itemprop="fullName">{owner}</p>
+        <p>Дата создания образовательной организации: <span itemprop="regDate">10 июля 1930 г.</span></p>
+        <p>Адрес: <span itemprop="address">г. Москва, ул. Ленина, 11</span></p></main>""")
+    institution = Institution.model_validate(INSTITUTION)
+    doc = official_reference_document(SimpleNamespace(get=lambda _: page), url, url, institution.name, max_chars=4000)
+    candidates = {f.field.value: f for f in official_basic_candidates([doc], institution, [])}
+    assert {key: f.value for key, f in candidates.items()} == {"institution.founded": "10 июля 1930 г.",
+        "institution.location": "г. Москва, ул. Ленина, 11", "institution.type": "образовательное учреждение высшего образования"}
+    assert "Дата создания образовательной организации" in candidates["institution.founded"].evidence[0].quote
+    assert all(f.verification_status == "pending" and any(owner in e.quote for e in f.evidence) for f in candidates.values())
+
+
+def test_self_study_discovery_prefers_the_latest_head_office_report_on_official_site():
+    page = SimpleNamespace(final_url="https://university.example/sveden/document/", text=r"""
+        <div><a href="\reports\head.pdf">Скачать .PDF</a><a href="\reports\head.pdf.sig">ЭП</a>
+        Отчет о результатах самообследования за 2025 год (головной вуз)</div>
+        <a href="/branch.pdf">Отчет о результатах самообследования за 2026 год (филиал)</a>
+        <a href="https://elsewhere.example/latest.pdf">Отчет о результатах самообследования за 2026 год</a>
+        <a href="/older.pdf">Отчет о самообследовании за 2024 год</a>
+    """)
+    assert official_self_study_url(SimpleNamespace(get=lambda _: page), "https://university.example") == (
+        "https://university.example/reports/head.pdf")
+
+
+def test_pdf_measure_routing_retains_title_anchor_and_late_page():
+    blocks = ["Учебный университет. Отчёт за 2025 год", "Этапы развития цифровой среды",
+              "Контингент обучающихся по программам высшего образования составляет 1200 чел."]
+    text = "\n\n".join(blocks)
+    fragments = []
+    for index, block in enumerate(blocks):
+        start = text.index(block)
+        fragments.append({"fragment_id": f"f{index}", "start": start, "end": start + len(block),
+                          "page_number": (1, 4, 18)[index], "institution_anchor_id": "f0"})
+    doc = ContextDocument.model_validate({"source_id": "report", "url": "https://university.example/report.pdf",
+        "text": text, "retrieved_at": "2026-11-28T00:00:00Z", "file_sha256": "a" * 64, "fragments": fragments})
+
+    focused = select_report_measures(doc, [ContextField.STUDENTS])
+
+    assert focused.text == text and [f.page_number for f in focused.fragments] == [1, 18]
+    assert select_report_measures(doc, [ContextField.STUDENTS, ContextField.PROFILE]) is doc
+
+
+def test_official_program_reference_keeps_subdomain_and_literal_title_anchor():
+    url = "https://admission.university.example/about/program"
+    page = SimpleNamespace(final_url=url, text="""<html><head>
+        <title>09.03.04. Программная инженерия | Приёмная комиссия. Учебный университет</title>
+        <link rel="canonical" href="/about/program">
+        </head><body><main><h1>Программная инженерия</h1><p>Бакалавриат</p></main></body></html>""")
+    client = SimpleNamespace(get=lambda _: page)
+    document = official_reference_document(client, url, "https://university.example",
+                                           "Учебный университет", max_chars=4000)
+    assert document.url == url
+    anchor = next(fragment for fragment in document.fragments
+                  if "Приёмная комиссия. Учебный университет" in document.text[fragment.start:fragment.end])
+    assert any(fragment.institution_anchor_id == anchor.fragment_id
+               and "Бакалавриат" in document.text[fragment.start:fragment.end] for fragment in document.fragments)
+    institution = Institution.model_validate(INSTITUTION)
+    fact, = official_program_candidates([document], institution, [])
+    assert fact.value == "09.03.04. Программная инженерия" and fact.verification_status == "pending"
+    assert fact.evidence[0].url == url
+    assert document.text[anchor.start:anchor.end] == fact.evidence[0].quote
+    assert not list(official_program_candidates([document], institution, [fact]))
+
+
+def test_program_disclosure_keeps_query_and_links_literal_heading_to_publisher():
+    url = "https://university.example/sveden/education/program?f=2026_09.03.03"
+    value = "09.03.03 Прикладная информатика: Системы искусственного интеллекта"
+    owner = "Учебный университет"
+    page = SimpleNamespace(final_url=url, text=f"""<html><head>
+        <title>Информация о реализуемой образовательной программе</title>
+        <link rel="canonical" href="/sveden/education/program">
+        </head><body><main><h4>{value}</h4>
+        <span itemprop="eduCode">09.03.03</span><span itemprop="eduName">Прикладная информатика</span>
+        </main><footer><p>© 2026 {owner}</p></footer></body></html>""")
+    client = SimpleNamespace(get=lambda _: page)
+    institution = Institution.model_validate(INSTITUTION)
+
+    document = official_reference_document(client, url, "https://university.example",
+                                           institution.name, max_chars=4000)
+    assert document.url == url
+    fact, = official_program_candidates([document], institution, [])
+    assert fact.value == value and fact.verification_status == "pending"
+    assert [proof.quote for proof in fact.evidence] == [value, owner]
+    for proof in fact.evidence:
+        assert document.text[proof.start_offset:proof.end_offset] == proof.quote
+        assert proof.url == url
+
+    page.text = page.text.replace(owner, "Другой университет")
+    other = official_reference_document(client, url, "https://university.example",
+                                        institution.name, max_chars=4000)
+    assert not list(official_program_candidates([other], institution, []))
 
 
 def biography_request():
@@ -117,6 +237,24 @@ def metric_extract(context=None, refs=None):
 
 
 METRIC = {"period": "2025 году", "scope": "студентов очной формы головного вуза", "unit": "человек"}
+
+
+def test_profile_dormitory_capacity_keeps_its_unit_and_period():
+    request = metric_request()
+    text = "Учебный университет. В 2026 году вместимость общежитий — 274 места."
+    request.documents[0].text = text
+    request.documents[0].fragments = [request.documents[0].fragments[0].model_copy(update={"end": len(text)})]
+    request.fields = [ContextField.DORMITORY_CAPACITY, ContextField.PROJECT_NAME]
+    payload = {"subject": {"entity_kind": "institution", "entity_name": "Учебный университет",
+                           "entity_fragment_id": "current"},
+               "field": "institution.dormitory_capacity", "value": "274", "value_fragment_id": "current",
+               "fragment_ids": ["current"], "metric_context": {
+                   "period": "2026 году", "scope": "вместимость общежитий", "unit": "места"}}
+    result, = asyncio.run(AssistantPipeline(FixtureProvider([{"facts": [payload], "gaps": []}])).extract_facts(request)).facts
+    assert result.verification_status == "pending" and result.metric_context.unit == "места"
+    payload["metric_context"]["unit"] = "человек"
+    result, = asyncio.run(AssistantPipeline(FixtureProvider([{"facts": [payload], "gaps": []}])).extract_facts(request)).facts
+    assert "institution_metric_unit_mismatch" in result.issues
 
 
 def test_qualified_metric_remains_candidate_and_preserves_population():

@@ -11,6 +11,8 @@ from app.services.llm.client import FixtureProvider
 from app.services.llm.fragment_models import FragmentExtractionRequest, parse_extraction_request
 from app.services.llm.models import GenerationRequest
 from app.services.llm.pipeline import DraftValidationError
+from parser.cleaner import HTMLCleaner
+from parser.llm_adapter import to_llm_document
 
 
 def request():
@@ -58,6 +60,44 @@ def test_server_builds_exact_quotes_with_offsets_and_hash():
     assert evidence.fragment_id == "f1"
     assert len(evidence.content_sha256) == 64
     assert result.facts[1].field.value == "person.name"
+
+
+@pytest.mark.parametrize("other_head", [None, "Иванов Иван Петрович"])
+def test_leadership_aliases_merge_evidence_without_hiding_a_second_head(other_head):
+    req = request()
+    full_name = "Иванов Иван Иванович"
+    short_name = "Иван Иванов"
+    short_quote = f"Ректор {short_name}"
+    other_quote = f"Ректор {other_head}" if other_head else ""
+    text = f"{short_quote}\n\n{other_quote}"
+    fragments = [{"fragment_id": "short", "start": 0, "end": len(short_quote)}]
+    if other_head:
+        fragments.append({"fragment_id": "other", "start": len(short_quote) + 2, "end": len(text)})
+    data = req.model_dump(mode="json")
+    data["documents"].append({
+        **data["documents"][0], "source_id": "second", "url": "https://university.example/rector",
+        "text": text, "fragments": fragments,
+    })
+    second = [proposal(value="ректор", refs=["short"], person=short_name)]
+    if other_head:
+        second.append(proposal(refs=["other"], person=other_head))
+    provider = FixtureProvider([
+        {"facts": [proposal()], "gaps": []}, {"facts": second, "gaps": []},
+    ])
+    result = asyncio.run(AssistantPipeline(provider).extract_facts(FragmentExtractionRequest.model_validate(data)))
+    positions = [f for f in result.facts if f.field.value == "appointment.position"]
+    names = [f for f in result.facts if f.field.value == "person.name"]
+    if other_head:
+        # The two published patronymics make the short spelling ambiguous.
+        assert {fact.subject.person_name for fact in positions} == {short_name, full_name, other_head}
+        assert all(fact.issues == ["multiple_head_candidates"] for fact in positions)
+    else:
+        position, = positions
+        name, = names
+        assert position.verification_status == "pending"
+        assert position.subject.person_name == name.value == full_name
+        assert {item.source_id for item in position.evidence} == {"source", "second"}
+        assert {item.source_id for item in name.evidence} == {"source"}
 
 
 def test_model_cannot_supply_or_rewrite_a_quote():
@@ -145,6 +185,59 @@ def test_structured_projection_respects_requested_fields():
     req.project_structured_contacts = True
     req.fields = ["person.name"]
     assert extract([], req).facts == []
+
+
+def test_repeated_site_contacts_keep_named_owner_and_merge_its_citations():
+    pages = [
+        """<h2>Контакт-центр</h2><p>contact@example.org, 8-800-100-50-44</p>
+        <h2>Реклама в университете</h2><p>partner@example.org</p>
+        <p>contact@example.org, 8-800-100-50-44, site@example.org</p>""",
+        """<h2>Об университете</h2><p>contact@example.org, +7 (800) 100-50-44, site@example.org</p>
+        <h2>Контакт-центр</h2><p>contact@example.org</p>""",
+    ]
+    cleaner = HTMLCleaner(content_selectors=("#contacts",))
+    documents = [cleaner.to_document(f'<article id="contacts">{html}</article>',
+                                    url=f"https://university.example/page-{index}", section="contacts")
+                 for index, html in enumerate(pages)]
+    req = FragmentExtractionRequest(
+        institution=request().institution, project_structured_contacts=True,
+        documents=[to_llm_document(doc) for doc in documents],
+    )
+    fixture = FixtureProvider([{"facts": [], "gaps": []}] * len(documents))
+    result = asyncio.run(AssistantPipeline(fixture).extract_facts(req))
+
+    email, = [fact for fact in result.facts if fact.value == "contact@example.org"]
+    phone, = [fact for fact in result.facts if fact.field == "contact.phone"]
+    partner, = [fact for fact in result.facts if fact.value == "partner@example.org"]
+    ambiguous, = [fact for fact in result.facts if fact.value == "site@example.org"]
+    assert email.contact_owner.label == phone.contact_owner.label == "Контакт-центр"
+    assert email.verification_status == phone.verification_status == "pending"
+    assert len({proof.url for proof in email.evidence}) == 2
+    assert partner.contact_owner.label == "Реклама в университете"
+    assert ambiguous.contact_owner is None and ambiguous.verification_status == "rejected"
+    assert ambiguous.issues == ["conflicting_contact_scopes"]
+
+
+def test_same_email_keeps_independently_documented_owners():
+    email = "shared@example.org"
+    documents = []
+    for index, owner in enumerate(("Отдел практики", "Отдел стажировок")):
+        text = f"{owner} — {email}"
+        documents.append({
+            "source_id": f"source-{index}", "url": f"https://university.example/unit-{index}",
+            "text": text, "retrieved_at": "2026-11-27T12:00:00+05:00",
+            "fragments": [{"fragment_id": "f1", "start": 0, "end": len(text), "contact_hints": [
+                {"field": "contact.email", "value": email, "owner": {"kind": "department", "label": owner}},
+            ]}],
+        })
+    req = FragmentExtractionRequest(
+        institution=request().institution, project_structured_contacts=True, documents=documents,
+    )
+    fixture = FixtureProvider([{"facts": [], "gaps": []}] * len(documents))
+    result = asyncio.run(AssistantPipeline(fixture).extract_facts(req))
+
+    assert {fact.contact_owner.label for fact in result.facts} == {"Отдел практики", "Отдел стажировок"}
+    assert all(fact.verification_status == "pending" for fact in result.facts)
 
 
 def test_projection_never_includes_unprocessed_fragments():

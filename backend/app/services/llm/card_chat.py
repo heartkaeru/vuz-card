@@ -10,7 +10,9 @@ from pydantic import Field, ValidationError
 from .changes import effective_facts, head_key, normalized
 from .card_edits import EDIT_TOOL, EditCard, preview_edit
 from .card_intake import COLLECT_PROMPT, COLLECT_TOOL, collection_arguments
+from .card_lookup import lookup_query
 from .client import LLMError
+from .collection_intent import collection_blocker, collection_help
 from .models import MeetingContext, StrictModel
 from .partnership import has_partnership_basis, match_partnership, partnership_facts
 
@@ -103,6 +105,7 @@ READ_PROMPT = """Ты консультируешь сотрудника по в�
 передай пустую строку, чтобы уточнить цель. Не выводи цель из профиля вуза или из ответов агента.
 Если речь о другом вузе, не делай подбор по открытой карточке.
 Для прямой просьбы собрать, перепроверить или обновить сведения открытого вуза вызови refresh_card.
+Если просят извлечь сведения из указанной страницы официального сайта открытого вуза, тоже вызови refresh_card.
 Если сотрудник просит найти сведения о вузе в целом, запусти сбор по источникам. Если он просит показать
 то, что уже известно или сохранено в карточке, прочитай её через read_card.
 Это относится и к пустой карточке. Вопросы о том, как запустить сбор или что он делает, являются
@@ -136,6 +139,9 @@ def read_facts(run, args: ReadCard, *, limit=40, candidates=False):
         "all": ("",),
     }[args.section]
     person = normalized(args.person)
+    if args.section == "contacts" and person in {"ректор", "ректора", "директор", "директора", "руководитель"}:
+        role = "ректор" if person.startswith("ректор") else "директор" if person.startswith("директор") else None
+        return head_contacts(run, candidates=candidates, role=role)[:limit]
     available = []
     if run:
         reconfirmed = run.reconfirmed_candidate_ids if candidates else set()
@@ -174,6 +180,11 @@ HEAD_QUESTION = re.compile(
 INTERNAL_DIRECTOR = re.compile(
     r"\bдиректор\s+(?:филиала|института|центра|департамента|школы|управления|отдела|программы|лаборатории)\b"
 )
+HEAD_CONTACT_QUESTION = re.compile(
+    r"(?:как (?:мне )?(?:связаться|поговорить|созвониться) с (?:ректором|директором|руководителем)(?: вуза)?"
+    r"|(?:дай |покажи |подскажи |какие )?(?:рабочие )?(?:телефон|почту|почта|контакты|email)"
+    r" (?:приемной )?(?:ректора|директора|руководителя)(?: вуза)?)"
+)
 
 
 def card_heads(facts):
@@ -185,6 +196,48 @@ def card_heads(facts):
         elif role == "директор" and not INTERNAL_DIRECTOR.search(normalized(fact.value)):
             directors.append(fact)
     return rectors or directors
+
+
+def head_contacts(run, *, candidates=False, office_only=False, role=None):
+    heads = card_heads(read_facts(run, ReadCard(section="leadership"), limit=None))
+    if role:
+        heads = [fact for fact in heads if head_key(fact) == role]
+    names = {normalized(f.subject.person_name) for f in heads}
+    office = (r"(?:директор|приемная директора|кабинет директора)" if role == "директор"
+              or (role is None and heads and head_key(heads[0]) == "директор")
+              else r"(?:ректор|приемная ректора|кабинет ректора|ректорат)")
+    return [
+        fact for fact in read_facts(run, ReadCard(section="contacts"), limit=None, candidates=candidates)
+        if fact.contact_owner and (
+            fact.contact_owner.kind in {"office", "department"}
+            and re.fullmatch(office, normalized(fact.contact_owner.label))
+            or not office_only and fact.contact_owner.kind == "person" and len(names) == 1
+            and normalized(fact.contact_owner.label) in names
+        )
+    ]
+
+
+def head_contact_answer(run, question):
+    office_only = "приемной" in question
+    phone = "телефон" in question or "созвониться" in question
+    mail = any(word in question for word in ("почта", "почту", "email"))
+    field = "contact.phone" if phone else "contact.email" if mail else None
+    role = "директор" if "директор" in question else "ректор" if "ректор" in question else None
+    contacts = [fact for fact in head_contacts(run, office_only=office_only, role=role)
+                if not field or fact.field.value == field][:12]
+    if contacts:
+        lines = [
+            f"{fact.contact_owner.label} — {'рабочий телефон' if fact.field.value == 'contact.phone' else 'рабочая почта'}: {fact.value}"
+            for fact in contacts
+        ]
+        return cited_answer("\n".join(lines), contacts)
+    pending = head_contacts(run, candidates=True, office_only=office_only, role=role)
+    text = "В карточке нет принятого рабочего контакта по этому запросу."
+    if any(not field or fact.field.value == field for fact in pending):
+        text += " Подходящие кандидаты ждут сверки в разделе «Проверить факты»."
+    else:
+        text += " Проверьте, указан ли контакт руководителя или его приёмной среди источников карточки."
+    return cited_answer(text, [])
 
 
 def cited_answer(text, facts):
@@ -228,13 +281,16 @@ def refresh_reply(job):
 
 async def partnership_reply(provider, run, goal):
     facts = {fact.fact_id: fact for fact in partnership_facts(run)} if run else {}
-    if not facts:
-        text = ("Для подбора партнёрств нужны принятые сведения о профиле вуза, направлениях подготовки, "
-                "проектах или событиях. Соберите недостающие сведения или примите их в разделе «Проверить факты».")
-        return cited_answer(text, [])
     if not has_partnership_basis(facts.values()):
-        return cited_answer("В карточке пока есть только общие данные. Для обоснованного предложения "
-                            "примите сведения о направлениях подготовки, проектах, событиях или задаче вуза.", [])
+        intro = "В карточке пока есть только общие данные." if facts else "Для подбора нужны принятые сведения о профиле вуза."
+        pending = (read_facts(run, ReadCard(section="profile"), candidates=True, limit=None)
+                   + read_facts(run, ReadCard(section="projects"), candidates=True, limit=None)
+                   + read_facts(run, ReadCard(section="events"), candidates=True, limit=None))
+        if has_partnership_basis(pending):
+            return cited_answer(f"{intro} Сверьте и примите подходящие направления, проекты или события "
+                                "в разделе «Проверить факты».", [])
+        return cited_answer(f"{intro} Пришлите ссылку на официальную страницу с направлениями подготовки "
+                            "и попросите собрать сведения с неё. После сбора откройте «Проверить факты» и примите нужные.", [])
     if not goal:
         return cited_answer("Какая цель встречи с вузом? Например, обсудить стажировки для студентов "
                             "или обучение преподавателей.", [])
@@ -254,6 +310,11 @@ async def partnership_reply(provider, run, goal):
         proposals.append(f"{name}\nЧто предложить — {match.proposal}\n"
                          f"Почему это уместно — {match.rationale} [{citations}]\n"
                          f"Что спросить — {match.discussion_question}")
+        if match.event_start:
+            proposals[-1] += f"\nНачало по анонсу — {match.event_start:%d.%m.%Y}. {match.catalog_url}"
+        if match.regional_case:
+            case = match.regional_case
+            proposals[-1] += f"\nПохожий опыт — {case.location}, {case.title}. {case.url}"
     reply = cited_answer("\n\n".join(proposals), (facts[fact_id] for fact_id in source_numbers))
     for source in reply["sources"]:
         source["value"] = f"[{source_numbers[source['fact_id']]}] {source['value']}"
@@ -261,7 +322,13 @@ async def partnership_reply(provider, run, goal):
 
 
 async def answer_card(provider, card, run, history, question):
-    if HEAD_QUESTION.fullmatch(normalized(question).rstrip(" ?.!")):
+    lookup = lookup_query(question)
+    if lookup:
+        return {"registry_query": lookup}
+    text = normalized(question).rstrip(" ?.!")
+    if HEAD_CONTACT_QUESTION.fullmatch(text):
+        return head_contact_answer(run, text)
+    if HEAD_QUESTION.fullmatch(text):
         args = ReadCard(section="leadership")
         heads = card_heads(read_facts(run, args, limit=None))
         if not heads:
@@ -271,19 +338,34 @@ async def answer_card(provider, card, run, history, question):
                                 "Сверьте их в разделе руководства.", heads[:12])
         position = heads[0]
         return cited_answer(f"По данным карточки: {position.subject.person_name} — {position.value}.", [position])
-    messages = [{"role": "system", "content": f"{READ_PROMPT}\n{COLLECT_PROMPT}\nВыбранный вуз: {card['name']}"}]
+    help_text = collection_help(question)
+    if help_text:
+        return cited_answer(help_text, [])
+    explicit_intake = re.search(r"\b(?:создай|добавь)\w*\b|\bнов\w*\s+карточк\w*", text) or (
+        "://" in text and "карточк" in text and re.search(r"\bсобери\w*\b", text)
+    )
+    prompt = f"{READ_PROMPT}\n{COLLECT_PROMPT}" if explicit_intake else READ_PROMPT
+    messages = [{"role": "system", "content": f"{prompt}\nВыбранный вуз: {card['name']}"}]
     for turn in history[-CONTEXT_LIMIT:]:
         messages.extend([
             {"role": "user", "content": turn["question"]},
             {"role": "assistant", "content": turn["answer"]["text"]},
         ])
     messages.append({"role": "user", "content": question})
-    tools = [GUIDE_TOOL, REFRESH_TOOL, READ_TOOL, EDIT_TOOL, COLLECT_TOOL, PARTNERSHIP_TOOL]
+    tools = [GUIDE_TOOL, REFRESH_TOOL, READ_TOOL, EDIT_TOOL, PARTNERSHIP_TOOL]
+    if explicit_intake:
+        tools.append(COLLECT_TOOL)
     choice = await provider.chat(messages, functions=tools, function_call="auto")
     if choice.finish_reason == "stop":
         choice = await provider.chat(messages, functions=tools, function_call={"name": TOOL_NAME})
     call = choice.message.function_call
+    if call and call.name in {REFRESH_TOOL["name"], COLLECT_TOOL["name"]}:
+        blocked = collection_blocker(question)
+        if blocked:
+            return cited_answer(blocked, [])
     if call and call.name == COLLECT_TOOL["name"]:
+        if not explicit_intake:
+            return cited_answer("Для создания карточки другого вуза откройте «Общий чат».", [])
         return {"collection_request": collection_arguments(choice, question)}
     if choice.finish_reason == "function_call" and call:
         try:

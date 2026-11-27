@@ -118,6 +118,50 @@ def test_parser_llm_database_review_and_draft_roundtrip(setup):
         initialize(db)
 
 
+def test_invalid_contact_markup_does_not_block_valid_leadership_sources(setup):
+    _, workflow, run, card = setup
+    equipment = HTMLCleaner().to_document(
+        "<main><p>Оснащение лаборатории: МФУ Kyocera C-0765(X3765790000).</p></main>",
+        url="https://university.example/sveden/objects/", section="about",
+    )
+    source = equipment.model_dump(mode="json")
+    source["fragments"][0]["contact_hints"] = [{
+        "field": "contact.phone", "value": "3765790000)",
+        "owner": {"kind": "department", "label": "лаборатории"},
+    }]
+    card.documents.append(type(equipment).model_validate(source))
+    current, _ = workflow.create(run.institution, card, "invalid-contact-markup", modes=("0.2",))
+
+    result = asyncio.run(workflow.extract(current.run_id, meeting_profile=True))
+
+    assert result.status == "partial"
+    assert result.errors == ["0.2:invalid_parser_llm_contract"]
+    assert any(f.field.value == "appointment.position" and f.value == "Ректор"
+               and f.verification_status == "pending" for f in result.facts)
+    assert all(e.url != equipment.url for f in result.facts for e in f.evidence)
+
+
+def test_structured_rectorate_row_keeps_acting_head_without_model_candidate(setup):
+    _, workflow, run, card = setup
+    rector = "Ректорат | Иванова Анна Сергеевна | и.о. ректора"
+    deputy = "Ректорат | Сидорова Елена Викторовна | проректор по учебной работе"
+    branch = "Филиал | Петров Иван Иванович | и.о. ректора"
+    structure = HTMLCleaner().to_document(f"<main><p>{rector}</p><p>{deputy}</p><p>{branch}</p></main>",
+                                          url="https://university.example/sveden/struct/", section="leadership")
+    assert not any(f.leadership_position for f in structure.fragments)
+    card.documents = [structure]
+    workflow.pipeline = AssistantPipeline(FixtureProvider([{"facts": [], "gaps": []}]))
+    current, _ = workflow.create(run.institution, card, "acting-head-in-structure", modes=("0.2",))
+
+    result = asyncio.run(workflow.extract(current.run_id, meeting_profile=True))
+
+    assert [(f.field.value, f.value) for f in result.facts] == [
+        ("appointment.position", "и.о. ректора"), ("appointment.position", "проректор по учебной работе"),
+        ("person.name", "Иванова Анна Сергеевна"), ("person.name", "Сидорова Елена Викторовна"),
+    ]
+    assert all(f.verification_status == "pending" and f.evidence[0].quote in {rector, deputy} for f in result.facts)
+
+
 def test_idempotent_request_does_not_run_llm_again(setup):
     repository, workflow, run, card = extracted(setup)
     again, created = workflow.create(run.institution, card, "test-request")

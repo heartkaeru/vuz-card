@@ -12,7 +12,7 @@ from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.util import Inches, Pt
 
-from .llm.models import DraftResult, Fact
+from .llm.models import INSTITUTION_METRICS, DraftResult, Fact
 from .llm.context_render import LABELS as CONTEXT_LABELS, context_value
 from .presentation_assets import download_official_portrait
 
@@ -22,11 +22,14 @@ LABELS = {
     "appointment.department": "Подразделение", "appointment.responsibilities": "Ответственность",
     "person.education": "Образование", "person.degree": "Учёная степень", "person.career": "Биография",
     "person.academic_title": "Учёное звание", "person.interests": "Научные интересы",
+    "person.birth_date": "Дата рождения", "person.birth_place": "Место рождения",
+    "person.experience": "Стаж", "person.honors": "Награды",
     "appointment.since": "Назначение",
     "contact.phone": "Рабочий телефон", "contact.email": "Рабочая почта",
 }
 BIO = {"appointment.responsibilities", "person.education", "person.degree", "person.career",
-       "person.academic_title", "person.interests"}
+       "person.academic_title", "person.interests", "person.birth_date", "person.birth_place",
+       "person.experience", "person.honors"}
 
 
 def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, candidate_preview=False,
@@ -36,7 +39,7 @@ def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, can
     if (len({f.fact_id for f in facts}) != len(facts) or set(draft.sources) != {f.fact_id for f in facts}
             or any(f.verification_status not in ({"pending", "verified"} if candidate_preview else {"verified"})
                    or f.validation_status != "passed" or f.issues
-                   or f.field.value == "institution.students" and f.metric_context is None
+                   or f.field in INSTITUTION_METRICS and f.metric_context is None
                    or f.institution_id != draft.institution.id for f in facts)):
         raise ValueError("Presentation requires the exact accepted fact snapshot")
     style = json.loads((ROOT / ("customer-compact.json" if draft.presentation_variant == "compact" else "customer-card.json")).read_text(encoding="utf-8"))
@@ -332,9 +335,15 @@ def build_card_presentation(draft: DraftResult, output_path: Path, facts, *, can
                 put(slide, "Основание: " + match["rationale"] + " " + citations(match["basis_fact_ids"]),
                     .7, 3.65, 11.9, 1.1, style["body_pt"])
                 put(slide, "Вопрос для встречи: " + match["discussion_question"], .7, 4.95, 11.9, .85, style["body_pt"])
-                link = put(slide, "Страница курса" if external else "Источник предложения",
+                event = match.get("event_start")
+                case = match.get("regional_case")
+                label = f"Анонс Сбера · начало {event}" if event else "Источник предложения"
+                link = put(slide, "Страница курса" if external else label,
                            .7, 6.05, 11.9, .35, 12, muted=True)
                 link.paragraphs[0].runs[0].hyperlink.address = match["catalog_url"]
+                if case:
+                    link = put(slide, f"Похожий опыт · {case['location']} · {case['title']}", .7, 6.43, 11.9, .35, 12, muted=True)
+                    link.paragraphs[0].runs[0].hyperlink.address = case["url"]
                 notes(slide, match["basis_fact_ids"])
                 slide.notes_slide.notes_text_frame.text += (
                     f"\n\nЗапись каталога: {match['catalog_url']}"
